@@ -1,4 +1,4 @@
-# QQMusic Reader
+# QQMusic Monitor
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-brightgreen.svg)
@@ -38,8 +38,8 @@
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/yourusername/QQMusicReader.git
-cd QQMusicReader
+git clone https://github.com/GotKiCry/QQMusicMonitor.git
+cd QQMusicMonitor
 ```
 
 ### 2. 构建项目
@@ -69,9 +69,9 @@ cargo run -- --quiet
 ### 命令行参数
 
 ```bash
-QQMusic Reader - 实时读取QQ音乐播放信息
+QQMusic Monitor - 实时读取QQ音乐播放信息
 
-使用方法: qqmusic-reader [选项]
+使用方法: qqmusic-monitor [选项]
 
 选项:
   -c, --config <文件>     配置文件路径 (默认: config.toml)
@@ -192,8 +192,8 @@ src/
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # 克隆项目
-git clone https://github.com/yourusername/QQMusicReader.git
-cd QQMusicReader
+git clone https://github.com/GotKiCry/QQMusicMonitor.git
+cd QQMusicMonitor
 
 # 构建项目
 cargo build
@@ -259,5 +259,5 @@ cargo test
 
 ---
 
-**项目主页**: [https://github.com/yourusername/QQMusicReader](https://github.com/yourusername/QQMusicReader)  
-**Bug反馈**: [https://github.com/yourusername/QQMusicReader/issues](https://github.com/yourusername/QQMusicReader/issues)
+**项目主页**: [https://github.com/GotKiCry/QQMusicMonitor](https://github.com/GotKiCry/QQMusicMonitor)  
+**Bug反馈**: [https://github.com/GotKiCry/QQMusicMonitor/issues](https://github.com/GotKiCry/QQMusicMonitor/issues)
