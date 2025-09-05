@@ -40,3 +40,6 @@ ce/*.PTR
 
 # 其他工具产生的文件
 .qoder/
+
+# Claude Code 配置文件
+.claude/settings*.json
