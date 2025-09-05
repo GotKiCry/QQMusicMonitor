@@ -13,7 +13,9 @@
       "Bash(python3:*)",
       "Bash(cargo build:*)",
       "Bash(cargo run -- --help)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git rebase:*)"
     ],
     "deny": [],
     "ask": []
