@@ -1,0 +1,42 @@
+# Rust 项目忽略文件
+# 编译输出目录
+/target/
+
+# Cargo 产生的文件
+Cargo.lock
+
+# IDE 和编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# QQMusicReader 特定文件
+# 运行时产生的文件
+now_playing.json
+now_playing.txt
+
+# ce/ 目录下的分析结果文件
+ce/*.results.*
+ce/*.scandata
+ce/*.addresslist
+ce/*.PTR
+
+# 调试和构建文件
+*.pdb
+*.d
+
+# 其他工具产生的文件
+.qoder/
