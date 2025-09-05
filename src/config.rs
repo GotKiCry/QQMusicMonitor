@@ -16,10 +16,14 @@ pub struct MemoryOffsets {
     pub song_singer_offset: usize,
     pub song_album_offset: usize,
     pub song_lyrics_offset: usize,
+    pub current_time_offset: usize,
+    pub total_time_offset: usize,
     pub song_name_chain: Vec<usize>,
     pub song_singer_chain: Vec<usize>,
     pub song_album_chain: Vec<usize>,
     pub song_lyrics_chain: Vec<usize>,
+    pub current_time_chain: Vec<usize>,
+    pub total_time_chain: Vec<usize>,
     pub title_offset: usize,
 }
 
@@ -46,10 +50,14 @@ impl Default for Config {
                 song_singer_offset: 0x0002B2C,
                 song_album_offset: 0x0002B2C,
                 song_lyrics_offset: 0x0002B2C,
+                current_time_offset: 0x0002B2C,
+                total_time_offset: 0x0002B2C,
                 song_name_chain: vec![0x0],
                 song_singer_chain: vec![0x0],
                 song_album_chain: vec![0x0],
                 song_lyrics_chain: vec![0x0],
+                current_time_chain: vec![0x0],
+                total_time_chain: vec![0x0],
                 title_offset: 0x90C,
             },
             settings: Settings {
@@ -84,12 +92,16 @@ impl Config {
     pub fn get_config() -> Self {
         match Self::load_from_file("config.toml") {
             Ok(config) => {
-                println!("✅ 成功加载配置文件");
+                if config.settings.debug_mode {
+                    println!("✅ 成功加载配置文件");
+                }
                 config
             }
             Err(e) => {
-                println!("⚠️  无法加载配置文件: {}", e);
-                println!("⚠️  使用默认配置");
+                if Self::default().settings.debug_mode {
+                    println!("⚠️  无法加载配置文件: {}", e);
+                    println!("⚠️  使用默认配置");
+                }
                 Self::default()
             }
         }

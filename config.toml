@@ -7,13 +7,17 @@
 song_name_offset = 0x00B6975C
 song_singer_offset = 0x00B69760
 song_album_offset = 0x00B69764
-song_lyrics_offset = 0x0002B2C
+song_lyrics_offset = 0x00B69768
+current_time_offset = 0x00B6976C
+total_time_offset = 0x00B69770
 
 # 歌曲信息指针链（用于查找标题）
 song_name_chain = [0x0]
 song_singer_chain = [0x0]
 song_album_chain = [0x0]
 song_lyrics_chain = [0x0]
+current_time_chain = [0x0]
+total_time_chain = [0x0]
 
 # 字符串字段偏移量（相对于最终指针）
 title_offset = 0x0
@@ -38,7 +42,7 @@ txt_filename = "now_playing.txt"
 json_filename = "now_playing.json"
 
 # 调试模式（输出详细的内存读取信息）
-debug_mode = true
+debug_mode = false
 
 # 最大字符串长度限制（防止读取错误指针导致内存溢出）
 max_string_length = 4096

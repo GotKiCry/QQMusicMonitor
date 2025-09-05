@@ -92,7 +92,7 @@ pub fn get_module_base_address(pid: DWORD, module_name: &str) -> Result<usize> {
         if current_module_name.eq_ignore_ascii_case(module_name) {
             unsafe { CloseHandle(snapshot) };
             let base_addr = module_entry.modBaseAddr as usize;
-            println!("✓ Found module '{}' at base address: {:#X}", module_name, base_addr);
+            println!("✓ Found module '{}'", module_name);
             return Ok(base_addr);
         }
 

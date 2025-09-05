@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)",
+      "Bash(.qqmusic-reader.exe --help)",
+      "Bash(./qqmusic-reader.exe:*)",
+      "Bash(./debug_process.exe:*)",
+      "Bash(./debug_pid.exe:*)",
+      "Bash(./debug_modules.exe)",
+      "Bash(move:*)",
+      "Bash(timeout:*)",
+      "Bash(powershell:*)",
+      "Bash(python3:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo run -- --help)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

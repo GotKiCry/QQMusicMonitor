@@ -18,7 +18,7 @@ pub fn read_pointer(handle: HANDLE, address: usize) -> Result<usize> {
         )
     };
     if result == 0 || bytes_read != std::mem::size_of::<u32>() {
-        Err(anyhow!("Failed to read pointer at address {:#X}", address))
+        Err(anyhow!("Failed to read pointer"))
     } else {
         Ok(buffer as usize)
     }
@@ -27,13 +27,12 @@ pub fn read_pointer(handle: HANDLE, address: usize) -> Result<usize> {
 /// 通过基地址和偏移量链解析最终地址
 fn resolve_pointer_chain(handle: HANDLE, base_address: usize, offsets: &[usize]) -> Result<usize> {
     let mut current_ptr_value = base_address;
-    println!("🔍 解析指针链: , base_address: {:#X}, offsets: {:?}", base_address, offsets);
     for (i, &offset) in offsets.iter().enumerate() {
         current_ptr_value = read_pointer(handle, current_ptr_value)
-            .with_context(|| format!("Failed at pointer chain index {}, offset {:#X}, address {:#X}", i, offset, current_ptr_value))?;
+            .with_context(|| format!("Failed at pointer chain index {}", i))?;
         
         if current_ptr_value == 0 {
-            return Err(anyhow!("Pointer at chain index {} was null (address {:#X})", i, current_ptr_value));
+            return Err(anyhow!("Pointer at chain index {} was null", i));
         }
         
         current_ptr_value += offset;
@@ -116,7 +115,7 @@ pub fn read_wstring(handle: HANDLE, address: usize, max_length: Option<usize>, c
         if config.settings.debug_mode {
             println!("DEBUG: Raw u16 buffer (empty): {:?}", buffer);
         }
-        return Err(anyhow!("Read 0 chars from wstring pointer: {:#X}", address));
+        return Err(anyhow!("Read 0 chars from wstring pointer"));
     }
 
     // 调试输出原始u16值
@@ -165,6 +164,23 @@ pub fn read_song_info(handle: HANDLE, base_address: usize, config: &Config) -> R
         song_info.lyrics = lyrics;
     }
     
+    // 读取当前播放时间
+    if let Ok(current_time) = read_int_field(handle, base_address, config, &config.memory_offsets.current_time_offset, &config.memory_offsets.current_time_chain, "当前时间") {
+        song_info.current_time = current_time;
+    }
+    
+    // 读取总时长
+    if let Ok(total_time) = read_int_field(handle, base_address, config, &config.memory_offsets.total_time_offset, &config.memory_offsets.total_time_chain, "总时长") {
+        song_info.total_time = total_time;
+    }
+    
+    // 计算进度百分比
+    if song_info.total_time > 0 {
+        song_info.progress_percent = (song_info.current_time as f32 / song_info.total_time as f32) * 100.0;
+    } else {
+        song_info.progress_percent = 0.0;
+    }
+    
     // 检查是否至少读取到了标题
     if song_info.is_valid() {
         if config.settings.debug_mode {
@@ -185,7 +201,7 @@ fn read_string_field(handle: HANDLE, base_address: usize, config: &Config, field
     let test_base = base_address + field_offset;
     
     if config.settings.debug_mode {
-        println!("🔧 读取{} - 使用配置偏移量: {:#X} (地址: {:#X})", field_name, field_offset, test_base);
+        println!("🔧 读取{} - 使用配置偏移量: {:#X}", field_name, field_offset);
     }
 
     // 解析指针链获取字段基地址
@@ -193,9 +209,8 @@ fn read_string_field(handle: HANDLE, base_address: usize, config: &Config, field
         // 检查指针是否合理
         if final_ptr > 0x1000 && final_ptr < 0x7FFFFFFFFFFFFFFF {
             if config.settings.debug_mode {
-                println!("✅ {}指针链解析成功 -> 最终指针: {:#X}", field_name, final_ptr);
+                println!("✅ {}指针链解析成功", field_name);
                 println!("🔧 {}_offset: {:#X}", field_name, title_offset);
-                println!("🔧 {}最终字符串地址: {:#X}", field_name, final_ptr + title_offset);
             }
             
             // 直接使用配置中的偏移量读取字符串信息
@@ -203,7 +218,6 @@ fn read_string_field(handle: HANDLE, base_address: usize, config: &Config, field
             
             if config.settings.debug_mode {
                 println!("🔍 {}使用配置中的偏移量: {:#X}", field_name, title_offset);
-                println!("🔍 {}最终字符串地址: {:#X}", field_name, string_address);
             }
             
             let result = read_wstring(handle, string_address, Some(config.settings.max_string_length), config)
@@ -233,7 +247,7 @@ fn read_string_field(handle: HANDLE, base_address: usize, config: &Config, field
     Err(anyhow!("无法读取{}信息", field_name))
 }
 
-/// 读取32位整数值（用于调试）
+/// 读取32位整数值（用于播放时间等）
 fn read_dword(handle: HANDLE, address: usize) -> Result<u32> {
     let mut buffer: u32 = 0;
     let mut bytes_read: usize = 0;
@@ -247,8 +261,46 @@ fn read_dword(handle: HANDLE, address: usize) -> Result<u32> {
         )
     };
     if result == 0 || bytes_read != 4 {
-        Err(anyhow!("Failed to read dword at address {:#X}", address))
+        Err(anyhow!("Failed to read dword"))
     } else {
         Ok(buffer)
     }
+}
+
+/// 读取整数字段的辅助函数
+fn read_int_field(handle: HANDLE, base_address: usize, config: &Config, field_offset: &usize, chain: &[usize], field_name: &str) -> Result<u32> {
+    let test_base = base_address + field_offset;
+    
+    if config.settings.debug_mode {
+        println!("🔧 读取{} - 使用配置偏移量: {:#X}", field_name, field_offset);
+    }
+
+    // 解析指针链获取字段基地址
+    if let Ok(final_ptr) = resolve_pointer_chain(handle, test_base, chain) {
+        // 检查指针是否合理
+        if final_ptr > 0x1000 && final_ptr < 0x7FFFFFFFFFFFFFFF {
+            if config.settings.debug_mode {
+                println!("✅ {}指针链解析成功", field_name);
+            }
+            
+            let result = read_dword(handle, final_ptr)
+                .unwrap_or(0);
+            
+            if config.settings.debug_mode {
+                println!("🔍 {}读取结果: {}", field_name, result);
+            }
+            
+            return Ok(result);
+        } else {
+            if config.settings.debug_mode {
+                println!("⚠️ {}指针地址无效", field_name);
+            }
+        }
+    } else {
+        if config.settings.debug_mode {
+            println!("⚠️ {}指针链解析失败", field_name);
+        }
+    }
+    
+    Ok(0) // 返回默认值0而不是错误
 }
