@@ -1,0 +1,430 @@
+:root {
+    --primary-color: #00d2ff;
+    --secondary-color: #3a7bd5;
+    --bg-dark: #0f172a;
+    --text-primary: #f8fafc;
+    --text-secondary: #94a3b8;
+    --text-highlight: #38bdf8;
+    --glass-bg: rgba(15, 23, 42, 0.4);
+    --glass-border: rgba(255, 255, 255, 0.1);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--text-primary);
+    background-color: var(--bg-dark);
+    height: 100vh;
+    padding: 2vw;
+    overflow: hidden;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    position: relative;
+}
+
+/* 动态迷幻背景 */
+.background-animation {
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: radial-gradient(circle at center, #1e1b4b 0%, var(--bg-dark) 50%);
+    z-index: -1;
+    animation: rotateBg 60s linear infinite;
+}
+
+.background-animation::before,
+.background-animation::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: radial-gradient(circle at 30% 70%, rgba(56, 189, 248, 0.15) 0%, transparent 40%),
+        radial-gradient(circle at 70% 30%, rgba(139, 92, 246, 0.15) 0%, transparent 40%);
+    animation: pulseBg 20s ease-in-out infinite alternate;
+}
+
+.background-animation::after {
+    background: radial-gradient(circle at 60% 80%, rgba(2ec4b6, 0.1) 0%, transparent 40%),
+        radial-gradient(circle at 20% 20%, rgba(255, 159, 28, 0.05) 0%, transparent 50%);
+    animation-delay: -10s;
+}
+
+@keyframes rotateBg {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@keyframes pulseBg {
+    0% {
+        opacity: 0.5;
+        transform: scale(1);
+    }
+
+    100% {
+        opacity: 1;
+        transform: scale(1.1);
+    }
+}
+
+/* 双列布局容器 */
+.layout-container {
+    display: flex;
+    width: 100%;
+    max-width: 1600px;
+    height: 90vh;
+    gap: 30px;
+    z-index: 1;
+}
+
+/* 玻璃拟态主容器 (共用) */
+.glass-panel {
+    background: var(--glass-bg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--glass-border);
+    border-radius: 24px;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+}
+
+/* 左侧数据容器 */
+.raw-data-container {
+    flex: 1;
+    min-width: 350px;
+    max-width: 500px;
+}
+
+.panel-header {
+    padding: 18px 25px;
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: #cbd5e1;
+    background: rgba(0, 0, 0, 0.3);
+    border-bottom: 1px solid var(--glass-border);
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+}
+
+#raw-data-view {
+    flex-grow: 1;
+    overflow-y: auto;
+    padding: 20px;
+    font-size: 13px;
+    line-height: 1.5;
+    font-family: 'JetBrains Mono', 'Consolas', 'Courier New', monospace;
+    color: #4ade80;
+    /* Hacker green */
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+/* Scrollbar for raw data */
+#raw-data-view::-webkit-scrollbar {
+    width: 8px;
+}
+
+#raw-data-view::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.1);
+}
+
+#raw-data-view::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+}
+
+#raw-data-view::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.3);
+}
+
+/* 右侧 UI 容器 */
+.glass-container {
+    flex: 2;
+}
+
+/* 头部 Header */
+.header {
+    display: flex;
+    align-items: center;
+    padding: 30px;
+    gap: 20px;
+    border-bottom: 1px solid var(--glass-border);
+}
+
+.cover-wrapper {
+    width: 100px;
+    height: 100px;
+    flex-shrink: 0;
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
+}
+
+.cover-placeholder {
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+    animation: gradientShift 5s ease infinite alternate;
+}
+
+@keyframes gradientShift {
+    0% {
+        filter: hue-rotate(0deg);
+    }
+
+    100% {
+        filter: hue-rotate(45deg);
+    }
+}
+
+.song-meta {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    overflow: hidden;
+}
+
+#song-title {
+    font-size: 2rem;
+    font-weight: 800;
+    margin-bottom: 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    letter-spacing: -0.5px;
+}
+
+#song-artist {
+    font-size: 1.1rem;
+    color: var(--text-highlight);
+    margin-bottom: 4px;
+    font-weight: 500;
+}
+
+#song-album {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+}
+
+/* 歌词区 */
+.lyrics-container {
+    flex-grow: 1;
+    overflow-y: auto;
+    padding: 20px 40px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 24px;
+    scroll-behavior: smooth;
+    /* 隐藏滚动条 */
+    scrollbar-width: none;
+}
+
+.lyrics-container::-webkit-scrollbar {
+    display: none;
+}
+
+/* 伪造上下遮罩边缘 */
+.lyrics-container::before,
+.lyrics-container::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 60px;
+    z-index: 10;
+    pointer-events: none;
+}
+
+.lyrics-container::before {
+    top: 161px;
+    /* Header 底部 */
+    background: linear-gradient(to bottom, var(--glass-bg), transparent);
+}
+
+.lyrics-container::after {
+    bottom: 90px;
+    /* Footer 顶部 */
+    background: linear-gradient(to top, var(--glass-bg), transparent);
+}
+
+.lyric-line {
+    font-size: 1.4rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-align: center;
+    transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+    opacity: 0.5;
+    transform: scale(0.95);
+    white-space: pre-wrap;
+    /* 英文换行 */
+    word-break: keep-all;
+}
+
+.lyric-line.active {
+    opacity: 1;
+    transform: scale(1.05);
+    color: #fff;
+    text-shadow: 0 0 20px rgba(255, 255, 255, 0.3);
+}
+
+.qrc-word {
+    display: inline-block;
+    position: relative;
+    color: var(--text-secondary);
+    /* 未唱字暗色 */
+    background-clip: text;
+    -webkit-background-clip: text;
+}
+
+/* KTV 逐字扫光效果 */
+.qrc-word::after {
+    content: attr(data-text);
+    position: absolute;
+    left: 0;
+    top: 0;
+    color: var(--text-highlight);
+    text-shadow: 0 0 10px rgba(56, 189, 248, 0.8);
+    overflow: hidden;
+    width: var(--progress, 0%);
+    /* 由 JS 动态控制 */
+    white-space: pre;
+}
+
+
+
+/* 底部功能区 */
+.footer {
+    height: 90px;
+    padding: 0 30px;
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    border-top: 1px solid var(--glass-border);
+    flex-shrink: 0;
+}
+
+.time {
+    font-variant-numeric: tabular-nums;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    width: 45px;
+    text-align: center;
+}
+
+.progress-bar-container {
+    flex-grow: 1;
+    height: 6px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+}
+
+.progress-bar-fill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
+    border-radius: 4px;
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.6);
+    /* 平滑过渡进度 */
+    transition: width 0.1s linear;
+}
+
+/* 控制栏 */
+.controls-bar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding: 0 30px;
+    height: 36px;
+    flex-shrink: 0;
+    border-top: 1px solid var(--glass-border);
+}
+
+/* Toggle Switch */
+.toggle-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.toggle-switch input {
+    display: none;
+}
+
+.toggle-slider {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 10px;
+    transition: background 0.3s ease;
+}
+
+.toggle-slider::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    background: var(--text-secondary);
+    border-radius: 50%;
+    transition: all 0.3s ease;
+}
+
+.toggle-switch input:checked+.toggle-slider {
+    background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+}
+
+.toggle-switch input:checked+.toggle-slider::after {
+    left: 18px;
+    background: #fff;
+    box-shadow: 0 0 6px rgba(0, 210, 255, 0.5);
+}
+
+.toggle-label {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    letter-spacing: 1px;
+}
+
+.toggle-switch input:checked~.toggle-label {
+    color: var(--text-highlight);
+}
+
+/* 翻译歌词行 - 增强样式 */
+.lyric-trans {
+    display: block;
+    font-size: 0.95rem;
+    font-weight: 400;
+    margin-top: 6px;
+    color: var(--text-secondary);
+    opacity: 0.75;
+    transition: opacity 0.3s ease;
+}

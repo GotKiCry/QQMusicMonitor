@@ -34,6 +34,18 @@ pub async fn get_current_media_info() -> Result<Option<SongInfo>> {
             0.0
         };
 
+        // 获取播放状态 (Playing, Paused, etc.)
+        let is_playing = if let Ok(playback_info) = session.GetPlaybackInfo() {
+            if let Ok(status) = playback_info.PlaybackStatus() {
+                // windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing == 4
+                status == windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         return Ok(Some(SongInfo {
             title,
             artist,
@@ -45,6 +57,7 @@ pub async fn get_current_media_info() -> Result<Option<SongInfo>> {
             current_time: current_seconds as u64, // SongInfo 用的是 u64 秒
             total_time: total_seconds as u64,
             progress_percent: progress as f32,
+            is_playing,
         }));
     }
 

@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QQMusicMonitor - Live Sync</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="background-animation"></div>
+    <div class="layout-container">
+        <!-- 左侧：原始数据展示区 -->
+        <div class="raw-data-container glass-panel">
+            <div class="panel-header">🔴 Raw WebSocket Data (Live)</div>
+            <pre id="raw-data-view">Waiting for data...</pre>
+        </div>
+
+        <!-- 右侧：原有 UI -->
+        <div class="glass-container glass-panel">
+            <!-- 头部信息 -->
+            <header class="header">
+                <div class="cover-wrapper">
+                    <!-- 预留封面，如果没有 API 可以给个炫彩渐隐占位 -->
+                    <div class="cover-placeholder"></div>
+                </div>
+                <div class="song-meta">
+                    <h1 id="song-title">等待播放...</h1>
+                    <h2 id="song-artist">-</h2>
+                    <h3 id="song-album">-</h3>
+                </div>
+            </header>
+
+            <!-- 歌词展示区 -->
+            <section class="lyrics-container" id="lyrics-container">
+                <!-- 动态生成的歌词行会放在这里 -->
+                <div class="lyric-line empty-state">连接中...</div>
+            </section>
+
+            <!-- 控制栏 -->
+            <div class="controls-bar">
+                <label class="toggle-switch" title="显示/隐藏翻译歌词">
+                    <input type="checkbox" id="toggle-trans" checked>
+                    <span class="toggle-slider"></span>
+                    <span class="toggle-label">译</span>
+                </label>
+            </div>
+
+            <!-- 底部进度条 -->
+            <footer class="footer">
+                <div class="time" id="current-time">00:00</div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar-fill" id="progress-bar-fill"></div>
+                </div>
+                <div class="time" id="total-time">00:00</div>
+            </footer>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

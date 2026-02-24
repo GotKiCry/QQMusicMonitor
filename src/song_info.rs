@@ -22,11 +22,13 @@ pub struct SongInfo {
     pub album: String,
     pub lyrics: String,
     pub trans: String, // 翻译歌词
+    #[serde(skip)]
     pub qrc_raw: String, // 逐字歌词 (加密)
     pub qrc_data: Vec<QrcLine>, // 逐字歌词 (解析后)
     pub current_time: u64,        // 当前播放时间（秒）
     pub total_time: u64,          // 总时长（秒）
     pub progress_percent: f32,    // 进度百分比
+    pub is_playing: bool,         // 当前是否正在播放
 }
 
 impl SongInfo {

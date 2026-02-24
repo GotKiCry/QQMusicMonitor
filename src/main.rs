@@ -14,6 +14,7 @@ mod lyrics;
 mod song_info;
 mod qrc;
 mod local_qrc; // Enable local QRC cache module
+mod server;
 
 use cli::Cli;
 use config::Config;
@@ -60,9 +61,14 @@ async fn main() -> Result<()> {
     // 初始化歌词获取器
     let lyric_fetcher = LyricFetcher::new();
 
-
-
-    // 初始化终端
+    // 初始化数据广播通道并启动服务
+    let (tx, rx) = tokio::sync::watch::channel(SongInfo::default());
+    if config.settings.enable_server {
+        let port = config.settings.server_port;
+        tokio::spawn(async move {
+            server::start_server(port, rx).await;
+        });
+    }    // 初始化终端
     if !args.quiet {
         execute!(stdout(), terminal::Clear(terminal::ClearType::All), cursor::MoveTo(0, 0))?;
         execute!(stdout(), cursor::Hide)?;
@@ -115,12 +121,17 @@ async fn main() -> Result<()> {
                                                 }
                                             }
                                         },
-                                        Err(e) => {
-                                            // Debug 强制输出错误以便定位 Hex 无法解密的原因
-                                            let dbg_msg = format!("Failed to decode QRC: {:?}", e);
-                                            std::fs::write("qrc_decode_error.log", &dbg_msg).unwrap_or_default();
+                                        Err(_e) => {
+                                            if config.settings.debug_mode {
+                                                eprintln!("Failed to decode QRC: {:?}", _e);
+                                            }
                                         }
                                     }
+                                }
+
+                                // 最终兜底: 如果 lyrics 仍为空但 trans 不为空，将翻译作为歌词展示
+                                if info.lyrics.is_empty() && !info.trans.is_empty() {
+                                    info.lyrics = info.trans.clone();
                                 }
                             },
                             Err(e) => {
@@ -129,12 +140,8 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-
                         // 2. 如果网络请求失败或歌词为空，尝试从本地缓存读取
-                        let cache_dir_opt = match &config.settings.qrc_cache_dir {
-                            Some(dir) => Some(std::path::PathBuf::from(dir)),
-                            None => local_qrc::auto_detect_cache_dir(),
-                        };
+                        let cache_dir_opt = local_qrc::auto_detect_cache_dir();
 
                         if let Some(cache_dir) = cache_dir_opt {
                             // 2.1 尝试读取本地 QRC
@@ -200,6 +207,7 @@ async fn main() -> Result<()> {
                         current_time: 0,
                         total_time: 0,
                         progress_percent: 0.0,
+                        is_playing: false,
                     }
                 }
             },
@@ -218,6 +226,7 @@ async fn main() -> Result<()> {
                     current_time: 0,
                     total_time: 0,
                     progress_percent: 0.0,
+                    is_playing: false,
                 }
             }
         };
@@ -227,6 +236,9 @@ async fn main() -> Result<()> {
             Some(last) => last.title != current_song_info.title || last.artist != current_song_info.artist,
             None => true,
         };
+
+        // 广播最新状态给所有 WebSocket 客户端
+        let _ = tx.send(current_song_info.clone());
 
         // 写入文件（无论歌曲是否变化都可能需要更新进度等，但对于 TXT/JSON 根据需求可优化，这里单独处理歌词实时更新）
         // 对于 current_lyric.txt, 依赖于时间，所以每隔 interval 都要更新
@@ -248,8 +260,36 @@ async fn main() -> Result<()> {
         }
 
         if config.settings.output_lyric {
-            let filtered_lyrics = filter_lyrics(&current_song_info.lyrics, &current_song_info.trans, current_song_info.current_time);
-            if let Err(e) = write_info_to_lyric_txt(&filtered_lyrics, &config.settings.lyric_filename) {
+            let precise_time_ms = (current_song_info.total_time as f64 * current_song_info.progress_percent as f64 * 10.0) as u64;
+            let mut filtered_lyrics = String::new();
+            
+            if !current_song_info.qrc_data.is_empty() {
+                let (qrc_line, trans_line) = get_current_qrc_line(&current_song_info.qrc_data, &current_song_info.trans, precise_time_ms);
+                if let Some(line) = qrc_line {
+                    if trans_line.is_empty() {
+                        filtered_lyrics = line.content.clone();
+                    } else {
+                        filtered_lyrics = format!("{}\n{}", line.content, trans_line);
+                    }
+                }
+            }
+            
+            if filtered_lyrics.is_empty() {
+                filtered_lyrics = filter_lyrics(&current_song_info.lyrics, &current_song_info.trans, current_song_info.current_time);
+            }
+            
+            let display_lyric = if filtered_lyrics.trim().is_empty() {
+                if current_song_info.is_valid() && current_song_info.title != "No music playing" {
+                    // 若有歌曲播放但是暂无对应时间的歌词（如间奏或还没开始），显示省略号填充
+                    "...\n\n".to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                filtered_lyrics
+            };
+
+            if let Err(e) = write_info_to_lyric_txt(&display_lyric, &config.settings.lyric_filename) {
                 if config.settings.debug_mode && !args.quiet {
                     eprintln!("Error writing lyric to txt file: {}", e);
                 }
@@ -389,6 +429,7 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(2)).await;
         } else {
             tokio::time::sleep(Duration::from_millis(config.settings.update_interval_ms)).await;
+
         }
     }
 
@@ -433,17 +474,22 @@ fn apply_cli_overrides(mut config: Config, args: &Cli) -> Config {
         config.settings.lyric_filename = args.lyric_file.clone();
     }
     
-    if args.interval != 1000 {
+    if args.interval != 1000 && args.interval != 500 {
         config.settings.update_interval_ms = args.interval;
     }
     
+    if args.no_server {
+        config.settings.enable_server = false;
+    }
+
+    if args.port != 3000 {
+        config.settings.server_port = args.port;
+    }
+
     if args.retries != 3 {
         config.settings.max_retries = args.retries;
     }
 
-    if let Some(ref dir) = args.qrc_dir {
-        config.settings.qrc_cache_dir = Some(dir.clone());
-    }
     
     config
 }
@@ -479,17 +525,24 @@ fn get_current_qrc_line<'a>(qrc_data: &'a [QrcLine], trans: &'a str, current_tim
 
     let mut current_trans = String::new();
     if let Some(line) = current_line {
-        // 尝试从翻译中找出对应时间戳的行
+        // 尝试从翻译中找出对应时间戳的行（最近邻匹配）
         if !trans.is_empty() {
             let line_time_sec = line.start_time_ms as f64 / 1000.0;
+            let mut best_diff = f64::MAX;
             for trans_line in trans.lines() {
                 if let Some(start_bracket) = trans_line.find('[') {
                     if let Some(end_bracket) = trans_line.find(']') {
+                        let text = trans_line[end_bracket+1..].trim();
+                        // Skip empty lines and "//" placeholders
+                        if text.is_empty() || text == "//" {
+                            continue;
+                        }
                         let time_str = &trans_line[start_bracket+1..end_bracket];
                         if let Ok(time_val) = parse_lrc_time(time_str) {
-                            if (time_val - line_time_sec).abs() < 0.5 {
-                                current_trans = trans_line[end_bracket+1..].trim().to_string();
-                                break;
+                            let diff = (time_val - line_time_sec).abs();
+                            if diff < 0.1 && diff < best_diff {
+                                best_diff = diff;
+                                current_trans = text.to_string();
                             }
                         }
                     }
@@ -566,10 +619,13 @@ fn filter_lyrics(lyrics: &str, trans: &str, current_time_sec: u64) -> String {
                 if let Some(end_bracket) = line.find(']') {
                     let time_str = &line[start_bracket+1..end_bracket];
                     if let Ok(time_val) = parse_lrc_time(time_str) {
-                        // 翻译的时间轴通常和原文一致，这里找最接近当前时间且不超过当前时间的
-                        // 由于网络获取的 trans 可能微秒级差异，或者直接用相同的时间戳查找
-                        if (time_val - max_time).abs() < 0.5 { // 容差 0.5 秒
-                            current_trans = line[end_bracket+1..].trim().to_string();
+                        let text = line[end_bracket+1..].trim();
+                        // Skip empty lines and "//" placeholders
+                        if text.is_empty() || text == "//" {
+                            continue;
+                        }
+                        if (time_val - max_time).abs() < 0.1 {
+                            current_trans = text.to_string();
                             break;
                         }
                     }

@@ -20,8 +20,8 @@ pub struct Settings {
     pub output_lyric: bool,
     pub lyric_filename: String,
     pub debug_mode: bool,
-    #[serde(default)]
-    pub qrc_cache_dir: Option<String>,
+    pub enable_server: bool,
+    pub server_port: u16,
 }
 
 impl Default for Config {
@@ -37,7 +37,8 @@ impl Default for Config {
                 output_lyric: true,
                 lyric_filename: "current_lyric.txt".to_string(),
                 debug_mode: false,
-                qrc_cache_dir: None,
+                enable_server: true,
+                server_port: 3000,
             },
         }
     }

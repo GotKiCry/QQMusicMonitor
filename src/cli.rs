@@ -28,6 +28,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_lyric: bool,
 
+    /// 禁用本地同步服务
+    #[arg(long)]
+    pub no_server: bool,
+
     /// 自定义文本输出文件名
     #[arg(long, default_value = "now_playing.txt")]
     pub txt_file: String,
@@ -44,6 +48,10 @@ pub struct Cli {
     #[arg(short, long, default_value_t = 500)]
     pub interval: u64,
 
+    /// 同步服务端口
+    #[arg(long, default_value_t = 3000)]
+    pub port: u16,
+
     /// 最大重试次数
     #[arg(short, long, default_value_t = 3)]
     pub retries: u32,
@@ -52,9 +60,6 @@ pub struct Cli {
     #[arg(short, long)]
     pub quiet: bool,
 
-    /// QRC歌词缓存目录（自动检测或手动指定）
-    #[arg(long)]
-    pub qrc_dir: Option<String>,
 
     /// 显示版本信息
     #[arg(long)]
@@ -90,13 +95,15 @@ impl Cli {
         println!("      --no-txt            禁用文本文件输出");
         println!("      --no-json           禁用JSON文件输出");
         println!("      --no-lyric          禁用单独歌词文件输出");
+        println!("      --no-server         禁用本地同步服务");
         println!("      --txt-file <文件>   自定义文本输出文件名 (默认: now_playing.txt)");
         println!("      --json-file <文件>  自定义JSON输出文件名 (默认: now_playing.json)");
         println!("      --lyric-file <文件> 自定义单独歌词输出文件名 (默认: current_lyric.txt)");
         println!("  -i, --interval <毫秒>   更新间隔 (默认: 500)");
+        println!("      --port <端口>       自定义同步服务端口 (默认: 3000)");
         println!("  -r, --retries <次数>    最大重试次数 (默认: 3)");
         println!("  -q, --quiet             静默模式（不输出控制台信息）");
-        println!("      --qrc-dir <路径>    QRC歌词缓存目录（默认自动检测）");
+
         println!("  -v, --version           显示版本信息");
         println!("  -h, --help              显示帮助信息");
         println!();

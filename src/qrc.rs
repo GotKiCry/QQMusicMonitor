@@ -106,48 +106,94 @@ pub fn decode_qrc_from_file(path: &Path) -> Result<String> {
 
 // Parse the decoded XML string into structured QRC data
 pub fn parse_qrc_xml(xml_content: &str) -> Result<Vec<QrcLine>> {
-    let root = Element::parse(xml_content.as_bytes())
-        .context("Failed to parse QRC XML")?;
-    
-    let mut lines = Vec::new();
+    // First try standard XML parsing
+    if let Ok(root) = Element::parse(xml_content.as_bytes()) {
+        let mut lines = Vec::new();
 
-    // The structure usually has LyricLine inside the root
-    for child in root.children {
-        if let Some(element) = child.as_element() {
-            if element.name == "LyricLine" {
-                let content = element.attributes.get("LyricContent").cloned().unwrap_or_default();
-                let start_time_ms = element.attributes.get("StartTime").and_then(|s| s.parse().ok()).unwrap_or(0);
-                let duration_ms = element.attributes.get("Duration").and_then(|s| s.parse().ok()).unwrap_or(0);
-                
-                let mut words = Vec::new();
-                for word_child in &element.children {
-                    if let Some(word_elem) = word_child.as_element() {
-                        if word_elem.name == "LyricWord" {
-                            let word_content = word_elem.attributes.get("LyricContent").cloned().unwrap_or_default();
-                            let word_start = word_elem.attributes.get("StartTime").and_then(|s| s.parse().ok()).unwrap_or(0);
-                            let word_duration = word_elem.attributes.get("Duration").and_then(|s| s.parse().ok()).unwrap_or(0);
-                            
-                            words.push(QrcWord {
-                                content: word_content,
-                                start_time_ms: word_start,
-                                duration_ms: word_duration,
-                            });
+        // Strategy 1: Direct LyricLine + LyricWord structure
+        for child in &root.children {
+            if let Some(element) = child.as_element() {
+                if element.name == "LyricLine" {
+                    let content = element.attributes.get("LyricContent").cloned().unwrap_or_default();
+                    let start_time_ms = element.attributes.get("StartTime").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let duration_ms = element.attributes.get("Duration").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    
+                    let mut words = Vec::new();
+                    for word_child in &element.children {
+                        if let Some(word_elem) = word_child.as_element() {
+                            if word_elem.name == "LyricWord" {
+                                let word_content = word_elem.attributes.get("LyricContent").cloned().unwrap_or_default();
+                                let word_start = word_elem.attributes.get("StartTime").and_then(|s| s.parse().ok()).unwrap_or(0);
+                                let word_duration = word_elem.attributes.get("Duration").and_then(|s| s.parse().ok()).unwrap_or(0);
+                                
+                                words.push(QrcWord {
+                                    content: word_content,
+                                    start_time_ms: word_start,
+                                    duration_ms: word_duration,
+                                });
+                            }
+                        }
+                    }
+                    
+                    lines.push(QrcLine {
+                        content,
+                        start_time_ms,
+                        duration_ms,
+                        words,
+                    });
+                }
+            }
+        }
+
+        // Strategy 2: Lyric_* nodes with LyricContent as QRC text
+        if lines.is_empty() {
+            fn find_lyric_content_recursive(elem: &Element) -> Option<String> {
+                if elem.name.starts_with("Lyric_") || elem.name.starts_with("Lyric") {
+                    if let Some(content) = elem.attributes.get("LyricContent") {
+                        if !content.is_empty() {
+                            return Some(content.clone());
                         }
                     }
                 }
-                
-                lines.push(QrcLine {
-                    content,
-                    start_time_ms,
-                    duration_ms,
-                    words,
-                });
+                for child in &elem.children {
+                    if let Some(child_elem) = child.as_element() {
+                        if let Some(found) = find_lyric_content_recursive(child_elem) {
+                            return Some(found);
+                        }
+                    }
+                }
+                None
+            }
+
+            if let Some(qrc_text) = find_lyric_content_recursive(&root) {
+                lines = parse_qrc_text(&qrc_text);
+            }
+        }
+
+        if !lines.is_empty() {
+            return Ok(lines);
+        }
+    }
+
+    // Strategy 3 (Fallback): XML parsing failed (e.g. unescaped quotes in LyricContent).
+    // Extract LyricContent value directly from raw string.
+    let marker = "LyricContent=\"";
+    if let Some(start_idx) = xml_content.find(marker) {
+        let content_start = start_idx + marker.len();
+        // Find the closing pattern: either `"/>` or `">\n</` at the end of the attribute
+        // Since the content itself may contain `"`, we search for `"/>` from the end
+        if let Some(end_offset) = xml_content[content_start..].rfind("\"/>") {
+            let qrc_text = &xml_content[content_start..content_start + end_offset];
+            let lines = parse_qrc_text(qrc_text);
+            if !lines.is_empty() {
+                return Ok(lines);
             }
         }
     }
 
-    Ok(lines)
+    Err(anyhow::anyhow!("No QRC data could be parsed from XML"))
 }
+
 
 // Parse QRC text format: [start_ms,duration_ms]字(word_start,word_dur)字(word_start,word_dur)...
 // This format is used by QRC lyrics embedded in API XML's LyricContent attribute

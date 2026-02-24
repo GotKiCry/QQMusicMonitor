@@ -10,6 +10,8 @@ anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 clap = { version = "4.0", features = ["derive"] }
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
 
 # 添加用于操作Windows进程的依赖
 # (已移除 legacy winapi 依赖，现在使用 windows crate)
