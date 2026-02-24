@@ -20,15 +20,15 @@ pub struct Settings {
     pub output_lyric: bool,
     pub lyric_filename: String,
     pub debug_mode: bool,
-    #[serde(default)]
-    pub qrc_cache_dir: Option<String>,
+    pub enable_server: bool,
+    pub server_port: u16,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             settings: Settings {
-                update_interval_ms: 1000,
+                update_interval_ms: 200,
                 max_retries: 3,
                 output_txt: false,
                 output_json: true,
@@ -37,7 +37,8 @@ impl Default for Config {
                 output_lyric: true,
                 lyric_filename: "current_lyric.txt".to_string(),
                 debug_mode: false,
-                qrc_cache_dir: None,
+                enable_server: true,
+                server_port: 3000,
             },
         }
     }

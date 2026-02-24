@@ -51,3 +51,6 @@ ce/*.PTR
 # Claude Code & Agent 文件夹
 .claude/
 .agent/
+
+# Reasonix Agent 文件夹
+.reasonix/

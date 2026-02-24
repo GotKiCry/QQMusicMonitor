@@ -2,26 +2,44 @@ use std::path::{Path, PathBuf};
 
 // Function to auto-detect QQ Music lyric cache directory
 pub fn auto_detect_cache_dir() -> Option<PathBuf> {
-    // Search common drive letters for QQMusicCache
-    let candidates = vec![
-        "D:\\QQMusicCache\\QQMusicLyricNew",
-        "E:\\QQMusicCache\\QQMusicLyricNew",
-        "F:\\QQMusicCache\\QQMusicLyricNew",
-        "C:\\QQMusicCache\\QQMusicLyricNew",
-    ];
+    // Step 1: Try reading cache path from QQ Music config file
+    if let Some(path) = detect_from_qq_music_config() {
+        return Some(path);
+    }
 
-    for path_str in candidates {
-        let path = PathBuf::from(path_str);
+    // Step 2: Fallback - scan all drive letters for QQMusicCache
+    for letter in b'C'..=b'Z' {
+        let path = PathBuf::from(format!("{}:\\QQMusicCache\\QQMusicLyricNew", letter as char));
         if path.exists() && path.is_dir() {
             return Some(path);
         }
     }
 
-    // Fallback: check all available drive letters
-    for letter in b'G'..=b'Z' {
-        let path = PathBuf::from(format!("{}:\\QQMusicCache\\QQMusicLyricNew", letter as char));
-        if path.exists() && path.is_dir() {
-            return Some(path);
+    None
+}
+
+// Function to detect lyric cache dir from QQ Music's WebkitCachePath.ini config
+fn detect_from_qq_music_config() -> Option<PathBuf> {
+    // QQ Music stores cache path in %APPDATA%\Tencent\QQMusic\WebkitCachePath.ini
+    // Format: [WebkitCache]
+    //         Path=D:\QQMusicCache\WebkitCache
+    // The parent of this path is the cache root, and lyrics are in QQMusicLyricNew subdir
+    let appdata = std::env::var("APPDATA").ok()?;
+    let ini_path = PathBuf::from(&appdata)
+        .join("Tencent")
+        .join("QQMusic")
+        .join("WebkitCachePath.ini");
+
+    let content = std::fs::read_to_string(&ini_path).ok()?;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(raw_path) = trimmed.strip_prefix("Path=") {
+            let cache_root = PathBuf::from(raw_path).parent()?.to_path_buf();
+            let lyric_dir = cache_root.join("QQMusicLyricNew");
+            if lyric_dir.exists() && lyric_dir.is_dir() {
+                return Some(lyric_dir);
+            }
         }
     }
 

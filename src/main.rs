@@ -4,6 +4,7 @@ use std::io::{Write, stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use widestring::U16String;
 use crossterm::{execute, terminal, cursor};
 
@@ -14,11 +15,39 @@ mod lyrics;
 mod song_info;
 mod qrc;
 mod local_qrc; // Enable local QRC cache module
+mod server;
 
 use cli::Cli;
 use config::Config;
 use song_info::{SongInfo, QrcLine};
 use lyrics::LyricFetcher;
+
+/// 后台歌词缓存 — 由主循环读取、后台任务写入
+struct LyricsCache {
+    /// 缓存的歌曲标识 "title|artist"
+    song_key: String,
+    lyrics: String,
+    trans: String,
+    qrc_raw: String,
+    qrc_data: Vec<QrcLine>,
+}
+
+impl LyricsCache {
+    fn new() -> Self {
+        Self {
+            song_key: String::new(),
+            lyrics: String::new(),
+            trans: String::new(),
+            qrc_raw: String::new(),
+            qrc_data: Vec::new(),
+        }
+    }
+
+    /// 检查歌曲是否已缓存
+    fn has_song(&self, title: &str, artist: &str) -> bool {
+        self.song_key == format!("{}|{}", title, artist)
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,10 +86,22 @@ async fn main() -> Result<()> {
         println!("========================================\n");
     }
 
-    // 初始化歌词获取器
-    let lyric_fetcher = LyricFetcher::new();
+    // 初始化歌词获取器和后台缓存
+    let lyric_fetcher = Arc::new(LyricFetcher::with_debug(config.settings.debug_mode));
+    let lyrics_cache = Arc::new(RwLock::new(LyricsCache::new()));
 
-
+    // 初始化数据广播通道并启动服务
+    let (tx, rx) = tokio::sync::watch::channel(SongInfo::default());
+    if config.settings.enable_server {
+        let port = config.settings.server_port;
+        // 在 TUI 接管前打印服务器信息，避免与渲染竞态
+        println!("🚀 本地同步服务已启动: http://127.0.0.1:{}", port);
+        println!("📡 WebSocket 接口: ws://127.0.0.1:{}/ws", port);
+        println!("📄 当前状态接口: http://127.0.0.1:{}/api/current", port);
+        tokio::spawn(async move {
+            server::start_server(port, rx).await;
+        });
+    }
 
     // 初始化终端
     if !args.quiet {
@@ -72,124 +113,131 @@ async fn main() -> Result<()> {
 
     let mut last_song_info: Option<SongInfo> = None;
     let mut update_count = 0;
-
-
+    // 记录 SMTC 返回时刻（纳秒精度），用于精确插值，避免把 SMTC 异步耗时算进插值
+    let poll_time_nanos: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 主循环
-
     while running.load(Ordering::SeqCst) {
-        // 使用包装块捕获循环内所有可能导致崩溃的错误
+        let loop_start = tokio::time::Instant::now();
+        let poll_nanos = poll_time_nanos.clone();
         let loop_result: Result<()> = async {
-            // 使用 SMTC 读取媒体信息
+            // 使用 SMTC 读取媒体信息（含会话源过滤：只接受 QQ Music，过滤其他音源）
             let current_song_info = match smtc::get_current_media_info().await {
             Ok(info) => {
                 if let Some(mut info) = info {
-                    // 如果切歌了（或者尚无缓存），尝试获取歌词覆盖进去
-                    let should_fetch_lyrics = match &last_song_info {
-                        Some(last) => last.title != info.title || last.artist != info.artist,
-                        None => true,
-                    };
+                    // 后台歌词加载：切歌时后台请求，不阻塞 TUI
+                    let song_key = format!("{}|{}", info.title, info.artist);
+                    let cached_has_song = lyrics_cache.read().await.has_song(&info.title, &info.artist);
 
-                    if should_fetch_lyrics {
-                        // 1. 网络 API 获取 LRC + 翻译 + QRC
-                        match lyric_fetcher.fetch_lyrics(&info.title, &info.artist).await {
-                            Ok((l, t, q)) => {
-                                info.lyrics = l;
-                                info.trans = t;
-                                if !q.is_empty() {
-                                    info.qrc_raw = q;
-                                    match qrc::decode_qrc(&info.qrc_raw) {
-                                        Ok(xml) => {
-                                            if let Ok(lines) = qrc::parse_qrc_xml(&xml) {
-                                                info.qrc_data = lines;
-                                            }
-                                            // 如果普通的 LRC 爬取失败但 QRC 成功解密了，从 QRC 的 XML 提取备份歌词
-                                            if info.lyrics.is_empty() {
-                                                info.lyrics = qrc::extract_lrc_from_xml(&xml).unwrap_or_default();
-                                            }
-                                            // 如果 parse_qrc_xml 没有产出结构化数据但 lyrics 是 QRC 文本格式，用 parse_qrc_text 解析
-                                            if info.qrc_data.is_empty() && !info.lyrics.is_empty() {
-                                                let parsed = qrc::parse_qrc_text(&info.lyrics);
-                                                if !parsed.is_empty() {
-                                                    info.qrc_data = parsed;
+                    if !cached_has_song {
+                        let debug = config.settings.debug_mode;
+                        if debug { eprintln!("[lyrics] Fetching lyrics for '{} - {}' in background", info.title, info.artist); }
+                        let cache = lyrics_cache.clone();
+                        let fetcher = lyric_fetcher.clone();
+                        let key = song_key.clone();
+                        let t = info.title.clone();
+                        let a = info.artist.clone();
+                        tokio::spawn(async move {
+                            match fetcher.fetch_lyrics(&t, &a).await {
+                                Ok((l, trans, q)) => {
+                                    let mut w = cache.write().await;
+                                    w.song_key = key;
+                                    w.lyrics = l;
+                                    w.trans = trans;
+                                    w.qrc_raw = q;
+                                    if !w.qrc_raw.is_empty() {
+                                        if debug { eprintln!("[QRC] Raw data: {} bytes", w.qrc_raw.len()); }
+                                        match qrc::decode_qrc(&w.qrc_raw) {
+                                            Ok(xml) => {
+                                                if debug { eprintln!("[QRC] Decrypted XML: {} bytes", xml.len()); }
+                                                match qrc::parse_qrc_xml(&xml) {
+                                                    Ok(lines) => {
+                                                        if debug { eprintln!("[QRC] Parsed {} lines from XML", lines.len()); }
+                                                        w.qrc_data = lines;
+                                                    }
+                                                    Err(e) => {
+                                                        if debug { let preview: String = xml.chars().take(300).collect(); eprintln!("[QRC] XML parse failed: {} — preview: {}", e, preview); }
+                                                    }
                                                 }
+                                                if w.lyrics.is_empty() {
+                                                    w.lyrics = qrc::extract_lrc_from_xml(&xml).unwrap_or_default();
+                                                    if debug && !w.lyrics.is_empty() { eprintln!("[QRC] Extracted LRC from XML: {} chars", w.lyrics.len()); }
+                                                }
+                                                if w.qrc_data.is_empty() && !w.lyrics.is_empty() {
+                                                    let parsed = qrc::parse_qrc_text(&w.lyrics);
+                                                    if !parsed.is_empty() {
+                                                        if debug { eprintln!("[QRC] Text fallback parsed {} lines", parsed.len()); }
+                                                        w.qrc_data = parsed;
+                                                    }
+                                                }
+                                            },
+                                            Err(e) => {
+                                                if debug { let preview: String = w.qrc_raw.chars().take(100).collect(); eprintln!("[QRC] Decode failed: {} — raw preview: {}", e, preview); }
                                             }
-                                        },
-                                        Err(e) => {
-                                            // Debug 强制输出错误以便定位 Hex 无法解密的原因
-                                            let dbg_msg = format!("Failed to decode QRC: {:?}", e);
-                                            std::fs::write("qrc_decode_error.log", &dbg_msg).unwrap_or_default();
                                         }
                                     }
+                                    if debug { eprintln!("[lyrics] ✓ Background fetch complete for '{} - {}'", t, a); }
                                 }
-                            },
-                            Err(e) => {
-                                if config.settings.debug_mode {
-                                    eprintln!("Lyric fetch error from API: {}", e);
+                                Err(e) => {
+                                    if debug { eprintln!("[lyrics] Background fetch failed for '{} - {}': {}", t, a, e); }
+                                }
+                            }
+                        });
+                    }
+
+                    // 从缓存中获取歌词 + QRC 数据
+                    {
+                        let cached = lyrics_cache.read().await;
+                        info.lyrics = cached.lyrics.clone();
+                        info.trans = cached.trans.clone();
+                        info.qrc_raw = cached.qrc_raw.clone();
+                        info.qrc_data = cached.qrc_data.clone();
+                    }
+
+                    if info.lyrics.is_empty() && !info.trans.is_empty() {
+                        info.lyrics = info.trans.clone();
+                    }
+
+                    // 如果网络歌词为空，尝试从本地缓存读取
+                    let cache_dir_opt = local_qrc::auto_detect_cache_dir();
+                    if let Some(cache_dir) = cache_dir_opt {
+                        if info.qrc_raw.is_empty() {
+                            if let Some(qrc_file) = local_qrc::find_qrc_file(&cache_dir, &info.title, &info.artist) {
+                                if let Ok(xml) = qrc::decode_qrc_from_file(&qrc_file) {
+                                    info.qrc_raw = "[local]".to_string();
+                                    if let Ok(lines) = qrc::parse_qrc_xml(&xml) {
+                                        if config.settings.debug_mode { eprintln!("[QRC] Debug: loaded {} lines from local cache", lines.len()); }
+                                        info.qrc_data = lines;
+                                    }
+                                    if let Some(trans_file) = local_qrc::find_qrc_trans_file(&qrc_file) {
+                                        if let Ok(trans_xml) = qrc::decode_qrc_from_file(&trans_file) {
+                                            info.trans = trans_xml;
+                                        }
+                                    }
                                 }
                             }
                         }
-
-                        // 2. 如果网络请求失败或歌词为空，尝试从本地缓存读取
-                        let cache_dir_opt = match &config.settings.qrc_cache_dir {
-                            Some(dir) => Some(std::path::PathBuf::from(dir)),
-                            None => local_qrc::auto_detect_cache_dir(),
-                        };
-
-                        if let Some(cache_dir) = cache_dir_opt {
-                            // 2.1 尝试读取本地 QRC
-                            if info.qrc_raw.is_empty() {
-                                if let Some(qrc_file) = local_qrc::find_qrc_file(&cache_dir, &info.title, &info.artist) {
-                                    if let Ok(xml) = qrc::decode_qrc_from_file(&qrc_file) {
-                                        info.qrc_raw = "[local]".to_string(); // 用 [local] 标记来源
-                                        if let Ok(lines) = qrc::parse_qrc_xml(&xml) {
-                                            info.qrc_data = lines;
-                                        }
-
-                                        // 顺便读取翻译文件
-                                        if let Some(trans_file) = local_qrc::find_qrc_trans_file(&qrc_file) {
-                                            if let Ok(trans_xml) = qrc::decode_qrc_from_file(&trans_file) {
-                                                info.trans = trans_xml; 
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 2.2 如果连普通的 LRC 歌词都没有，尝试读取本地 LRC
-                            if info.lyrics.is_empty() {
-                                if let Some(lrc_file) = local_qrc::find_lrc_file(&cache_dir, &info.title, &info.artist) {
-                                    // LRC 文件可能被以与 QRC 同样的方式加密，也可能是明文
-                                    let lrc_raw = match qrc::decode_qrc_from_file(&lrc_file) {
+                        if info.lyrics.is_empty() {
+                            if let Some(lrc_file) = local_qrc::find_lrc_file(&cache_dir, &info.title, &info.artist) {
+                                let lrc_raw = match qrc::decode_qrc_from_file(&lrc_file) {
+                                    Ok(decrypted) => decrypted,
+                                    Err(_) => std::fs::read_to_string(&lrc_file).unwrap_or_default(),
+                                };
+                                info.lyrics = qrc::extract_lrc_from_xml(&lrc_raw).unwrap_or(lrc_raw);
+                                if let Some(trans_lrc_file) = local_qrc::find_lrc_trans_file(&lrc_file) {
+                                    let trans_raw = match qrc::decode_qrc_from_file(&trans_lrc_file) {
                                         Ok(decrypted) => decrypted,
-                                        Err(_) => std::fs::read_to_string(&lrc_file).unwrap_or_default(),
+                                        Err(_) => std::fs::read_to_string(&trans_lrc_file).unwrap_or_default(),
                                     };
-                                    
-                                    info.lyrics = qrc::extract_lrc_from_xml(&lrc_raw).unwrap_or(lrc_raw);
-                                    
-                                    // 寻找翻译 LRC
-                                    if let Some(trans_lrc_file) = local_qrc::find_lrc_trans_file(&lrc_file) {
-                                        let trans_raw = match qrc::decode_qrc_from_file(&trans_lrc_file) {
-                                            Ok(decrypted) => decrypted,
-                                            Err(_) => std::fs::read_to_string(&trans_lrc_file).unwrap_or_default(),
-                                        };
-                                        info.trans = qrc::extract_lrc_from_xml(&trans_raw).unwrap_or(trans_raw);
-                                    }
+                                    info.trans = qrc::extract_lrc_from_xml(&trans_raw).unwrap_or(trans_raw);
                                 }
                             }
-                        }
-                    } else {
-                        // 没切歌，保留上一首歌的数据
-                        if let Some(last) = &last_song_info {
-                            info.lyrics = last.lyrics.clone();
-                            info.trans = last.trans.clone();
-                            info.qrc_raw = last.qrc_raw.clone();
-                            info.qrc_data = last.qrc_data.clone();
                         }
                     }
+
                     info
                 } else {
-                    SongInfo { 
+                    SongInfo {
                         title: "No music playing".to_string(),
                         artist: String::new(),
                         album: String::new(),
@@ -199,7 +247,10 @@ async fn main() -> Result<()> {
                         qrc_data: Vec::new(),
                         current_time: 0,
                         total_time: 0,
+                        current_time_ms: 0,
+                        total_time_ms: 0,
                         progress_percent: 0.0,
+                        is_playing: false,
                     }
                 }
             },
@@ -207,7 +258,7 @@ async fn main() -> Result<()> {
                 if !args.quiet {
                     eprintln!("Error reading SMTC info: {}", e);
                 }
-                SongInfo { 
+                SongInfo {
                     title: "ERROR".to_string(),
                     artist: String::new(),
                     album: String::new(),
@@ -217,9 +268,40 @@ async fn main() -> Result<()> {
                     qrc_data: Vec::new(),
                     current_time: 0,
                     total_time: 0,
+                    current_time_ms: 0,
+                    total_time_ms: 0,
                     progress_percent: 0.0,
+                    is_playing: false,
                 }
             }
+        };
+
+        // 记录 SMTC 调用返回的时刻（纳秒），供外部精确插值
+        poll_nanos.store(loop_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        // 对当前播放时间进行插值，使歌词高亮在两次轮询之间也能平滑跟随
+        //
+        // 延迟来源（从后往前补偿）：
+        //   1. SMTC Position() 返回的快照本身滞后于实际播放位置
+        //   2. QQ Music → SMTC 之间有缓冲延迟
+        //   3. 我们的 SMTC 轮询间隔造成的更新滞后
+        //
+        // 策略：用 poll_time（SMTC 返回时刻）而非 loop_start 作为插值基准，
+        //        避免把 SMTC 异步调用耗时算进插值；再加一个固定前置量补偿 SMTC 滞后。
+        let smtc_offset_ms = 200;  // 补偿 SMTC 报告位置滞后于实际播放位置的固定偏移
+        let display_time_ms = if current_song_info.is_playing {
+            // 从 poll_time_nanos 反推 SMTC 返回的时刻距今多久
+            let poll_elapsed_ns = poll_time_nanos.load(Ordering::Relaxed);
+            let poll_time = tokio::time::Instant::now() - std::time::Duration::from_nanos(poll_elapsed_ns);
+            let elapsed_since_poll = poll_time.elapsed().as_millis() as u64;
+            let interpolated = current_song_info.current_time_ms + elapsed_since_poll + smtc_offset_ms;
+            if current_song_info.total_time_ms > 0 {
+                interpolated.min(current_song_info.total_time_ms)
+            } else {
+                interpolated
+            }
+        } else {
+            current_song_info.current_time_ms
         };
 
         // 检查歌曲是否有变化 (用于文件输出)
@@ -228,8 +310,10 @@ async fn main() -> Result<()> {
             None => true,
         };
 
-        // 写入文件（无论歌曲是否变化都可能需要更新进度等，但对于 TXT/JSON 根据需求可优化，这里单独处理歌词实时更新）
-        // 对于 current_lyric.txt, 依赖于时间，所以每隔 interval 都要更新
+        // 广播最新状态给所有 WebSocket 客户端
+        let _ = tx.send(current_song_info.clone());
+
+        // 写入文件
         if config.settings.output_txt && song_changed {
             if let Err(e) = write_info_to_txt(&current_song_info, &config.settings.txt_filename) {
                 if config.settings.debug_mode && !args.quiet {
@@ -237,9 +321,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        
+
         if config.settings.output_json {
-            // JSON 包含进度，可以每隔一定时间更新一次，不过这里就每帧刷新了
             if let Err(e) = write_info_to_json(&current_song_info, &config.settings.json_filename) {
                 if config.settings.debug_mode && !args.quiet {
                     eprintln!("Error writing to json file: {}", e);
@@ -248,136 +331,152 @@ async fn main() -> Result<()> {
         }
 
         if config.settings.output_lyric {
-            let filtered_lyrics = filter_lyrics(&current_song_info.lyrics, &current_song_info.trans, current_song_info.current_time);
-            if let Err(e) = write_info_to_lyric_txt(&filtered_lyrics, &config.settings.lyric_filename) {
+            let precise_time_ms = display_time_ms;
+            let mut filtered_lyrics = String::new();
+
+            if !current_song_info.qrc_data.is_empty() {
+                let (qrc_line, trans_line) = get_current_qrc_line(&current_song_info.qrc_data, &current_song_info.trans, precise_time_ms);
+                if let Some(line) = qrc_line {
+                    if trans_line.is_empty() {
+                        filtered_lyrics = line.content.clone();
+                    } else {
+                        filtered_lyrics = format!("{}\n{}", line.content, trans_line);
+                    }
+                }
+            }
+
+            if filtered_lyrics.is_empty() {
+                filtered_lyrics = filter_lyrics(&current_song_info.lyrics, &current_song_info.trans, current_song_info.current_time);
+            }
+
+            let display_lyric = if filtered_lyrics.trim().is_empty() {
+                if current_song_info.is_valid() && current_song_info.title != "No music playing" {
+                    "...\n\n".to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                filtered_lyrics
+            };
+
+            if let Err(e) = write_info_to_lyric_txt(&display_lyric, &config.settings.lyric_filename) {
                 if config.settings.debug_mode && !args.quiet {
                     eprintln!("Error writing lyric to txt file: {}", e);
                 }
             }
         }
 
-        // 更新控制台显示
+        // TUI 渲染（直接用 SMTC 的 current_time_ms，不插值）
         if !args.quiet {
             use crossterm::style::Stylize;
-            execute!(stdout(), cursor::MoveTo(0, 0))?;
-            
-            // 显示歌曲信息
+
+            let mut frame = String::new();
+
             if current_song_info.is_valid() && current_song_info.title != "No music playing" {
-                // 处理空数据，用<参数名>替代
                 let title = if current_song_info.title.is_empty() { "<歌曲名>" } else { &current_song_info.title };
                 let artist = if current_song_info.artist.is_empty() { "<歌手>" } else { &current_song_info.artist };
                 let album = if current_song_info.album.is_empty() { "<专辑>" } else { &current_song_info.album };
-                
-                // 第一行：歌曲名-歌手 (绿色高亮)
-                let line1 = format!("{}-{}", title, artist);
-                print!("{:<80}", line1.green().bold());
-                execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                println!();
-                
-                // 第二行：专辑信息 (灰色)
-                let album_line = format!("专辑:{}", album);
-                print!("{:<80}", album_line.dark_grey());
-                execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                println!();
-                
-                // 第三行：进度条和时间信息 (青色)
+
+                let title_text = format!("{}-{}", title, artist);
+                frame.push_str(&pad_line(&title_text.clone(), format!("{}", title_text.green().bold()), 80));
+
+                let album_text = format!("专辑:{}", album);
+                frame.push_str(&pad_line(&album_text.clone(), format!("{}", album_text.dark_grey()), 80));
+
                 if current_song_info.total_time > 0 {
-                    let progress_bar = current_song_info.get_progress_bar(20).cyan();
-                    let time_info = format!("{} / {} [{:.1}%]", 
+                    let status_icon = if current_song_info.is_playing { "▶" } else { "▐▐" };
+                    let status = status_icon.cyan();
+                    let progress_bar = current_song_info.get_progress_bar(19).cyan();
+                    let time_info = format!("{} / {} [{:.1}%]",
                         current_song_info.format_current_time(),
                         current_song_info.format_total_time(),
                         current_song_info.progress_percent).cyan();
-                    print!("{} {}", progress_bar, time_info);
-                    execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                    println!();
+                    frame.push_str(&pad_styled(&format!("{} {} {}", status, progress_bar, time_info), 80));
+                    frame.push('\n');
                 } else {
-                    print!("{}", chrono::Local::now().format("%H:%M:%S").to_string().dark_grey());
-                    execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                    println!();
+                    frame.push_str(&pad_line(&chrono::Local::now().format("%H:%M:%S").to_string(), format!("{}", chrono::Local::now().format("%H:%M:%S").to_string().dark_grey()), 80));
                 }
-                
-                println!(); // 空一行
 
-                // 显示歌词（如果有）
+                frame.push('\n');
+
+                // 显示歌词
+                if config.settings.debug_mode && !current_song_info.qrc_data.is_empty() {
+                    eprintln!("[lyric] QRC mode: {} lines, {} total words, current_time_ms={}, display_time_ms={}",
+                        current_song_info.qrc_data.len(),
+                        current_song_info.qrc_data.iter().map(|l| l.words.len()).sum::<usize>(),
+                        current_song_info.current_time_ms,
+                        display_time_ms);
+                    for (i, l) in current_song_info.qrc_data.iter().enumerate() {
+                        eprintln!("[lyric]   line[{}]: start={} dur={} content={:?} words={}",
+                            i, l.start_time_ms, l.duration_ms, l.content, l.words.len());
+                        if !l.words.is_empty() {
+                            let first = &l.words[0];
+                            let last = &l.words[l.words.len()-1];
+                            eprintln!("[lyric]     first_word: {:?} start={} dur={} | last_word: {:?} start={} dur={}",
+                                first.content, first.start_time_ms, first.duration_ms,
+                                last.content, last.start_time_ms, last.duration_ms);
+                        }
+                    }
+                }
                 if !current_song_info.qrc_data.is_empty() {
-                    // To get more precise time than SMTC's integer seconds, use progress_percent:
-                    let precise_time_ms = (current_song_info.total_time as f64 * current_song_info.progress_percent as f64 * 10.0) as u64;
-
+                    let precise_time_ms = display_time_ms;
                     let (qrc_line, trans_line) = get_current_qrc_line(&current_song_info.qrc_data, &current_song_info.trans, precise_time_ms);
                     if let Some(line) = qrc_line {
-                        print!("{}", render_qrc_line(line, precise_time_ms));
-                        execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                        println!();
-
+                        frame.push_str(&pad_styled(&render_qrc_line(line, precise_time_ms, config.settings.debug_mode), 80));
+                        frame.push('\n');
                         if !trans_line.is_empty() {
-                            print!("{}", trans_line.white());
-                            execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                            println!();
+                            frame.push_str(&pad_line(&trans_line.clone(), format!("{}", trans_line.white()), 80));
                         }
                     } else {
-                        print!("...");
-                        execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                        println!();
+                        frame.push_str(&pad_line("...", format!("{}", "...".dark_grey()), 80));
                     }
                 } else if !current_song_info.lyrics.is_empty() {
                     let filtered_lyrics = filter_lyrics(&current_song_info.lyrics, &current_song_info.trans, current_song_info.current_time);
                     if !filtered_lyrics.is_empty() {
-                         // 歌词可能包含两行（原唱+翻译）
                          let mut lines = filtered_lyrics.lines();
                           if let Some(orig) = lines.next() {
-                             print!("{}", orig.yellow().bold());
-                             execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                             println!();
+                             frame.push_str(&pad_line(&orig, format!("{}", orig.yellow().bold()), 80));
                          }
                          if let Some(trans) = lines.next() {
-                             print!("{}", trans.white());
-                             execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                             println!();
+                             frame.push_str(&pad_line(&trans, format!("{}", trans.white()), 80));
                          }
                     } else {
-                        print!("...");
-                        execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                        println!();
+                        frame.push_str(&pad_line("...", format!("{}", "...".dark_grey()), 80));
                     }
-                } else {
-                     print!("{}", "Lyrics not found".dark_red());
-                     execute!(stdout(), terminal::Clear(terminal::ClearType::UntilNewLine))?;
-                     println!();
                 }
 
                 // QRC 调试信息
                 if config.settings.debug_mode {
                     if !current_song_info.qrc_data.is_empty() {
                         let source = if current_song_info.qrc_raw == "[local]" { "本地缓存" } else { "API" };
-                        let qrc_info = format!("[QRC] {} | {} 行逐字数据", source, current_song_info.qrc_data.len());
-                        println!("{}", qrc_info.cyan());
+                        let word_count: usize = current_song_info.qrc_data.iter().map(|l| l.words.len()).sum();
+                        let qrc_debug = format!("[QRC] {} | {} 行, {} 个逐字词 | 当前: {}ms", source, current_song_info.qrc_data.len(), word_count, current_song_info.current_time_ms);
+                        frame.push_str(&pad_line(&qrc_debug.clone(), format!("{}", qrc_debug.cyan()), 80));
                     } else if !current_song_info.lyrics.is_empty() {
-                         println!("{}", "[QRC] 无逐字歌词数据".dark_grey());
+                         frame.push_str(&pad_line("[QRC] 无逐字歌词数据 (qrc_data 为空)", format!("{}", "[QRC] 无逐字歌词数据 (qrc_data 为空)".dark_grey()), 80));
                     }
                 }
             } else {
-                println!("{:<80}", "No music playing...".dark_grey());
-                println!("{:<80}", "");
-                println!("{:<80}", format!("{}", chrono::Local::now().format("%H:%M:%S")).dark_grey());
-                println!("{:<80}", "");
+                frame.push_str(&pad_line("No music playing...", format!("{}", "No music playing...".dark_grey()), 80));
+                frame.push_str(&pad_line("", format!(""), 80));
+                frame.push_str(&pad_line(&chrono::Local::now().format("%H:%M:%S").to_string(), format!("{}", chrono::Local::now().format("%H:%M:%S").to_string().dark_grey()), 80));
+                frame.push_str(&pad_line("", format!(""), 80));
             }
-            
-            // 调试模式下显示详细信息
+
             if config.settings.debug_mode {
-                println!("{}", "─".repeat(80).dark_grey());
-                let debug_line = format!("SMTC Mode | 更新: {} | 间隔: {}ms", 
-                    update_count, config.settings.update_interval_ms);
-                println!("{}", debug_line.dark_grey());
+                frame.push_str(&pad_line(&"─".repeat(80), format!("{}", "─".repeat(80).dark_grey()), 80));
+                let debug_text = format!("SMTC Mode | 更新: {} | 间隔: {}ms", update_count, config.settings.update_interval_ms);
+                frame.push_str(&pad_line(&debug_text.clone(), format!("{}", debug_text.dark_grey()), 80));
             }
-            
-            // 清除剩余的行（防止歌词变短时的残留）
+
+            execute!(stdout(), cursor::MoveTo(0, 0))?;
+            print!("{}", frame);
             execute!(stdout(), terminal::Clear(terminal::ClearType::FromCursorDown))?;
         }
 
         last_song_info = Some(current_song_info);
         update_count += 1;
-        
-        // 等待下一次更新
+
             Ok(())
         }.await;
 
@@ -385,10 +484,13 @@ async fn main() -> Result<()> {
             if config.settings.debug_mode && !args.quiet {
                 eprintln!("Critical loop error: {}", e);
             }
-            // 发生严重错误时稍微多睡一会，防止死循环刷屏
             tokio::time::sleep(Duration::from_secs(2)).await;
         } else {
-            tokio::time::sleep(Duration::from_millis(config.settings.update_interval_ms)).await;
+            let elapsed = loop_start.elapsed();
+            let interval = Duration::from_millis(config.settings.update_interval_ms);
+            if elapsed < interval {
+                tokio::time::sleep(interval - elapsed).await;
+            }
         }
     }
 
@@ -433,17 +535,21 @@ fn apply_cli_overrides(mut config: Config, args: &Cli) -> Config {
         config.settings.lyric_filename = args.lyric_file.clone();
     }
     
-    if args.interval != 1000 {
-        config.settings.update_interval_ms = args.interval;
-    }
+    // CLI --interval 始终覆盖配置文件
+    config.settings.update_interval_ms = args.interval;
     
+    if args.no_server {
+        config.settings.enable_server = false;
+    }
+
+    if args.port != 3000 {
+        config.settings.server_port = args.port;
+    }
+
     if args.retries != 3 {
         config.settings.max_retries = args.retries;
     }
 
-    if let Some(ref dir) = args.qrc_dir {
-        config.settings.qrc_cache_dir = Some(dir.clone());
-    }
     
     config
 }
@@ -479,17 +585,24 @@ fn get_current_qrc_line<'a>(qrc_data: &'a [QrcLine], trans: &'a str, current_tim
 
     let mut current_trans = String::new();
     if let Some(line) = current_line {
-        // 尝试从翻译中找出对应时间戳的行
+        // 尝试从翻译中找出对应时间戳的行（最近邻匹配）
         if !trans.is_empty() {
             let line_time_sec = line.start_time_ms as f64 / 1000.0;
+            let mut best_diff = f64::MAX;
             for trans_line in trans.lines() {
                 if let Some(start_bracket) = trans_line.find('[') {
                     if let Some(end_bracket) = trans_line.find(']') {
+                        let text = trans_line[end_bracket+1..].trim();
+                        // Skip empty lines and "//" placeholders
+                        if text.is_empty() || text == "//" {
+                            continue;
+                        }
                         let time_str = &trans_line[start_bracket+1..end_bracket];
                         if let Ok(time_val) = parse_lrc_time(time_str) {
-                            if (time_val - line_time_sec).abs() < 0.5 {
-                                current_trans = trans_line[end_bracket+1..].trim().to_string();
-                                break;
+                            let diff = (time_val - line_time_sec).abs();
+                            if diff < 0.1 && diff < best_diff {
+                                best_diff = diff;
+                                current_trans = text.to_string();
                             }
                         }
                     }
@@ -501,38 +614,95 @@ fn get_current_qrc_line<'a>(qrc_data: &'a [QrcLine], trans: &'a str, current_tim
     (current_line, current_trans)
 }
 
-/// 渲染带高亮的 QRC 逐字歌词
-fn render_qrc_line(line: &QrcLine, current_time_ms: u64) -> String {
+/// 在字符索引处拆分字符串（支持中文字符）
+fn split_str_at_char(s: &str, char_idx: usize) -> (&str, &str) {
+    let mut ci = 0;
+    for (i, _) in s.char_indices() {
+        if ci == char_idx {
+            return (&s[..i], &s[i..]);
+        }
+        ci += 1;
+    }
+    (s, "")
+}
+
+/// 渲染带逐字进度高亮的 QRC 歌词
+fn render_qrc_line(line: &QrcLine, current_time_ms: u64, debug: bool) -> String {
     use crossterm::style::Stylize;
-    
+
+    // 计算行的有效结束时间：取行时长终点与每个字终点中的最大值，防止行时长小于字时长导致提前截断
+    let line_end_ms = {
+        let dur_end = if line.duration_ms > 0 {
+            line.start_time_ms + line.duration_ms
+        } else {
+            0
+        };
+        let word_end = line.words.last()
+            .map(|w| w.start_time_ms + w.duration_ms)
+            .unwrap_or(0);
+        let end = dur_end.max(word_end);
+        if end > 0 { end } else { line.start_time_ms + 5000 }
+    };
+
+    if debug {
+        eprintln!("[render] cur={} line_start={} line_end={} line_dur={} words={} content={:?}",
+            current_time_ms, line.start_time_ms, line_end_ms, line.duration_ms,
+            line.words.len(), line.content);
+    }
+
     // 如果还没唱到这行，全灰
     if current_time_ms < line.start_time_ms {
+        if debug { eprintln!("[render] -> BEFORE (dark_grey)"); }
         return line.content.clone().dark_grey().to_string();
     }
-    
+
     // 如果这行已经唱完了，全黄
-    if current_time_ms >= line.start_time_ms + line.duration_ms {
+    if current_time_ms >= line_end_ms {
+        if debug { eprintln!("[render] -> AFTER (yellow bold)"); }
         return line.content.clone().yellow().bold().to_string();
     }
-    
-    // 正在唱这一行：按字渲染
+
+    // 没有逐字数据时，按行整体进度显示
+    if line.words.is_empty() {
+        let progress = ((current_time_ms - line.start_time_ms) as f64
+            / (line_end_ms - line.start_time_ms) as f64)
+            .clamp(0.0, 1.0);
+        let char_count = line.content.chars().count();
+        let split_idx = ((char_count as f64) * progress).ceil() as usize;
+        let (done, todo) = split_str_at_char(&line.content, split_idx);
+        if debug { eprintln!("[render] -> EMPTY_WORDS progress={:.2}", progress); }
+        return format!("{}{}", done.yellow().bold(), todo.dark_grey());
+    }
+
+    // 正在唱这一行：逐字渲染，当前字按进度分高低亮
+    // word.start_time_ms 已是基于歌曲开头的绝对时间
     let mut result = String::new();
     for word in &line.words {
-        // QRC 文本格式中 word.start_time_ms 已经是绝对时间（相对于歌曲开头）
-        let word_end_ms = word.start_time_ms + word.duration_ms;
-        
-        if current_time_ms >= word_end_ms {
+        let word_start_abs = word.start_time_ms;
+        let word_dur = if word.duration_ms > 0 { word.duration_ms } else { 200 };
+        let word_end_abs = word_start_abs + word_dur;
+
+        if current_time_ms >= word_end_abs {
+            if debug { eprintln!("[render]   word={:?} start={} end={} -> FINISHED", word.content, word_start_abs, word_end_abs); }
             // 这个字已经唱完，显示黄色
             result.push_str(&word.content.clone().yellow().bold().to_string());
-        } else if current_time_ms >= word.start_time_ms && current_time_ms < word_end_ms {
-            // 正在唱的字，高亮青色
-            result.push_str(&word.content.clone().cyan().bold().to_string());
+        } else if current_time_ms >= word_start_abs && current_time_ms < word_end_abs {
+            // 正在唱的字：按时间进度拆分为"已唱"和"未唱"两部分
+            let progress = ((current_time_ms - word_start_abs) as f64 / word_dur as f64)
+                .clamp(0.0, 1.0);
+            let char_count = word.content.chars().count();
+            let split_idx = ((char_count as f64) * progress).ceil() as usize;
+            let (done, todo) = split_str_at_char(&word.content, split_idx);
+            if debug { eprintln!("[render]   word={:?} start={} end={} -> IN_PROGRESS progress={:.2} split={}", word.content, word_start_abs, word_end_abs, progress, split_idx); }
+            result.push_str(&done.yellow().bold().to_string());
+            result.push_str(&todo.dark_grey().to_string());
         } else {
+            if debug { eprintln!("[render]   word={:?} start={} end={} -> PENDING", word.content, word_start_abs, word_end_abs); }
             // 还没唱到的字，显示暗色
             result.push_str(&word.content.clone().dark_grey().to_string());
         }
     }
-    
+
     result
 }
 
@@ -566,10 +736,13 @@ fn filter_lyrics(lyrics: &str, trans: &str, current_time_sec: u64) -> String {
                 if let Some(end_bracket) = line.find(']') {
                     let time_str = &line[start_bracket+1..end_bracket];
                     if let Ok(time_val) = parse_lrc_time(time_str) {
-                        // 翻译的时间轴通常和原文一致，这里找最接近当前时间且不超过当前时间的
-                        // 由于网络获取的 trans 可能微秒级差异，或者直接用相同的时间戳查找
-                        if (time_val - max_time).abs() < 0.5 { // 容差 0.5 秒
-                            current_trans = line[end_bracket+1..].trim().to_string();
+                        let text = line[end_bracket+1..].trim();
+                        // Skip empty lines and "//" placeholders
+                        if text.is_empty() || text == "//" {
+                            continue;
+                        }
+                        if (time_val - max_time).abs() < 0.1 {
+                            current_trans = text.to_string();
                             break;
                         }
                     }
@@ -604,6 +777,38 @@ fn parse_lrc_time(time_str: &str) -> Result<f64, ()> {
         return Ok(min * 60.0 + sec);
     }
     Err(())
+}
+
+/// 渲染内容并补空格到指定可见宽度
+/// 解决 Stylize 的 ANSI 转义码被 `{:<w}` 计入宽度的问题
+fn pad_line(text: &str, styled: String, width: usize) -> String {
+    let visible = text.chars().count();
+    if visible < width {
+        format!("{}{}\n", styled, " ".repeat(width - visible))
+    } else {
+        format!("{}\n", styled)
+    }
+}
+
+/// 对已包含 ANSI 转义码的字符串按可见宽度补空格
+fn pad_styled(styled: &str, width: usize) -> String {
+    // 粗略计算可见宽度：去掉 \x1b[... 转义序列后数可见字符
+    // 不引入 regex 依赖，通过简单状态机跳过 ANSI 序列
+    let mut visible = 0;
+    let mut in_escape = false;
+    for c in styled.chars() {
+        if in_escape {
+            if c == 'm' || c == 'H' { in_escape = false; }
+            continue;
+        }
+        if c == '\x1b' { in_escape = true; continue; }
+        visible += 1;
+    }
+    if visible < width {
+        format!("{}{}", styled, " ".repeat(width - visible))
+    } else {
+        styled.to_string()
+    }
 }
 
 /// 将歌曲信息完整写入JSON文件
