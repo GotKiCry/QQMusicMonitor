@@ -27,6 +27,10 @@ pub struct SongInfo {
     pub qrc_data: Vec<QrcLine>, // 逐字歌词 (解析后)
     pub current_time: u64,        // 当前播放时间（秒）
     pub total_time: u64,          // 总时长（秒）
+    #[serde(skip)]
+    pub current_time_ms: u64,     // 当前播放时间（毫秒），用于 QRC 精确逐字渲染
+    #[serde(skip)]
+    pub total_time_ms: u64,       // 总时长（毫秒）
     pub progress_percent: f32,    // 进度百分比
     pub is_playing: bool,         // 当前是否正在播放
 }

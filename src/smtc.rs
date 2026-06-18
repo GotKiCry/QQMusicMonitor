@@ -23,8 +23,11 @@ pub async fn get_current_media_info() -> Result<Option<SongInfo>> {
         let position = timeline_properties.Position()?;
         let end_time = timeline_properties.EndTime()?;
         
+        // 直接计算毫秒精确值 (SMTC 用 100ns ticks)
+        let current_time_ms = (position.Duration / 10_000) as u64;  // 100ns → ms
+        let total_time_ms = (end_time.Duration / 10_000) as u64;
+        
         // 生成 SongInfo
-        // 注意：SMTC 的时间单位是 TimeSpan (100ns tick)，Windows crate 会自动转换为 std::time::Duration
         let current_seconds = (position.Duration as f64) / 10_000_000.0;
         let total_seconds = (end_time.Duration as f64) / 10_000_000.0;
 
@@ -56,6 +59,8 @@ pub async fn get_current_media_info() -> Result<Option<SongInfo>> {
             qrc_data: Vec::new(),
             current_time: current_seconds as u64, // SongInfo 用的是 u64 秒
             total_time: total_seconds as u64,
+            current_time_ms,
+            total_time_ms,
             progress_percent: progress as f32,
             is_playing,
         }));

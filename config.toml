@@ -2,7 +2,7 @@
 
 [settings]
 # 更新间隔（毫秒）
-update_interval_ms = 1000
+update_interval_ms = 500
 
 # 最大重试次数
 max_retries = 3
@@ -14,7 +14,7 @@ txt_filename = "now_playing.txt"
 json_filename = "now_playing.json"
 
 # 歌词输出设置
-output_lyric = false
+output_lyric = true
 lyric_filename = "current_lyric.txt"
 
 # 调试模式

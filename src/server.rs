@@ -28,9 +28,6 @@ pub async fn start_server(port: u16, receiver: watch::Receiver<SongInfo>) {
 
     let addr = format!("127.0.0.1:{}", port);
     if let Ok(listener) = tokio::net::TcpListener::bind(&addr).await {
-        println!("🚀 本地同步服务已启动: http://{}", addr);
-        println!("📡 WebSocket 接口: ws://{}/ws", addr);
-        println!("📄 当前状态接口: http://{}/api/current", addr);
         axum::serve(listener, app).await.ok();
     } else {
         eprintln!("❌ 无法绑定端口 {}", port);
