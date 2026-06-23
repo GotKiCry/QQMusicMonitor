@@ -28,7 +28,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             settings: Settings {
-                update_interval_ms: 1000,
+                update_interval_ms: 200,
                 max_retries: 3,
                 output_txt: false,
                 output_json: true,

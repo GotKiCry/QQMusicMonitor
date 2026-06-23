@@ -20,7 +20,7 @@ crossterm = "0.27"
 chrono = "0.4"
 ctrlc = "3.4"
 regex = "1.0"
-windows = { version = "0.62.2", features = ["Media_Control", "Foundation", "Storage_Streams"] }
+windows = { version = "0.62.2", features = ["Media_Control", "Foundation", "Foundation_Collections", "Storage_Streams"] }
 reqwest = { version = "0.13.2", features = ["json", "blocking"] }
 base64 = "0.22.1"
 des = "0.8.1"

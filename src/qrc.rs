@@ -123,9 +123,10 @@ pub fn parse_qrc_xml(xml_content: &str) -> Result<Vec<QrcLine>> {
                         if let Some(word_elem) = word_child.as_element() {
                             if word_elem.name == "LyricWord" {
                                 let word_content = word_elem.attributes.get("LyricContent").cloned().unwrap_or_default();
-                                let word_start = word_elem.attributes.get("StartTime").and_then(|s| s.parse().ok()).unwrap_or(0);
+                                let word_start: u64 = word_elem.attributes.get("StartTime").and_then(|s| s.parse().ok()).unwrap_or(0);
                                 let word_duration = word_elem.attributes.get("Duration").and_then(|s| s.parse().ok()).unwrap_or(0);
                                 
+                                // LyricWord.StartTime 是绝对时间（相对于歌曲开头）
                                 words.push(QrcWord {
                                     content: word_content,
                                     start_time_ms: word_start,
@@ -272,6 +273,7 @@ pub fn parse_qrc_text(qrc_text: &str) -> Vec<QrcLine> {
                     let word_duration: u64 = timing_parts[1].trim().parse().unwrap_or(0);
 
                     content.push_str(&word_text);
+                    // 文本格式字时间是绝对时间（相对于歌曲开头），与 XML 格式一致
                     words.push(QrcWord {
                         content: word_text,
                         start_time_ms: word_start,
