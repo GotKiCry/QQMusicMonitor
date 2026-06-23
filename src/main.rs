@@ -113,10 +113,13 @@ async fn main() -> Result<()> {
 
     let mut last_song_info: Option<SongInfo> = None;
     let mut update_count = 0;
+    // 记录 SMTC 返回时刻（纳秒精度），用于精确插值，避免把 SMTC 异步耗时算进插值
+    let poll_time_nanos: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 主循环
     while running.load(Ordering::SeqCst) {
         let loop_start = tokio::time::Instant::now();
+        let poll_nanos = poll_time_nanos.clone();
         let loop_result: Result<()> = async {
             // 使用 SMTC 读取媒体信息（含会话源过滤：只接受 QQ Music，过滤其他音源）
             let current_song_info = match smtc::get_current_media_info().await {
@@ -273,10 +276,25 @@ async fn main() -> Result<()> {
             }
         };
 
+        // 记录 SMTC 调用返回的时刻（纳秒），供外部精确插值
+        poll_nanos.store(loop_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
         // 对当前播放时间进行插值，使歌词高亮在两次轮询之间也能平滑跟随
+        //
+        // 延迟来源（从后往前补偿）：
+        //   1. SMTC Position() 返回的快照本身滞后于实际播放位置
+        //   2. QQ Music → SMTC 之间有缓冲延迟
+        //   3. 我们的 SMTC 轮询间隔造成的更新滞后
+        //
+        // 策略：用 poll_time（SMTC 返回时刻）而非 loop_start 作为插值基准，
+        //        避免把 SMTC 异步调用耗时算进插值；再加一个固定前置量补偿 SMTC 滞后。
+        let smtc_offset_ms = 200;  // 补偿 SMTC 报告位置滞后于实际播放位置的固定偏移
         let display_time_ms = if current_song_info.is_playing {
-            let elapsed_since_poll = loop_start.elapsed().as_millis() as u64;
-            let interpolated = current_song_info.current_time_ms + elapsed_since_poll;
+            // 从 poll_time_nanos 反推 SMTC 返回的时刻距今多久
+            let poll_elapsed_ns = poll_time_nanos.load(Ordering::Relaxed);
+            let poll_time = tokio::time::Instant::now() - std::time::Duration::from_nanos(poll_elapsed_ns);
+            let elapsed_since_poll = poll_time.elapsed().as_millis() as u64;
+            let interpolated = current_song_info.current_time_ms + elapsed_since_poll + smtc_offset_ms;
             if current_song_info.total_time_ms > 0 {
                 interpolated.min(current_song_info.total_time_ms)
             } else {
