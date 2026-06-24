@@ -1,17 +1,18 @@
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 
 /// 配置文件结构
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub settings: Settings,
 }
 
 /// 程序设置配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Settings {
     pub update_interval_ms: u64,
+    pub smtc_offset_ms: u64,
     pub max_retries: u32,
     pub output_txt: bool,
     pub output_json: bool,
@@ -28,7 +29,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             settings: Settings {
-                update_interval_ms: 200,
+                update_interval_ms: 100,
+                smtc_offset_ms: 200,
                 max_retries: 3,
                 output_txt: false,
                 output_json: true,

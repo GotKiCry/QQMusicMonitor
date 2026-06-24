@@ -1,12 +1,80 @@
+#![allow(dead_code)]
 use anyhow::Result;
-use std::fs::File;
-use std::io::{Write, stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use tokio::sync::RwLock;
+
+static IS_BACKGROUND: AtomicBool = AtomicBool::new(false);
+static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct FrontConfig {
+    pub server_port: u16,
+    pub smtc_offset_ms: u64,
+    pub update_interval_ms: u64,
+    pub output_txt: bool,
+    pub output_json: bool,
+    pub output_lyric: bool,
+}
+
+#[tauri::command]
+// Function to set background state.
+fn set_background_state(is_background: bool) {
+    IS_BACKGROUND.store(is_background, Ordering::SeqCst);
+}
+
+#[tauri::command]
+// Function to get current configuration asynchronously.
+async fn get_app_config() -> Result<FrontConfig, String> {
+    let cfg = CONFIG.get().ok_or("Config not initialized")?;
+    let settings = {
+        let guard = cfg.read().await;
+        guard.settings.clone()
+    };
+    Ok(FrontConfig {
+        server_port: settings.server_port,
+        smtc_offset_ms: settings.smtc_offset_ms,
+        update_interval_ms: settings.update_interval_ms,
+        output_txt: settings.output_txt,
+        output_json: settings.output_json,
+        output_lyric: settings.output_lyric,
+    })
+}
+
+#[tauri::command]
+// Function to save configuration asynchronously.
+async fn save_app_config(new_cfg: FrontConfig) -> Result<(), String> {
+    let cfg_lock = CONFIG.get().ok_or("Config not initialized")?;
+    
+    // 1. Update memory config
+    {
+        let mut guard = cfg_lock.write().await;
+        guard.settings.server_port = new_cfg.server_port;
+        guard.settings.smtc_offset_ms = new_cfg.smtc_offset_ms;
+        guard.settings.update_interval_ms = new_cfg.update_interval_ms;
+        guard.settings.output_txt = new_cfg.output_txt;
+        guard.settings.output_json = new_cfg.output_json;
+        guard.settings.output_lyric = new_cfg.output_lyric;
+    }
+    
+    // 2. Write config.toml
+    let toml_to_write = {
+        let guard = cfg_lock.read().await;
+        toml::to_string_pretty(&*guard)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?
+    };
+    
+    tokio::fs::write("config.toml", toml_to_write)
+        .await
+        .map_err(|e| format!("Failed to write config.toml: {}", e))?;
+        
+    Ok(())
+}
+use std::fs::File;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use widestring::U16String;
-use crossterm::{execute, terminal, cursor};
 
 mod cli;
 mod config;
@@ -22,54 +90,47 @@ use config::Config;
 use song_info::{SongInfo, QrcLine};
 use lyrics::LyricFetcher;
 
-/// 后台歌词缓存 — 由主循环读取、后台任务写入
-struct LyricsCache {
-    /// 缓存的歌曲标识 "title|artist"
-    song_key: String,
+use std::collections::HashMap;
+
+struct LyricsCacheEntry {
     lyrics: String,
     trans: String,
     qrc_raw: String,
     qrc_data: Vec<QrcLine>,
+    album_pic_url: String,
+}
+
+/// 后台歌词缓存 — 由主循环读取、后台任务写入 (使用 HashMap 支持多歌曲缓存，防止切歌竞态)
+struct LyricsCache {
+    entries: HashMap<String, LyricsCacheEntry>,
 }
 
 impl LyricsCache {
     fn new() -> Self {
         Self {
-            song_key: String::new(),
-            lyrics: String::new(),
-            trans: String::new(),
-            qrc_raw: String::new(),
-            qrc_data: Vec::new(),
+            entries: HashMap::new(),
         }
     }
 
     /// 检查歌曲是否已缓存
     fn has_song(&self, title: &str, artist: &str) -> bool {
-        self.song_key == format!("{}|{}", title, artist)
+        let key = format!("{}|{}", title, artist);
+        self.entries.contains_key(&key)
+    }
+
+    fn get_entry(&self, title: &str, artist: &str) -> Option<&LyricsCacheEntry> {
+        let key = format!("{}|{}", title, artist);
+        self.entries.get(&key)
+    }
+
+    fn insert_entry(&mut self, title: &str, artist: &str, entry: LyricsCacheEntry) {
+        let key = format!("{}|{}", title, artist);
+        self.entries.insert(key, entry);
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 解析命令行参数
-    let args = Cli::parse_args();
-    
-    // 处理帮助和版本信息
-    if args.help {
-        Cli::show_help();
-        return Ok(());
-    }
-    
-    if args.version {
-        Cli::show_version();
-        return Ok(());
-    }
-
-    // 加载配置
-    let config = Config::get_config();
-    
-    // 应用命令行参数覆盖配置
-    let config = apply_cli_overrides(config, &args);
+// Function to run the main monitor loop in a background thread.
+async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Config) -> Result<()> {
 
     // 设置Ctrl+C处理
     let running = Arc::new(AtomicBool::new(true));
@@ -94,92 +155,99 @@ async fn main() -> Result<()> {
     let (tx, rx) = tokio::sync::watch::channel(SongInfo::default());
     if config.settings.enable_server {
         let port = config.settings.server_port;
-        // 在 TUI 接管前打印服务器信息，避免与渲染竞态
-        println!("🚀 本地同步服务已启动: http://127.0.0.1:{}", port);
-        println!("📡 WebSocket 接口: ws://127.0.0.1:{}/ws", port);
-        println!("📄 当前状态接口: http://127.0.0.1:{}/api/current", port);
+        if config.settings.debug_mode {
+            // 在 TUI 接管前打印服务器信息，避免与渲染竞态
+            println!("🚀 本地同步服务已启动: http://127.0.0.1:{}", port);
+            println!("📡 WebSocket 接口: ws://127.0.0.1:{}/ws", port);
+            println!("📄 当前状态接口: http://127.0.0.1:{}/api/current", port);
+        }
         tokio::spawn(async move {
             server::start_server(port, rx).await;
         });
     }
 
-    // 初始化终端
-    if !args.quiet {
-        execute!(stdout(), terminal::Clear(terminal::ClearType::All), cursor::MoveTo(0, 0))?;
-        execute!(stdout(), cursor::Hide)?;
-    }
+
 
 
 
     let mut last_song_info: Option<SongInfo> = None;
     let mut update_count = 0;
-    // 记录 SMTC 返回时刻（纳秒精度），用于精确插值，避免把 SMTC 异步耗时算进插值
-    let poll_time_nanos: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 主循环
     while running.load(Ordering::SeqCst) {
         let loop_start = tokio::time::Instant::now();
-        let poll_nanos = poll_time_nanos.clone();
+        // Read active config dynamically in each loop iteration
+        let config = {
+            if let Some(cfg_lock) = CONFIG.get() {
+                cfg_lock.read().await.clone()
+            } else {
+                config.clone()
+            }
+        };
         let loop_result: Result<()> = async {
             // 使用 SMTC 读取媒体信息（含会话源过滤：只接受 QQ Music，过滤其他音源）
             let current_song_info = match smtc::get_current_media_info().await {
             Ok(info) => {
                 if let Some(mut info) = info {
                     // 后台歌词加载：切歌时后台请求，不阻塞 TUI
-                    let song_key = format!("{}|{}", info.title, info.artist);
                     let cached_has_song = lyrics_cache.read().await.has_song(&info.title, &info.artist);
 
                     if !cached_has_song {
+                        let quiet = args.quiet;
                         let debug = config.settings.debug_mode;
                         if debug { eprintln!("[lyrics] Fetching lyrics for '{} - {}' in background", info.title, info.artist); }
                         let cache = lyrics_cache.clone();
                         let fetcher = lyric_fetcher.clone();
-                        let key = song_key.clone();
                         let t = info.title.clone();
                         let a = info.artist.clone();
                         tokio::spawn(async move {
                             match fetcher.fetch_lyrics(&t, &a).await {
-                                Ok((l, trans, q)) => {
-                                    let mut w = cache.write().await;
-                                    w.song_key = key;
-                                    w.lyrics = l;
-                                    w.trans = trans;
-                                    w.qrc_raw = q;
-                                    if !w.qrc_raw.is_empty() {
-                                        if debug { eprintln!("[QRC] Raw data: {} bytes", w.qrc_raw.len()); }
-                                        match qrc::decode_qrc(&w.qrc_raw) {
+                                Ok((l, trans, q, pic_url)) => {
+                                    let mut entry = LyricsCacheEntry {
+                                        lyrics: l,
+                                        trans,
+                                        qrc_raw: q,
+                                        qrc_data: Vec::new(),
+                                        album_pic_url: pic_url,
+                                    };
+                                    if !entry.qrc_raw.is_empty() {
+                                        if debug { eprintln!("[QRC] Raw data: {} bytes", entry.qrc_raw.len()); }
+                                        match qrc::decode_qrc(&entry.qrc_raw) {
                                             Ok(xml) => {
                                                 if debug { eprintln!("[QRC] Decrypted XML: {} bytes", xml.len()); }
                                                 match qrc::parse_qrc_xml(&xml) {
                                                     Ok(lines) => {
                                                         if debug { eprintln!("[QRC] Parsed {} lines from XML", lines.len()); }
-                                                        w.qrc_data = lines;
+                                                        entry.qrc_data = lines;
                                                     }
                                                     Err(e) => {
-                                                        if debug { let preview: String = xml.chars().take(300).collect(); eprintln!("[QRC] XML parse failed: {} — preview: {}", e, preview); }
+                                                        if !quiet { eprintln!("[QRC] XML parse failed for '{} - {}': {}", t, a, e); }
                                                     }
                                                 }
-                                                if w.lyrics.is_empty() {
-                                                    w.lyrics = qrc::extract_lrc_from_xml(&xml).unwrap_or_default();
-                                                    if debug && !w.lyrics.is_empty() { eprintln!("[QRC] Extracted LRC from XML: {} chars", w.lyrics.len()); }
+                                                if entry.lyrics.is_empty() {
+                                                    entry.lyrics = qrc::extract_lrc_from_xml(&xml).unwrap_or_default();
+                                                    if debug && !entry.lyrics.is_empty() { eprintln!("[QRC] Extracted LRC from XML: {} chars", entry.lyrics.len()); }
                                                 }
-                                                if w.qrc_data.is_empty() && !w.lyrics.is_empty() {
-                                                    let parsed = qrc::parse_qrc_text(&w.lyrics);
+                                                if entry.qrc_data.is_empty() && !entry.lyrics.is_empty() {
+                                                    let parsed = qrc::parse_qrc_text(&entry.lyrics);
                                                     if !parsed.is_empty() {
                                                         if debug { eprintln!("[QRC] Text fallback parsed {} lines", parsed.len()); }
-                                                        w.qrc_data = parsed;
+                                                        entry.qrc_data = parsed;
                                                     }
                                                 }
                                             },
                                             Err(e) => {
-                                                if debug { let preview: String = w.qrc_raw.chars().take(100).collect(); eprintln!("[QRC] Decode failed: {} — raw preview: {}", e, preview); }
+                                                if !quiet { eprintln!("[QRC] Decode failed for '{} - {}': {}", t, a, e); }
                                             }
                                         }
                                     }
+                                    
+                                    let mut w = cache.write().await;
+                                    w.insert_entry(&t, &a, entry);
                                     if debug { eprintln!("[lyrics] ✓ Background fetch complete for '{} - {}'", t, a); }
                                 }
                                 Err(e) => {
-                                    if debug { eprintln!("[lyrics] Background fetch failed for '{} - {}': {}", t, a, e); }
+                                    if !quiet { eprintln!("[lyrics] Background fetch failed for '{} - {}': {}", t, a, e); }
                                 }
                             }
                         });
@@ -188,10 +256,15 @@ async fn main() -> Result<()> {
                     // 从缓存中获取歌词 + QRC 数据
                     {
                         let cached = lyrics_cache.read().await;
-                        info.lyrics = cached.lyrics.clone();
-                        info.trans = cached.trans.clone();
-                        info.qrc_raw = cached.qrc_raw.clone();
-                        info.qrc_data = cached.qrc_data.clone();
+                        if let Some(entry) = cached.get_entry(&info.title, &info.artist) {
+                            info.lyrics = entry.lyrics.clone();
+                            info.trans = entry.trans.clone();
+                            info.qrc_raw = entry.qrc_raw.clone();
+                            info.qrc_data = entry.qrc_data.clone();
+                            if !entry.album_pic_url.is_empty() {
+                                info.album_pic_url = entry.album_pic_url.clone();
+                            }
+                        }
                     }
 
                     if info.lyrics.is_empty() && !info.trans.is_empty() {
@@ -251,6 +324,8 @@ async fn main() -> Result<()> {
                         total_time_ms: 0,
                         progress_percent: 0.0,
                         is_playing: false,
+                        album_pic_url: String::new(),
+                        server_ts: 0,
                     }
                 }
             },
@@ -272,33 +347,21 @@ async fn main() -> Result<()> {
                     total_time_ms: 0,
                     progress_percent: 0.0,
                     is_playing: false,
+                    album_pic_url: String::new(),
+                    server_ts: 0,
                 }
             }
         };
 
-        // 记录 SMTC 调用返回的时刻（纳秒），供外部精确插值
-        poll_nanos.store(loop_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-        // 对当前播放时间进行插值，使歌词高亮在两次轮询之间也能平滑跟随
-        //
-        // 延迟来源（从后往前补偿）：
-        //   1. SMTC Position() 返回的快照本身滞后于实际播放位置
-        //   2. QQ Music → SMTC 之间有缓冲延迟
-        //   3. 我们的 SMTC 轮询间隔造成的更新滞后
-        //
-        // 策略：用 poll_time（SMTC 返回时刻）而非 loop_start 作为插值基准，
-        //        避免把 SMTC 异步调用耗时算进插值；再加一个固定前置量补偿 SMTC 滞后。
-        let smtc_offset_ms = 200;  // 补偿 SMTC 报告位置滞后于实际播放位置的固定偏移
+        // SMTC positions are now drift-corrected via LastUpdatedTime in smtc.rs.
+        // Only apply the user-configurable offset for fine-tuning.
+        let smtc_offset_ms = config.settings.smtc_offset_ms;
         let display_time_ms = if current_song_info.is_playing {
-            // 从 poll_time_nanos 反推 SMTC 返回的时刻距今多久
-            let poll_elapsed_ns = poll_time_nanos.load(Ordering::Relaxed);
-            let poll_time = tokio::time::Instant::now() - std::time::Duration::from_nanos(poll_elapsed_ns);
-            let elapsed_since_poll = poll_time.elapsed().as_millis() as u64;
-            let interpolated = current_song_info.current_time_ms + elapsed_since_poll + smtc_offset_ms;
+            let adjusted = current_song_info.current_time_ms + smtc_offset_ms;
             if current_song_info.total_time_ms > 0 {
-                interpolated.min(current_song_info.total_time_ms)
+                adjusted.min(current_song_info.total_time_ms)
             } else {
-                interpolated
+                adjusted
             }
         } else {
             current_song_info.current_time_ms
@@ -312,6 +375,12 @@ async fn main() -> Result<()> {
 
         // 广播最新状态给所有 WebSocket 客户端
         let _ = tx.send(current_song_info.clone());
+
+        // 如果存在 Tauri app_handle，则广播给 GUI 前端
+        if let Some(ref handle) = app_handle {
+            use tauri::Emitter;
+            let _ = handle.emit("song-info", current_song_info.clone());
+        }
 
         // 写入文件
         if config.settings.output_txt && song_changed {
@@ -366,114 +435,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        // TUI 渲染（直接用 SMTC 的 current_time_ms，不插值）
-        if !args.quiet {
-            use crossterm::style::Stylize;
-
-            let mut frame = String::new();
-
-            if current_song_info.is_valid() && current_song_info.title != "No music playing" {
-                let title = if current_song_info.title.is_empty() { "<歌曲名>" } else { &current_song_info.title };
-                let artist = if current_song_info.artist.is_empty() { "<歌手>" } else { &current_song_info.artist };
-                let album = if current_song_info.album.is_empty() { "<专辑>" } else { &current_song_info.album };
-
-                let title_text = format!("{}-{}", title, artist);
-                frame.push_str(&pad_line(&title_text.clone(), format!("{}", title_text.green().bold()), 80));
-
-                let album_text = format!("专辑:{}", album);
-                frame.push_str(&pad_line(&album_text.clone(), format!("{}", album_text.dark_grey()), 80));
-
-                if current_song_info.total_time > 0 {
-                    let status_icon = if current_song_info.is_playing { "▶" } else { "▐▐" };
-                    let status = status_icon.cyan();
-                    let progress_bar = current_song_info.get_progress_bar(19).cyan();
-                    let time_info = format!("{} / {} [{:.1}%]",
-                        current_song_info.format_current_time(),
-                        current_song_info.format_total_time(),
-                        current_song_info.progress_percent).cyan();
-                    frame.push_str(&pad_styled(&format!("{} {} {}", status, progress_bar, time_info), 80));
-                    frame.push('\n');
-                } else {
-                    frame.push_str(&pad_line(&chrono::Local::now().format("%H:%M:%S").to_string(), format!("{}", chrono::Local::now().format("%H:%M:%S").to_string().dark_grey()), 80));
-                }
-
-                frame.push('\n');
-
-                // 显示歌词
-                if config.settings.debug_mode && !current_song_info.qrc_data.is_empty() {
-                    eprintln!("[lyric] QRC mode: {} lines, {} total words, current_time_ms={}, display_time_ms={}",
-                        current_song_info.qrc_data.len(),
-                        current_song_info.qrc_data.iter().map(|l| l.words.len()).sum::<usize>(),
-                        current_song_info.current_time_ms,
-                        display_time_ms);
-                    for (i, l) in current_song_info.qrc_data.iter().enumerate() {
-                        eprintln!("[lyric]   line[{}]: start={} dur={} content={:?} words={}",
-                            i, l.start_time_ms, l.duration_ms, l.content, l.words.len());
-                        if !l.words.is_empty() {
-                            let first = &l.words[0];
-                            let last = &l.words[l.words.len()-1];
-                            eprintln!("[lyric]     first_word: {:?} start={} dur={} | last_word: {:?} start={} dur={}",
-                                first.content, first.start_time_ms, first.duration_ms,
-                                last.content, last.start_time_ms, last.duration_ms);
-                        }
-                    }
-                }
-                if !current_song_info.qrc_data.is_empty() {
-                    let precise_time_ms = display_time_ms;
-                    let (qrc_line, trans_line) = get_current_qrc_line(&current_song_info.qrc_data, &current_song_info.trans, precise_time_ms);
-                    if let Some(line) = qrc_line {
-                        frame.push_str(&pad_styled(&render_qrc_line(line, precise_time_ms, config.settings.debug_mode), 80));
-                        frame.push('\n');
-                        if !trans_line.is_empty() {
-                            frame.push_str(&pad_line(&trans_line.clone(), format!("{}", trans_line.white()), 80));
-                        }
-                    } else {
-                        frame.push_str(&pad_line("...", format!("{}", "...".dark_grey()), 80));
-                    }
-                } else if !current_song_info.lyrics.is_empty() {
-                    let filtered_lyrics = filter_lyrics(&current_song_info.lyrics, &current_song_info.trans, current_song_info.current_time);
-                    if !filtered_lyrics.is_empty() {
-                         let mut lines = filtered_lyrics.lines();
-                          if let Some(orig) = lines.next() {
-                             frame.push_str(&pad_line(&orig, format!("{}", orig.yellow().bold()), 80));
-                         }
-                         if let Some(trans) = lines.next() {
-                             frame.push_str(&pad_line(&trans, format!("{}", trans.white()), 80));
-                         }
-                    } else {
-                        frame.push_str(&pad_line("...", format!("{}", "...".dark_grey()), 80));
-                    }
-                }
-
-                // QRC 调试信息
-                if config.settings.debug_mode {
-                    if !current_song_info.qrc_data.is_empty() {
-                        let source = if current_song_info.qrc_raw == "[local]" { "本地缓存" } else { "API" };
-                        let word_count: usize = current_song_info.qrc_data.iter().map(|l| l.words.len()).sum();
-                        let qrc_debug = format!("[QRC] {} | {} 行, {} 个逐字词 | 当前: {}ms", source, current_song_info.qrc_data.len(), word_count, current_song_info.current_time_ms);
-                        frame.push_str(&pad_line(&qrc_debug.clone(), format!("{}", qrc_debug.cyan()), 80));
-                    } else if !current_song_info.lyrics.is_empty() {
-                         frame.push_str(&pad_line("[QRC] 无逐字歌词数据 (qrc_data 为空)", format!("{}", "[QRC] 无逐字歌词数据 (qrc_data 为空)".dark_grey()), 80));
-                    }
-                }
-            } else {
-                frame.push_str(&pad_line("No music playing...", format!("{}", "No music playing...".dark_grey()), 80));
-                frame.push_str(&pad_line("", format!(""), 80));
-                frame.push_str(&pad_line(&chrono::Local::now().format("%H:%M:%S").to_string(), format!("{}", chrono::Local::now().format("%H:%M:%S").to_string().dark_grey()), 80));
-                frame.push_str(&pad_line("", format!(""), 80));
-            }
-
-            if config.settings.debug_mode {
-                frame.push_str(&pad_line(&"─".repeat(80), format!("{}", "─".repeat(80).dark_grey()), 80));
-                let debug_text = format!("SMTC Mode | 更新: {} | 间隔: {}ms", update_count, config.settings.update_interval_ms);
-                frame.push_str(&pad_line(&debug_text.clone(), format!("{}", debug_text.dark_grey()), 80));
-            }
-
-            execute!(stdout(), cursor::MoveTo(0, 0))?;
-            print!("{}", frame);
-            execute!(stdout(), terminal::Clear(terminal::ClearType::FromCursorDown))?;
-        }
-
         last_song_info = Some(current_song_info);
         update_count += 1;
 
@@ -487,20 +448,17 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(2)).await;
         } else {
             let elapsed = loop_start.elapsed();
-            let interval = Duration::from_millis(config.settings.update_interval_ms);
-            if elapsed < interval {
-                tokio::time::sleep(interval - elapsed).await;
+            let current_interval = if IS_BACKGROUND.load(Ordering::Relaxed) {
+                Duration::from_millis(2000)
+            } else {
+                Duration::from_millis(config.settings.update_interval_ms)
+            };
+            if elapsed < current_interval {
+                tokio::time::sleep(current_interval - elapsed).await;
             }
         }
     }
 
-
-    // 恢复终端状态
-    if !args.quiet {
-        execute!(stdout(), cursor::Show)?;
-        execute!(stdout(), terminal::Clear(terminal::ClearType::All))?;
-        println!("程序已退出");
-    }
 
     Ok(())
 }
@@ -535,8 +493,15 @@ fn apply_cli_overrides(mut config: Config, args: &Cli) -> Config {
         config.settings.lyric_filename = args.lyric_file.clone();
     }
     
-    // CLI --interval 始终覆盖配置文件
-    config.settings.update_interval_ms = args.interval;
+    // CLI --interval 如果指定，则覆盖配置文件
+    if let Some(interval) = args.interval {
+        config.settings.update_interval_ms = interval;
+    }
+
+    // CLI --offset 如果指定，则覆盖配置文件
+    if let Some(offset) = args.offset {
+        config.settings.smtc_offset_ms = offset;
+    }
     
     if args.no_server {
         config.settings.enable_server = false;
@@ -828,5 +793,60 @@ fn write_info_to_lyric_txt(lyric: &str, filename: &str) -> Result<()> {
     let mut final_bytes = vec![0xFF, 0xFE]; 
     final_bytes.extend(bytes);
     file.write_all(&final_bytes)?;
+    Ok(())
+}
+
+#[tokio::main]
+// Function to launch the Tauri GUI and background monitor loop.
+async fn main() -> Result<()> {
+    // 解析命令行参数
+    let args = Cli::parse_args();
+    
+    // 处理帮助和版本信息
+    if args.help {
+        Cli::show_help();
+        return Ok(());
+    }
+    
+    if args.version {
+        Cli::show_version();
+        return Ok(());
+    }
+
+    // 加载配置
+    let config = Config::get_config();
+    
+    // 应用命令行参数覆盖配置
+    let config = apply_cli_overrides(config, &args);
+
+    // Initialize global config lock
+    CONFIG.set(RwLock::new(config.clone()))
+        .map_err(|_| anyhow::anyhow!("Failed to initialize global config OnceLock"))?;
+
+    let monitor_args = args.clone();
+    let monitor_config = config.clone();
+
+    // 启动 Tauri 窗口
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![set_background_state, get_app_config, save_app_config])
+        .setup(move |app| {
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to build tokio runtime");
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&rt, async {
+                    if let Err(e) = run_monitor(Some(app_handle), monitor_args, monitor_config).await {
+                        eprintln!("Monitor loop error: {:?}", e);
+                    }
+                });
+            });
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+
     Ok(())
 }

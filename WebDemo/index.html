@@ -1,63 +1,237 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QQMusic Monitor</title>
+    <!-- Google Typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
 </head>
+<body data-theme="aurora-cyan">
+    <!-- Animated Glowing Background Orbs -->
+    <div class="aurora-bg">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+    <!-- Ambient Blur Album Cover Background -->
+    <div class="album-blur-bg" id="album-blur-bg"></div>
 
-<body>
-    <div class="app">
-        <!-- Header: title-artist / album -->
-        <div class="header">
-            <div class="song-title" id="song-title">No music playing</div>
-            <div class="song-album" id="song-album"></div>
-        </div>
-
-        <!-- Progress bar with status icon -->
-        <div class="progress-section">
-            <span class="status-icon" id="status-icon">▶</span>
-            <div class="progress-track">
-                <div class="progress-fill" id="progress-fill"></div>
+    <!-- Main Desktop Container -->
+    <div class="app-card">
+        <!-- Top Status Bar -->
+        <header class="top-header">
+            <div class="system-status">
+                <span class="status-indicator" id="status-dot"></span>
+                <span class="status-label" id="status-text">OFFLINE</span>
             </div>
-            <span class="time-info" id="time-info">00:00 / 00:00 [0.0%]</span>
+            <div class="header-title">QQ MUSIC MONITOR</div>
+            <button class="settings-trigger-btn" id="btn-settings" title="偏好设置">
+                <svg viewBox="0 0 24 24" class="svg-icon">
+                    <path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/>
+                </svg>
+            </button>
+        </header>
+
+        <!-- Two Column Main Body -->
+        <main class="dashboard-body">
+            <!-- Left Panel: Vinyl Deck and Playback Stats -->
+            <section class="left-deck">
+                <div class="deck-turntable">
+                    <div class="deck-stylus-arm" id="stylus-arm"></div>
+                    <div class="deck-vinyl" id="vinyl-record">
+                        <div class="vinyl-groove"></div>
+                        <div class="vinyl-center-art" id="vinyl-center-art">
+                            <div class="vinyl-sticker-pin"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="playback-meta">
+                    <h1 class="track-title" id="song-title">等待播放</h1>
+                    <p class="track-artist" id="song-artist">QQ音乐监听器</p>
+                    <p class="track-album" id="song-album">SMTC 模式</p>
+                </div>
+
+                <div class="deck-timeline">
+                    <span class="time-label" id="time-current">00:00</span>
+                    <div class="timeline-bar-wrapper">
+                        <div class="timeline-bar-track">
+                            <div class="timeline-bar-fill" id="progress-fill"></div>
+                        </div>
+                    </div>
+                    <span class="time-label" id="time-total">00:00</span>
+                </div>
+            </section>
+
+            <!-- Right Panel: Auto Scroll Lyrics with Fade Gradient -->
+            <section class="right-lyrics" id="lyrics-container">
+                <div class="lyrics-viewport" id="lyrics-viewport">
+                    <div class="lyric-line active" style="margin-top: 150px;">
+                        <span class="word">等待歌曲播放中...</span>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Settings Overlay Drawer -->
+    <div class="settings-drawer" id="settings-overlay">
+        <div class="drawer-content">
+            <header class="drawer-header">
+                <h2>偏好设置</h2>
+                <button class="drawer-close" id="btn-settings-close">&times;</button>
+            </header>
+
+            <div class="drawer-body">
+                <!-- Group 1: Audio and Sync -->
+                <fieldset class="setting-group">
+                    <legend>播放与同步控制</legend>
+                    
+                    <div class="setting-item">
+                        <div class="setting-info">
+                            <label for="cfg-offset">音频延迟补偿</label>
+                            <span class="badge" id="val-offset">200ms</span>
+                        </div>
+                        <div class="range-stepper">
+                            <button class="step-btn" id="btn-offset-dec">-10ms</button>
+                            <input type="range" id="cfg-offset" min="-1000" max="1000" step="10" value="200">
+                            <button class="step-btn" id="btn-offset-inc">+10ms</button>
+                        </div>
+                        <p class="helper-text">调整歌词与人声同步：歌词慢了调大，歌词快了调小。</p>
+                    </div>
+
+                    <div class="setting-item">
+                        <div class="setting-info">
+                            <label for="cfg-interval">SMTC 轮询间隔</label>
+                            <span class="badge" id="val-interval">100ms</span>
+                        </div>
+                        <input type="range" id="cfg-interval" min="50" max="1000" step="50" value="100">
+                        <p class="helper-text">获取系统播放状态的频率。越低越流畅，但会稍微消耗性能。</p>
+                    </div>
+
+                    <div class="setting-item">
+                        <div class="setting-info">
+                            <label for="cfg-port">同步服务端口 (Axum)</label>
+                        </div>
+                        <div class="input-inline">
+                            <input type="number" id="cfg-port" min="1" max="65535" value="3000">
+                            <button class="solid-btn" id="btn-apply-port">应用</button>
+                        </div>
+                        <p class="helper-text">修改端口保存后，需要手动重启程序以重新绑定端口。</p>
+                    </div>
+                </fieldset>
+
+                <!-- Group 2: OBS File Exports -->
+                <fieldset class="setting-group">
+                    <legend>OBS 文件输出设置</legend>
+                    
+                    <div class="setting-item flex-row">
+                        <div>
+                            <span class="setting-title">输出 now_playing.txt</span>
+                            <p class="helper-text">在根目录写入 UTF-16 LE 纯文本歌名</p>
+                        </div>
+                        <label class="switch">
+                            <input type="checkbox" id="chk-out-txt">
+                            <span class="switch-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting-item flex-row">
+                        <div>
+                            <span class="setting-title">输出 now_playing.json</span>
+                            <p class="helper-text">写入包含完整歌曲播放状态的 JSON 文件</p>
+                        </div>
+                        <label class="switch">
+                            <input type="checkbox" id="chk-out-json">
+                            <span class="switch-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting-item flex-row">
+                        <div>
+                            <span class="setting-title">输出 current_lyric.txt</span>
+                            <p class="helper-text">单独输出当前正在唱的一行歌词文件</p>
+                        </div>
+                        <label class="switch">
+                            <input type="checkbox" id="chk-out-lyric">
+                            <span class="switch-slider"></span>
+                        </label>
+                    </div>
+                </fieldset>
+
+                <!-- Group 3: Appearance and Themes -->
+                <fieldset class="setting-group">
+                    <legend>视觉与外观设置</legend>
+
+                    <div class="setting-item">
+                        <div class="setting-info">
+                            <label for="cfg-font-size">歌词字号大小</label>
+                            <span class="badge" id="val-font-size">26px</span>
+                        </div>
+                        <input type="range" id="cfg-font-size" min="18" max="42" step="1" value="26">
+                    </div>
+
+                    <div class="setting-item">
+                        <div class="setting-info">
+                            <label for="cfg-font-weight">歌词字体粗细</label>
+                            <span class="badge" id="val-font-weight">700</span>
+                        </div>
+                        <input type="range" id="cfg-font-weight" min="300" max="800" step="100" value="700">
+                    </div>
+
+                    <div class="setting-item flex-row">
+                        <div>
+                            <span class="setting-title">双语对照翻译</span>
+                            <p class="helper-text">在当前歌词下方显示中文翻译（若有）</p>
+                        </div>
+                        <label class="switch">
+                            <input type="checkbox" id="toggle-trans" checked>
+                            <span class="switch-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting-item">
+                        <span class="setting-title">应用主题色</span>
+                        <div class="theme-picker">
+                            <button class="theme-dot dot-cyan active" data-theme="aurora-cyan" title="极光青"></button>
+                            <button class="theme-dot dot-purple" data-theme="aurora-purple" title="罗兰紫"></button>
+                            <button class="theme-dot dot-emerald" data-theme="aurora-emerald" title="翡翠绿"></button>
+                            <button class="theme-dot dot-sunset" data-theme="aurora-sunset" title="落日橙"></button>
+                        </div>
+                    </div>
+                </fieldset>
+
+                <!-- Group 4: Debugger Console -->
+                <fieldset class="setting-group">
+                    <legend>开发者调试选项</legend>
+
+                    <div class="setting-item flex-row">
+                        <div>
+                            <span class="setting-title">数据调试监视面板</span>
+                            <p class="helper-text">展示收到的即时 JSON 结构及延迟状态</p>
+                        </div>
+                        <label class="switch">
+                            <input type="checkbox" id="toggle-debug">
+                            <span class="switch-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="debug-panel" id="debug-panel" hidden>
+                        <div class="debug-meta-text" id="debug-info">未连接</div>
+                        <details class="debug-details">
+                            <summary>查看完整 SongInfo JSON 数据</summary>
+                            <pre id="raw-data">{}</pre>
+                        </details>
+                    </div>
+                </fieldset>
+            </div>
         </div>
-
-        <!-- Divider -->
-        <div class="divider"></div>
-
-        <!-- Lyrics area -->
-        <div class="lyrics-area" id="lyrics-area">
-            <div class="lyric-empty">...</div>
-        </div>
-
-        <!-- Controls -->
-        <div class="controls">
-            <label class="toggle" title="显示/隐藏翻译">
-                <input type="checkbox" id="toggle-trans" checked>
-                <span class="toggle-track"><span class="toggle-thumb"></span></span>
-                <span class="toggle-label">译</span>
-            </label>
-            <label class="toggle" title="显示/隐藏调试信息">
-                <input type="checkbox" id="toggle-debug">
-                <span class="toggle-track"><span class="toggle-thumb"></span></span>
-                <span class="toggle-label">Debug</span>
-            </label>
-        </div>
-
-        <!-- Debug info -->
-        <div class="debug-info" id="debug-info"></div>
-
-        <!-- Raw data (collapsible) -->
-        <details class="raw-panel">
-            <summary>Raw JSON Data</summary>
-            <pre id="raw-data">Waiting for data...</pre>
-        </details>
     </div>
 
     <script src="app.js"></script>
 </body>
-
 </html>

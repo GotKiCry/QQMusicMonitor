@@ -1,7 +1,7 @@
 use clap::Parser;
 
 /// QQ音乐信息读取器 - 实时获取QQ音乐播放信息
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "QQMusic Reader")]
 #[command(version = "1.0")]
 #[command(about = "实时读取QQ音乐播放信息并输出到文件", long_about = None)]
@@ -44,9 +44,13 @@ pub struct Cli {
     #[arg(long, default_value = "current_lyric.txt")]
     pub lyric_file: String,
 
-    /// 更新间隔（毫秒）
-    #[arg(short, long, default_value_t = 200)]
-    pub interval: u64,
+    /// 更新间隔（毫秒），不指定则使用配置文件
+    #[arg(short, long)]
+    pub interval: Option<u64>,
+
+    /// SMTC 滞后补偿量（毫秒），不指定则使用配置文件
+    #[arg(short, long)]
+    pub offset: Option<u64>,
 
     /// 同步服务端口
     #[arg(long, default_value_t = 3000)]
@@ -99,7 +103,8 @@ impl Cli {
         println!("      --txt-file <文件>   自定义文本输出文件名 (默认: now_playing.txt)");
         println!("      --json-file <文件>  自定义JSON输出文件名 (默认: now_playing.json)");
         println!("      --lyric-file <文件> 自定义单独歌词输出文件名 (默认: current_lyric.txt)");
-        println!("  -i, --interval <毫秒>   更新间隔 (默认: 200)");
+        println!("  -i, --interval <毫秒>   更新间隔 (不指定则使用配置文件)");
+        println!("  -o, --offset <毫秒>     SMTC 滞后补偿量 (不指定则使用配置文件)");
         println!("      --port <端口>       自定义同步服务端口 (默认: 3000)");
         println!("  -r, --retries <次数>    最大重试次数 (默认: 3)");
         println!("  -q, --quiet             静默模式（不输出控制台信息）");

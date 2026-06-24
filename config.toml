@@ -4,6 +4,9 @@
 # 更新间隔（毫秒）
 update_interval_ms = 100
 
+# SMTC 滞后补偿量（毫秒）。根据设备延迟调节，蓝牙耳机建议 200-300，有线设备建议 100-200。
+smtc_offset_ms = 200
+
 # 最大重试次数
 max_retries = 3
 

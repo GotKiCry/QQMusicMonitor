@@ -27,21 +27,20 @@ pub struct SongInfo {
     pub qrc_data: Vec<QrcLine>, // 逐字歌词 (解析后)
     pub current_time: u64,        // 当前播放时间（秒）
     pub total_time: u64,          // 总时长（秒）
-    #[serde(skip)]
     pub current_time_ms: u64,     // 当前播放时间（毫秒），用于 QRC 精确逐字渲染
-    #[serde(skip)]
     pub total_time_ms: u64,       // 总时长（毫秒）
     pub progress_percent: f32,    // 进度百分比
     pub is_playing: bool,         // 当前是否正在播放
+    pub album_pic_url: String,    // 专辑封面图片地址
+    pub server_ts: u64,           // 后端采样时的绝对时间戳（毫秒）
 }
 
+#[allow(dead_code)]
 impl SongInfo {
     /// 检查歌曲信息是否有效（有标题）
     pub fn is_valid(&self) -> bool {
         !self.title.is_empty()
     }
-    
-
     
     /// 格式化当前时间为 MM:SS 格式
     pub fn format_current_time(&self) -> String {
@@ -66,6 +65,7 @@ impl SongInfo {
 }
 
 /// 将秒数格式化为 MM:SS 格式
+#[allow(dead_code)]
 fn format_time(seconds: u64) -> String {
     let minutes = seconds / 60;
     let secs = seconds % 60;
