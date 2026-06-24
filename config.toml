@@ -2,7 +2,7 @@
 
 [settings]
 # 更新间隔（毫秒）
-update_interval_ms = 200
+update_interval_ms = 100
 
 # 最大重试次数
 max_retries = 3
