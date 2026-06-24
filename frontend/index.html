@@ -8,7 +8,12 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="css/tokens.css">
+    <link rel="stylesheet" href="css/base.css">
+    <link rel="stylesheet" href="css/layout.css">
+    <link rel="stylesheet" href="css/components.css">
+    <link rel="stylesheet" href="css/settings.css">
+    <link rel="stylesheet" href="css/responsive.css">
 </head>
 <body data-theme="aurora-cyan">
     <!-- Animated Glowing Background Orbs -->
@@ -38,17 +43,9 @@
 
         <!-- Two Column Main Body -->
         <main class="dashboard-body">
-            <!-- Left Panel: Vinyl Deck and Playback Stats -->
+            <!-- Left Panel: Album Art and Playback Stats -->
             <section class="left-deck">
-                <div class="deck-turntable">
-                    <div class="deck-stylus-arm" id="stylus-arm"></div>
-                    <div class="deck-vinyl" id="vinyl-record">
-                        <div class="vinyl-groove"></div>
-                        <div class="vinyl-center-art" id="vinyl-center-art">
-                            <div class="vinyl-sticker-pin"></div>
-                        </div>
-                    </div>
-                </div>
+                <div class="deck-album-art" id="album-art"></div>
 
                 <div class="playback-meta">
                     <h1 class="track-title" id="song-title">等待播放</h1>
@@ -109,7 +106,7 @@
                             <label for="cfg-interval">SMTC 轮询间隔</label>
                             <span class="badge" id="val-interval">100ms</span>
                         </div>
-                        <input type="range" id="cfg-interval" min="50" max="1000" step="50" value="100">
+                        <input type="range" id="cfg-interval" min="30" max="1000" step="10" value="50">
                         <p class="helper-text">获取系统播放状态的频率。越低越流畅，但会稍微消耗性能。</p>
                     </div>
 
@@ -232,6 +229,6 @@
         </div>
     </div>
 
-    <script src="app.js"></script>
+    <script type="module" src="src/index.js"></script>
 </body>
 </html>

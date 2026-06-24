@@ -1,0 +1,66 @@
+/* ============================================================
+ * Responsive Adjustments
+ * 桌面 vs 移动布局适配
+ * ============================================================ */
+
+@media (max-width: 768px) {
+    .app-card {
+        height: 100vh;
+        max-height: none;
+        border-radius: 0;
+        border: none;
+    }
+
+    body {
+        padding: 0;
+    }
+
+    .dashboard-body {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto 1fr;
+    }
+
+    .left-deck {
+        border-right: none;
+        border-bottom: 1px solid var(--border-glass);
+        padding: 24px 20px;
+        flex-direction: row;
+        gap: 20px;
+        align-items: center;
+        justify-content: flex-start;
+    }
+
+    .deck-album-art {
+        width: 80px;
+        height: 80px;
+        border-radius: 8px;
+        margin-bottom: 0;
+    }
+
+    .playback-meta {
+        flex: 1;
+        text-align: left;
+        padding: 0;
+    }
+
+    .track-title {
+        font-size: 1.05rem;
+    }
+
+    .track-artist {
+        font-size: 0.82rem;
+        margin-top: 2px;
+    }
+
+    .track-album {
+        display: none;
+    }
+
+    .deck-timeline {
+        display: none; /* 移动紧凑布局隐藏进度条 */
+    }
+
+    .right-lyrics {
+        padding: 0 20px;
+    }
+}

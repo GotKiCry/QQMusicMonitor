@@ -29,7 +29,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             settings: Settings {
-                update_interval_ms: 100,
+                update_interval_ms: 50,
                 smtc_offset_ms: 200,
                 max_retries: 3,
                 output_txt: false,

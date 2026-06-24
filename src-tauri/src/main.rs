@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 
 static IS_BACKGROUND: AtomicBool = AtomicBool::new(false);
 static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
+static CACHED_LYRIC_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct FrontConfig {
@@ -72,6 +73,7 @@ async fn save_app_config(new_cfg: FrontConfig) -> Result<(), String> {
 }
 use std::fs::File;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use widestring::U16String;
@@ -129,6 +131,65 @@ impl LyricsCache {
     }
 }
 
+/// 缓存 QQ 音乐本地歌词目录路径，只探测一次避免每帧扫盘
+fn get_lyric_cache_dir() -> Option<PathBuf> {
+    CACHED_LYRIC_DIR.get_or_init(|| local_qrc::auto_detect_cache_dir()).clone()
+}
+
+/// 从本地 QQ 音乐缓存目录查找歌词（QRC 优先，LRC 兜底），返回完整的缓存条目。
+/// 此函数包含文件 I/O 与 DES 解密，仅应在 spawn_blocking 中调用。
+fn lookup_local_lyrics(title: &str, artist: &str) -> LyricsCacheEntry {
+    let mut entry = LyricsCacheEntry {
+        lyrics: String::new(),
+        trans: String::new(),
+        qrc_raw: String::new(),
+        qrc_data: Vec::new(),
+        album_pic_url: String::new(),
+    };
+
+    let Some(cache_dir) = get_lyric_cache_dir() else {
+        return entry;
+    };
+
+    // QRC 优先（逐字歌词）
+    if let Some(qrc_file) = local_qrc::find_qrc_file(&cache_dir, title, artist) {
+        if let Ok(xml) = qrc::decode_qrc_from_file(&qrc_file) {
+            entry.qrc_raw = "[local]".to_string();
+            if let Ok(lines) = qrc::parse_qrc_xml(&xml) {
+                entry.qrc_data = lines;
+            }
+            if entry.lyrics.is_empty() {
+                entry.lyrics = qrc::extract_lrc_from_xml(&xml).unwrap_or_default();
+            }
+            if let Some(trans_file) = local_qrc::find_qrc_trans_file(&qrc_file) {
+                if let Ok(trans_xml) = qrc::decode_qrc_from_file(&trans_file) {
+                    entry.trans = trans_xml;
+                }
+            }
+        }
+    }
+
+    // LRC 兜底（普通歌词，无逐字）
+    if entry.lyrics.is_empty() {
+        if let Some(lrc_file) = local_qrc::find_lrc_file(&cache_dir, title, artist) {
+            let lrc_raw = match qrc::decode_qrc_from_file(&lrc_file) {
+                Ok(decrypted) => decrypted,
+                Err(_) => std::fs::read_to_string(&lrc_file).unwrap_or_default(),
+            };
+            entry.lyrics = qrc::extract_lrc_from_xml(&lrc_raw).unwrap_or(lrc_raw);
+            if let Some(trans_lrc_file) = local_qrc::find_lrc_trans_file(&lrc_file) {
+                let trans_raw = match qrc::decode_qrc_from_file(&trans_lrc_file) {
+                    Ok(decrypted) => decrypted,
+                    Err(_) => std::fs::read_to_string(&trans_lrc_file).unwrap_or_default(),
+                };
+                entry.trans = qrc::extract_lrc_from_xml(&trans_raw).unwrap_or(trans_raw);
+            }
+        }
+    }
+
+    entry
+}
+
 // Function to run the main monitor loop in a background thread.
 async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Config) -> Result<()> {
 
@@ -172,6 +233,8 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 
     let mut last_song_info: Option<SongInfo> = None;
     let mut update_count = 0;
+    // 切歌后追踪旧歌 total_time_ms，用于跨帧检测 SMTC timeline 是否仍报旧值
+    let mut stale_song_total: Option<u64> = None;
 
     // 主循环
     while running.load(Ordering::SeqCst) {
@@ -186,7 +249,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
         };
         let loop_result: Result<()> = async {
             // 使用 SMTC 读取媒体信息（含会话源过滤：只接受 QQ Music，过滤其他音源）
-            let current_song_info = match smtc::get_current_media_info().await {
+            let mut current_song_info = match smtc::get_current_media_info().await {
             Ok(info) => {
                 if let Some(mut info) = info {
                     // 后台歌词加载：切歌时后台请求，不阻塞 TUI
@@ -201,6 +264,25 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                         let t = info.title.clone();
                         let a = info.artist.clone();
                         tokio::spawn(async move {
+                            // 1. 本地歌词快速查找并立即插入缓存（~50ms，不阻塞在线获取）
+                            {
+                                let t2 = t.clone();
+                                let a2 = a.clone();
+                                let local = tokio::task::spawn_blocking(move || lookup_local_lyrics(&t2, &a2))
+                                    .await
+                                    .unwrap_or_else(|_| LyricsCacheEntry {
+                                        lyrics: String::new(), trans: String::new(),
+                                        qrc_raw: String::new(), qrc_data: Vec::new(),
+                                        album_pic_url: String::new(),
+                                    });
+                                if !local.lyrics.is_empty() || !local.qrc_data.is_empty() {
+                                    let mut w = cache.write().await;
+                                    w.insert_entry(&t, &a, local);
+                                    if debug { eprintln!("[lyrics] Local cache populated for '{} - {}'", t, a); }
+                                }
+                            }
+
+                            // 2. 在线歌词获取（网络 API，1-3s），完成后覆盖本地数据
                             match fetcher.fetch_lyrics(&t, &a).await {
                                 Ok((l, trans, q, pic_url)) => {
                                     let mut entry = LyricsCacheEntry {
@@ -210,6 +292,8 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                         qrc_data: Vec::new(),
                                         album_pic_url: pic_url,
                                     };
+
+                                    // 在线 QRC 解密
                                     if !entry.qrc_raw.is_empty() {
                                         if debug { eprintln!("[QRC] Raw data: {} bytes", entry.qrc_raw.len()); }
                                         match qrc::decode_qrc(&entry.qrc_raw) {
@@ -220,8 +304,8 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                                         if debug { eprintln!("[QRC] Parsed {} lines from XML", lines.len()); }
                                                         entry.qrc_data = lines;
                                                     }
-                                                    Err(e) => {
-                                                        if !quiet { eprintln!("[QRC] XML parse failed for '{} - {}': {}", t, a, e); }
+                                                    Err(err) => {
+                                                        if !quiet { eprintln!("[QRC] XML parse failed for '{} - {}': {}", t, a, err); }
                                                     }
                                                 }
                                                 if entry.lyrics.is_empty() {
@@ -236,18 +320,29 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                                     }
                                                 }
                                             },
-                                            Err(e) => {
-                                                if !quiet { eprintln!("[QRC] Decode failed for '{} - {}': {}", t, a, e); }
+                                            Err(err) => {
+                                                if !quiet { eprintln!("[QRC] Decode failed for '{} - {}': {}", t, a, err); }
                                             }
                                         }
                                     }
-                                    
+
+                                    // 在线数据未覆盖的字段回填本地缓存
+                                    if entry.lyrics.is_empty() || entry.qrc_data.is_empty() || entry.trans.is_empty() {
+                                        let cached = cache.read().await;
+                                        if let Some(cur) = cached.get_entry(&t, &a) {
+                                            if entry.lyrics.is_empty() { entry.lyrics = cur.lyrics.clone(); }
+                                            if entry.qrc_data.is_empty() { entry.qrc_data = cur.qrc_data.clone(); }
+                                            if entry.trans.is_empty() { entry.trans = cur.trans.clone(); }
+                                        }
+                                    }
+
                                     let mut w = cache.write().await;
                                     w.insert_entry(&t, &a, entry);
                                     if debug { eprintln!("[lyrics] ✓ Background fetch complete for '{} - {}'", t, a); }
                                 }
                                 Err(e) => {
                                     if !quiet { eprintln!("[lyrics] Background fetch failed for '{} - {}': {}", t, a, e); }
+                                    // 本地数据已在步骤 1 插入，无需额外处理
                                 }
                             }
                         });
@@ -269,43 +364,6 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 
                     if info.lyrics.is_empty() && !info.trans.is_empty() {
                         info.lyrics = info.trans.clone();
-                    }
-
-                    // 如果网络歌词为空，尝试从本地缓存读取
-                    let cache_dir_opt = local_qrc::auto_detect_cache_dir();
-                    if let Some(cache_dir) = cache_dir_opt {
-                        if info.qrc_raw.is_empty() {
-                            if let Some(qrc_file) = local_qrc::find_qrc_file(&cache_dir, &info.title, &info.artist) {
-                                if let Ok(xml) = qrc::decode_qrc_from_file(&qrc_file) {
-                                    info.qrc_raw = "[local]".to_string();
-                                    if let Ok(lines) = qrc::parse_qrc_xml(&xml) {
-                                        if config.settings.debug_mode { eprintln!("[QRC] Debug: loaded {} lines from local cache", lines.len()); }
-                                        info.qrc_data = lines;
-                                    }
-                                    if let Some(trans_file) = local_qrc::find_qrc_trans_file(&qrc_file) {
-                                        if let Ok(trans_xml) = qrc::decode_qrc_from_file(&trans_file) {
-                                            info.trans = trans_xml;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if info.lyrics.is_empty() {
-                            if let Some(lrc_file) = local_qrc::find_lrc_file(&cache_dir, &info.title, &info.artist) {
-                                let lrc_raw = match qrc::decode_qrc_from_file(&lrc_file) {
-                                    Ok(decrypted) => decrypted,
-                                    Err(_) => std::fs::read_to_string(&lrc_file).unwrap_or_default(),
-                                };
-                                info.lyrics = qrc::extract_lrc_from_xml(&lrc_raw).unwrap_or(lrc_raw);
-                                if let Some(trans_lrc_file) = local_qrc::find_lrc_trans_file(&lrc_file) {
-                                    let trans_raw = match qrc::decode_qrc_from_file(&trans_lrc_file) {
-                                        Ok(decrypted) => decrypted,
-                                        Err(_) => std::fs::read_to_string(&trans_lrc_file).unwrap_or_default(),
-                                    };
-                                    info.trans = qrc::extract_lrc_from_xml(&trans_raw).unwrap_or(trans_raw);
-                                }
-                            }
-                        }
                     }
 
                     info
@@ -353,6 +411,45 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
             }
         };
 
+        // 检查歌曲是否有变化 (用于切歌修正与文件输出)
+        let song_changed = match &last_song_info {
+            Some(last) => last.title != current_song_info.title || last.artist != current_song_info.artist,
+            None => true,
+        };
+
+        // SMTC 切歌瞬间修正：media properties（title/artist）先更新，
+        // timeline（Position/EndTime）可能滞后 1~2 秒仍报旧歌数据。
+        //
+        // 只靠 song_changed 一帧归零不够：后续帧 title 未变但 timeline 仍旧，
+        // 前端会收到"新歌名 + 旧进度"错配——旧歌词继续渲染，进度来回跳。
+        //
+        // 解法：用 last_song_info.total_time_ms 做锚点——若当前 total 与旧歌
+        // 相同（±500ms），判定 timeline 未更新，强制归零。total 变化后清除追踪。
+        if song_changed {
+            if let Some(old) = &last_song_info {
+                if old.total_time_ms > 0 {
+                    stale_song_total = Some(old.total_time_ms);
+                }
+            }
+            current_song_info.current_time_ms = 0;
+            current_song_info.current_time = 0;
+            current_song_info.progress_percent = 0.0;
+            current_song_info.total_time_ms = 0;
+            current_song_info.total_time = 0;
+        } else if let Some(old_total) = stale_song_total {
+            if current_song_info.total_time_ms == 0
+                || current_song_info.total_time_ms == old_total
+            {
+                current_song_info.current_time_ms = 0;
+                current_song_info.current_time = 0;
+                current_song_info.progress_percent = 0.0;
+                current_song_info.total_time_ms = 0;
+                current_song_info.total_time = 0;
+            } else {
+                stale_song_total = None;
+            }
+        }
+
         // SMTC positions are now drift-corrected via LastUpdatedTime in smtc.rs.
         // Only apply the user-configurable offset for fine-tuning.
         let smtc_offset_ms = config.settings.smtc_offset_ms;
@@ -365,12 +462,6 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
             }
         } else {
             current_song_info.current_time_ms
-        };
-
-        // 检查歌曲是否有变化 (用于文件输出)
-        let song_changed = match &last_song_info {
-            Some(last) => last.title != current_song_info.title || last.artist != current_song_info.artist,
-            None => true,
         };
 
         // 广播最新状态给所有 WebSocket 客户端

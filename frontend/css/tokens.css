@@ -1,0 +1,62 @@
+/* ============================================================
+ * Design Tokens & Custom Themes (Aurora Midnight Design)
+ * 设计变量与主题：颜色、字体、过渡、阴影等基础 token
+ * ============================================================ */
+
+:root {
+    /* 极光青主题 (Default) */
+    --theme-primary: #14b8a6;
+    --theme-primary-glow: rgba(20, 184, 166, 0.35);
+    --theme-gradient: linear-gradient(135deg, #2dd4bf, #0d9488);
+
+    /* 基础色彩 */
+    --bg-base: #0a0e17;
+    --surface-glass: rgba(13, 20, 35, 0.45);
+    --surface-glass-solid: rgba(16, 24, 48, 0.85);
+    --border-glass: rgba(255, 255, 255, 0.08);
+    --border-focus: rgba(45, 212, 191, 0.4);
+
+    /* 文字颜色 */
+    --text-main: #f8fafc;
+    --text-sub: #94a3b8;
+    --text-muted: #475569;
+    --text-lyric-idle: #475569;
+
+    /* 状态与功能 */
+    --color-success: #10b981;
+    --color-warning: #f59e0b;
+    --color-error: #ef4444;
+
+    /* 字体排版 */
+    --font-heading: 'Outfit', 'Inter', -apple-system, sans-serif;
+    --font-body: 'Inter', -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+
+    /* 动态过渡 */
+    --transition-base: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+    --shadow-heavy: 0 25px 60px -15px rgba(0, 0, 0, 0.65);
+}
+
+/* Theme: 罗兰紫 */
+body[data-theme="aurora-purple"] {
+    --theme-primary: #a855f7;
+    --theme-primary-glow: rgba(168, 85, 247, 0.35);
+    --theme-gradient: linear-gradient(135deg, #c084fc, #7e22ce);
+    --border-focus: rgba(192, 132, 252, 0.4);
+}
+
+/* Theme: 翡翠绿 */
+body[data-theme="aurora-emerald"] {
+    --theme-primary: #10b981;
+    --theme-primary-glow: rgba(16, 185, 129, 0.35);
+    --theme-gradient: linear-gradient(135deg, #34d399, #047857);
+    --border-focus: rgba(52, 211, 153, 0.4);
+}
+
+/* Theme: 落日橙 */
+body[data-theme="aurora-sunset"] {
+    --theme-primary: #f97316;
+    --theme-primary-glow: rgba(249, 115, 22, 0.35);
+    --theme-gradient: linear-gradient(135deg, #fb923c, #c2410c);
+    --border-focus: rgba(251, 146, 60, 0.4);
+}
