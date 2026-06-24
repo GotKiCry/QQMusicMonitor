@@ -1,0 +1,146 @@
+/* ============================================================
+ * Layout: Glassmorphic Frame, Deck, Lyrics
+ * 玻璃拟态主框架、左面板唱机、右面板歌词区
+ * ============================================================ */
+
+/* —— 玻璃拟态桌面框架 —— */
+.app-card {
+    width: 100%;
+    max-width: 920px;
+    height: calc(100vh - 48px);
+    max-height: 700px;
+    background: var(--surface-glass);
+    border: 1px solid var(--border-glass);
+    border-radius: 28px;
+    box-shadow: var(--shadow-heavy);
+    backdrop-filter: blur(48px);
+    -webkit-backdrop-filter: blur(48px);
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+}
+
+/* —— 顶部状态栏 —— */
+.top-header {
+    height: 64px;
+    padding: 0 32px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--border-glass);
+}
+
+.system-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.status-indicator {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    transition: var(--transition-base);
+}
+
+.status-indicator.connected {
+    background-color: var(--color-success);
+    box-shadow: 0 0 12px var(--color-success);
+}
+
+.status-indicator.connecting {
+    background-color: var(--color-warning);
+    box-shadow: 0 0 12px var(--color-warning);
+    animation: statusPulse 1.5s infinite;
+}
+
+.status-indicator.disconnected {
+    background-color: var(--color-error);
+    box-shadow: 0 0 12px var(--color-error);
+}
+
+@keyframes statusPulse {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1; }
+}
+
+.status-label {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    color: var(--text-sub);
+}
+
+.header-title {
+    font-family: var(--font-heading);
+    font-size: 0.85rem;
+    font-weight: 700;
+    letter-spacing: 0.25em;
+    color: var(--text-sub);
+    opacity: 0.85;
+}
+
+.settings-trigger-btn {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    color: var(--text-sub);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    transition: var(--transition-base);
+}
+
+.settings-trigger-btn:hover {
+    color: var(--theme-primary);
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+.svg-icon {
+    width: 20px;
+    height: 20px;
+    fill: currentColor;
+}
+
+/* —— 双列主体 —— */
+.dashboard-body {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 360px 1fr;
+    overflow: hidden;
+}
+
+/* 左面板 */
+.left-deck {
+    border-right: 1px solid var(--border-glass);
+    padding: 40px 32px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+}
+
+/* 右面板：自动居中滚动歌词 */
+.right-lyrics {
+    padding: 0 40px;
+    overflow: hidden;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    /* 边缘垂直淡出遮罩 */
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 20%, #000 80%, transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0%, #000 20%, #000 80%, transparent 100%);
+}
+
+.lyrics-viewport {
+    width: 100%;
+    transform: translateY(180px);
+    transition: transform 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+    will-change: transform;
+}

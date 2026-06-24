@@ -1,0 +1,208 @@
+/* ============================================================
+ * Components: Turntable, Lyrics, Settings Drawer, Controls
+ * 唱机组件、歌词行、设置抽屉、表单控件
+ * ============================================================ */
+
+/* —— 专辑封面 —— */
+.deck-album-art {
+    width: 220px;
+    height: 220px;
+    border-radius: 12px;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-image: var(--theme-gradient);
+    box-shadow: 0 15px 35px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--border-glass);
+    transition: transform 0.6s cubic-bezier(0.25, 1, 0.5, 1),
+                box-shadow 0.6s cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+.deck-album-art.playing {
+    box-shadow: 0 15px 40px rgba(0, 0, 0, 0.55), 0 0 0 2px var(--theme-primary),
+                0 0 25px var(--theme-primary-glow);
+    transform: scale(1.03);
+}
+
+/* —— 播放信息与时间轴 —— */
+.playback-meta {
+    text-align: center;
+    width: 100%;
+    padding: 0 10px;
+    overflow: hidden;
+}
+
+.track-title {
+    font-family: var(--font-heading);
+    font-size: 1.28rem;
+    font-weight: 800;
+    color: var(--text-main);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.3;
+}
+
+.track-artist {
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--theme-primary);
+    margin-top: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.track-album {
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.deck-timeline {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 16px;
+}
+
+.time-label {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-sub);
+    width: 38px;
+}
+
+.time-label:last-child {
+    text-align: right;
+}
+
+.timeline-bar-wrapper {
+    flex: 1;
+    padding: 8px 0;
+}
+
+.timeline-bar-track {
+    width: 100%;
+    height: 4px;
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.timeline-bar-fill {
+    width: 0%;
+    height: 100%;
+    background: var(--theme-gradient);
+    border-radius: 2px;
+    box-shadow: 0 0 10px var(--theme-primary);
+    transition: width 0.15s linear;
+}
+
+/* —— 歌词行 —— */
+.lyric-line {
+    padding: 16px 12px;
+    text-align: center;
+    width: 100%;
+    min-height: 58px;
+    transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1),
+                opacity 0.4s cubic-bezier(0.25, 1, 0.5, 1);
+    opacity: 0.2;
+    transform: scale(0.9);
+    will-change: transform, opacity;
+}
+
+.lyric-trans {
+    font-size: 0.95rem;
+    color: var(--text-sub);
+    margin-top: 8px;
+    font-weight: 400;
+    transition: var(--transition-base);
+}
+
+.lyric-line.before {
+    opacity: 0.35;
+    transform: scale(0.94);
+}
+
+.lyric-line.after {
+    opacity: 0.2;
+    transform: scale(0.92);
+}
+
+.lyric-line.active {
+    opacity: 1;
+    transform: scale(1.08);
+    filter: drop-shadow(0 4px 12px rgba(0,0,0,0.15));
+}
+
+.lyric-line.active .lyric-trans {
+    color: var(--text-main);
+    font-weight: 500;
+}
+
+/* 逐字结构 */
+.word {
+    position: relative;
+    display: inline-block;
+    vertical-align: middle;
+    font-family: var(--font-heading);
+    font-size: var(--lyric-font-size, 1.55rem);
+    font-weight: var(--lyric-font-weight, 800);
+    white-space: pre;
+    -webkit-font-smoothing: antialiased;
+}
+
+.word-bg {
+    color: var(--text-lyric-idle);
+    display: inline-block;
+    white-space: inherit;
+    transition: color 0.3s ease;
+}
+
+.word-fg {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 0%;
+    overflow: hidden;
+    white-space: inherit;
+    background: var(--theme-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    display: block;
+    pointer-events: none;
+    -webkit-font-smoothing: antialiased;
+}
+
+.lyric-empty {
+    text-align: center;
+    font-size: 1.1rem;
+    font-weight: 500;
+    color: var(--text-sub);
+    margin-top: 180px;
+    letter-spacing: 0.05em;
+}
+
+.lyric-loading {
+    text-align: center;
+    font-size: 1.1rem;
+    font-weight: 500;
+    color: var(--text-sub);
+    margin-top: 180px;
+    letter-spacing: 0.05em;
+    animation: loading-pulse 1.5s infinite alternate;
+}
+
+@keyframes loading-pulse {
+    0% { opacity: 0.4; }
+    100% { opacity: 1; }
+}

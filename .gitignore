@@ -25,6 +25,7 @@ Thumbs.db
 
 # QQMusicReader 特定文件
 # 运行时产生的文件
+config.toml
 now_playing.json
 now_playing.txt
 current_lyric.txt
@@ -47,6 +48,9 @@ ce/*.PTR
 
 # 其他工具产生的文件
 .qoder/
+
+# Node 依赖
+node_modules/
 
 # Claude Code & Agent 文件夹
 .claude/
