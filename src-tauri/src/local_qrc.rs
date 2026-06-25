@@ -1,15 +1,16 @@
 use std::path::{Path, PathBuf};
 
-// Function to auto-detect QQ Music lyric cache directory
-pub fn auto_detect_cache_dir() -> Option<PathBuf> {
+/// 探测 QQ 音乐缓存根目录（如 `D:\QQMusicCache`）。
+/// 歌词在 `QQMusicLyricNew` 子目录，封面图在 `QQMusicPicture` 子目录。
+pub fn auto_detect_cache_root() -> Option<PathBuf> {
     // Step 1: Try reading cache path from QQ Music config file
-    if let Some(path) = detect_from_qq_music_config() {
-        return Some(path);
+    if let Some(root) = detect_cache_root_from_config() {
+        return Some(root);
     }
 
     // Step 2: Fallback - scan all drive letters for QQMusicCache
     for letter in b'C'..=b'Z' {
-        let path = PathBuf::from(format!("{}:\\QQMusicCache\\QQMusicLyricNew", letter as char));
+        let path = PathBuf::from(format!("{}:\\QQMusicCache", letter as char));
         if path.exists() && path.is_dir() {
             return Some(path);
         }
@@ -18,12 +19,8 @@ pub fn auto_detect_cache_dir() -> Option<PathBuf> {
     None
 }
 
-// Function to detect lyric cache dir from QQ Music's WebkitCachePath.ini config
-fn detect_from_qq_music_config() -> Option<PathBuf> {
-    // QQ Music stores cache path in %APPDATA%\Tencent\QQMusic\WebkitCachePath.ini
-    // Format: [WebkitCache]
-    //         Path=D:\QQMusicCache\WebkitCache
-    // The parent of this path is the cache root, and lyrics are in QQMusicLyricNew subdir
+/// 从 WebkitCachePath.ini 推断缓存根目录
+fn detect_cache_root_from_config() -> Option<PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
     let ini_path = PathBuf::from(&appdata)
         .join("Tencent")
@@ -35,10 +32,10 @@ fn detect_from_qq_music_config() -> Option<PathBuf> {
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(raw_path) = trimmed.strip_prefix("Path=") {
+            // raw_path 形如 D:\QQMusicCache\WebkitCache，parent 即缓存根
             let cache_root = PathBuf::from(raw_path).parent()?.to_path_buf();
-            let lyric_dir = cache_root.join("QQMusicLyricNew");
-            if lyric_dir.exists() && lyric_dir.is_dir() {
-                return Some(lyric_dir);
+            if cache_root.is_dir() {
+                return Some(cache_root);
             }
         }
     }
@@ -206,4 +203,52 @@ fn normalize(s: &str) -> String {
         .replace('\\', " ")
         .trim()
         .to_string()
+}
+
+/// 在 QQ 音乐本地缓存目录中查找专辑封面图。
+///
+/// 本地封面文件名格式：`T002R{W}x{H}M000{album_mid}_{seq}.jpg`
+/// 优先返回 `R500x500`（本地最高清），回退 `R150x150`。
+///
+/// @param picture_dir - `QQMusicPicture` 目录路径
+/// @param album_mid   - 从在线 API 获取的专辑 mid
+/// @return 本地封面文件的绝对路径，或 None
+pub fn find_album_pic(picture_dir: &Path, album_mid: &str) -> Option<PathBuf> {
+    if album_mid.is_empty() {
+        return None;
+    }
+
+    let entries = std::fs::read_dir(picture_dir).ok()?;
+    let prefix_500 = format!("T002R500x500M000{}", album_mid);
+    let prefix_150 = format!("T002R150x150M000{}", album_mid);
+
+    let mut pic_500: Option<PathBuf> = None;
+    let mut pic_150: Option<PathBuf> = None;
+
+    for entry in entries.flatten() {
+        let file_name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if file_name.starts_with(&prefix_500) && file_name.ends_with(".jpg") {
+            pic_500 = Some(entry.path());
+        } else if file_name.starts_with(&prefix_150) && file_name.ends_with(".jpg") {
+            pic_150 = Some(entry.path());
+        }
+    }
+
+    // 同一 mid 可能有多张（不同 seq），取第一张即可
+    pic_500.or(pic_150)
+}
+
+/// 从在线专辑图 URL 中提取 album_mid。
+///
+/// URL 格式：`https://y.gtimg.cn/music/photo_new/T002R800x800M000{album_mid}.jpg?max_age=...`
+/// 提取 `M000` 和 `.jpg` 之间的部分。
+pub fn extract_album_mid_from_url(url: &str) -> Option<String> {
+    let marker = "M000";
+    let mid_start = url.find(marker)?;
+    let after_marker = &url[mid_start + marker.len()..];
+    let end = after_marker.find(".jpg")?;
+    Some(after_marker[..end].to_string())
 }

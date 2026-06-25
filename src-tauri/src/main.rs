@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 static IS_BACKGROUND: AtomicBool = AtomicBool::new(false);
 static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
-static CACHED_LYRIC_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+static CACHED_CACHE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct FrontConfig {
@@ -94,15 +94,30 @@ use lyrics::LyricFetcher;
 
 use std::collections::HashMap;
 
+/// 当前 Unix 毫秒时间戳，用于 LRU 淘汰
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 缓存淘汰上限：超出后淘汰最久未访问的条目。
+/// 每条含歌词文本 + QRC 逐字数据，按平均 8KB/条估算，128 条约 1MB 内存。
+const LYRICS_CACHE_MAX_ENTRIES: usize = 128;
+
 struct LyricsCacheEntry {
     lyrics: String,
     trans: String,
     qrc_raw: String,
     qrc_data: Vec<QrcLine>,
     album_pic_url: String,
+    /// 最后访问时间戳（毫秒），用于 LRU 淘汰
+    last_accessed: u64,
 }
 
 /// 后台歌词缓存 — 由主循环读取、后台任务写入 (使用 HashMap 支持多歌曲缓存，防止切歌竞态)
+/// 超过 LYRICS_CACHE_MAX_ENTRIES 时淘汰最久未访问的条目（近似 LRU）。
 struct LyricsCache {
     entries: HashMap<String, LyricsCacheEntry>,
 }
@@ -120,20 +135,136 @@ impl LyricsCache {
         self.entries.contains_key(&key)
     }
 
-    fn get_entry(&self, title: &str, artist: &str) -> Option<&LyricsCacheEntry> {
+    fn get_entry(&mut self, title: &str, artist: &str) -> Option<&LyricsCacheEntry> {
         let key = format!("{}|{}", title, artist);
-        self.entries.get(&key)
+        let now = current_timestamp_ms();
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_accessed = now;
+        Some(entry)
     }
 
-    fn insert_entry(&mut self, title: &str, artist: &str, entry: LyricsCacheEntry) {
+    fn insert_entry(&mut self, title: &str, artist: &str, mut entry: LyricsCacheEntry) {
         let key = format!("{}|{}", title, artist);
+        entry.last_accessed = current_timestamp_ms();
+
+        if self.entries.len() >= LYRICS_CACHE_MAX_ENTRIES && !self.entries.contains_key(&key) {
+            self.evict_oldest();
+        }
+
         self.entries.insert(key, entry);
+    }
+
+    /// 部分更新：仅覆盖缓存中某首歌的 album_pic_url
+    fn update_album_pic_url(&mut self, title: &str, artist: &str, url: String) {
+        let key = format!("{}|{}", title, artist);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.album_pic_url = url;
+            entry.last_accessed = current_timestamp_ms();
+        }
+    }
+
+    /// 淘汰 last_accessed 最小的条目
+    fn evict_oldest(&mut self) {
+        if let Some((oldest_key, _)) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, e)| e.last_accessed)
+            .map(|(k, v)| (k.clone(), v.last_accessed))
+        {
+            self.entries.remove(&oldest_key);
+        }
     }
 }
 
-/// 缓存 QQ 音乐本地歌词目录路径，只探测一次避免每帧扫盘
+/// 缓存 QQ 音乐本地缓存根目录，只探测一次避免每帧扫盘
+fn get_cache_root() -> Option<PathBuf> {
+    CACHED_CACHE_ROOT.get_or_init(|| local_qrc::auto_detect_cache_root()).clone()
+}
+
+/// 获取歌词缓存目录（QQMusicLyricNew）
 fn get_lyric_cache_dir() -> Option<PathBuf> {
-    CACHED_LYRIC_DIR.get_or_init(|| local_qrc::auto_detect_cache_dir()).clone()
+    get_cache_root().map(|root| root.join("QQMusicLyricNew"))
+}
+
+/// 获取封面图缓存目录（QQMusicPicture）
+fn get_picture_cache_dir() -> Option<PathBuf> {
+    get_cache_root().map(|root| root.join("QQMusicPicture"))
+}
+
+/// 清洗专辑名：去掉中英文括号内容及前后空格，用于 SmartBox 模糊匹配。
+/// 例：`ONE PIECE SUPER BEST (海贼王10周年 SUPER BEST)` → `ONE PIECE SUPER BEST`
+fn clean_album_name(raw: &str) -> String {
+    let mut s = raw.to_string();
+    while let Some(start) = s.find('(') {
+        if let Some(end) = s[start..].find(')') {
+            s.replace_range(start..start + end + 1, "");
+        } else {
+            break;
+        }
+    }
+    while let Some(start) = s.find('（') {
+        if let Some(end) = s[start..].find('）') {
+            let end_byte = start + end + '）'.len_utf8();
+            s.replace_range(start..end_byte, "");
+        } else {
+            break;
+        }
+    }
+    s.trim().to_string()
+}
+
+/// 优先使用本地缓存的专辑封面图，找不到则返回原始在线 URL。
+///
+/// 本地封面文件名含 album_mid，可从在线 URL 中提取 mid 后在 QQMusicPicture 目录查找。
+/// 找到则读取文件转为 base64 data URI（与 SMTC 缩略图格式一致，前端可直接加载）。
+///
+/// 当 API 返回的 album_mid 在本地没找到时（如单曲版 vs 合辑版不一致），
+/// 用 SMTC 报告的专辑名通过 SmartBox 搜索正确的 album_mid，再查本地。
+async fn resolve_album_pic_url(online_url: &str, album_name: &str, fetcher: &LyricFetcher) -> String {
+    if online_url.is_empty() {
+        return String::new();
+    }
+
+    // 只处理 QQ 音乐 CDN 的在线 URL（data:image base64 是 SMTC 缩略图，不替换）
+    if !online_url.contains("y.gtimg.cn") {
+        return online_url.to_string();
+    }
+
+    let Some(pic_dir) = get_picture_cache_dir() else {
+        return online_url.to_string();
+    };
+
+    // 第一次尝试：用在线 URL 中的 album_mid 查本地
+    if let Some(album_mid) = local_qrc::extract_album_mid_from_url(online_url) {
+        if let Some(local_path) = local_qrc::find_album_pic(&pic_dir, &album_mid) {
+            if let Ok(data) = std::fs::read(&local_path) {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                return format!("data:image/jpeg;base64,{}", STANDARD.encode(&data));
+            }
+        }
+    }
+
+    // 第二次尝试：用 SMTC 专辑名搜 SmartBox，拿到用户实际播放专辑的 album_mid。
+    // 尝试原始名和去括号清洗后的变体，处理 SMTC 返回"ONE PIECE SUPER BEST (海贼王…)" 但 SmartBox 只索引"ONE PIECE SUPER BEST"的情况。
+    if !album_name.is_empty() {
+        let mut variants: Vec<&str> = vec![album_name];
+        let cleaned = clean_album_name(album_name);
+        if cleaned != album_name {
+            variants.push(&cleaned);
+        }
+        for variant in &variants {
+            if let Some(correct_mid) = fetcher.search_album_mid_by_name(variant).await {
+                if let Some(local_path) = local_qrc::find_album_pic(&pic_dir, &correct_mid) {
+                    if let Ok(data) = std::fs::read(&local_path) {
+                        use base64::{Engine as _, engine::general_purpose::STANDARD};
+                        return format!("data:image/jpeg;base64,{}", STANDARD.encode(&data));
+                    }
+                }
+            }
+        }
+    }
+
+    online_url.to_string()
 }
 
 /// 从本地 QQ 音乐缓存目录查找歌词（QRC 优先，LRC 兜底），返回完整的缓存条目。
@@ -145,6 +276,7 @@ fn lookup_local_lyrics(title: &str, artist: &str) -> LyricsCacheEntry {
         qrc_raw: String::new(),
         qrc_data: Vec::new(),
         album_pic_url: String::new(),
+        last_accessed: 0,
     };
 
     let Some(cache_dir) = get_lyric_cache_dir() else {
@@ -263,6 +395,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                         let fetcher = lyric_fetcher.clone();
                         let t = info.title.clone();
                         let a = info.artist.clone();
+                        let album = info.album.clone();
                         tokio::spawn(async move {
                             // 1. 本地歌词快速查找并立即插入缓存（~50ms，不阻塞在线获取）
                             {
@@ -274,6 +407,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                         lyrics: String::new(), trans: String::new(),
                                         qrc_raw: String::new(), qrc_data: Vec::new(),
                                         album_pic_url: String::new(),
+                                        last_accessed: 0,
                                     });
                                 if !local.lyrics.is_empty() || !local.qrc_data.is_empty() {
                                     let mut w = cache.write().await;
@@ -285,12 +419,14 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                             // 2. 在线歌词获取（网络 API，1-3s），完成后覆盖本地数据
                             match fetcher.fetch_lyrics(&t, &a).await {
                                 Ok((l, trans, q, pic_url)) => {
+                                    let resolved_pic_url = resolve_album_pic_url(&pic_url, &album, &fetcher).await;
                                     let mut entry = LyricsCacheEntry {
                                         lyrics: l,
                                         trans,
                                         qrc_raw: q,
                                         qrc_data: Vec::new(),
-                                        album_pic_url: pic_url,
+                                        album_pic_url: resolved_pic_url,
+                                        last_accessed: 0,
                                     };
 
                                     // 在线 QRC 解密
@@ -328,7 +464,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 
                                     // 在线数据未覆盖的字段回填本地缓存
                                     if entry.lyrics.is_empty() || entry.qrc_data.is_empty() || entry.trans.is_empty() {
-                                        let cached = cache.read().await;
+                                        let mut cached = cache.write().await;
                                         if let Some(cur) = cached.get_entry(&t, &a) {
                                             if entry.lyrics.is_empty() { entry.lyrics = cur.lyrics.clone(); }
                                             if entry.qrc_data.is_empty() { entry.qrc_data = cur.qrc_data.clone(); }
@@ -350,7 +486,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 
                     // 从缓存中获取歌词 + QRC 数据
                     {
-                        let cached = lyrics_cache.read().await;
+                        let mut cached = lyrics_cache.write().await;
                         if let Some(entry) = cached.get_entry(&info.title, &info.artist) {
                             info.lyrics = entry.lyrics.clone();
                             info.trans = entry.trans.clone();
@@ -359,6 +495,18 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                             if !entry.album_pic_url.is_empty() {
                                 info.album_pic_url = entry.album_pic_url.clone();
                             }
+                        }
+                    }
+
+                    // 即时本地封面重解析：若缓存的 album_pic_url 是 QQ 音乐在线 URL，
+                    // 尝试找本地缓存文件替代。对已缓存歌曲避免永远使用旧 URL。
+                    // resolve_album_pic_url 分两步：URL 中的 album_mid 查本地 → SmartBox 用专辑名查。
+                    if info.album_pic_url.contains("y.gtimg.cn") {
+                        let resolved = resolve_album_pic_url(&info.album_pic_url, &info.album, &lyric_fetcher).await;
+                        if resolved != info.album_pic_url {
+                            let mut w = lyrics_cache.write().await;
+                            w.update_album_pic_url(&info.title, &info.artist, resolved.clone());
+                            info.album_pic_url = resolved;
                         }
                     }
 

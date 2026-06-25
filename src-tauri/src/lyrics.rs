@@ -36,6 +36,27 @@ impl LyricFetcher {
         }
     }
 
+    /// 通过专辑名在 SmartBox 搜索专辑，返回第一个匹配的 album_mid。
+    /// 用于纠正 song_detail API 返回的单曲 album_mid 与用户实际播放专辑不符的情况。
+    pub async fn search_album_mid_by_name(&self, album_name: &str) -> Option<String> {
+        let smartbox_url = "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg";
+        let url = Url::parse_with_params(smartbox_url, &[("key", album_name), ("format", "json")]).ok()?;
+
+        let resp = self.client.get(url)
+            .header("Referer", "https://y.qq.com/")
+            .send()
+            .await
+            .ok()?;
+
+        let parsed: Value = resp.json().await.ok()?;
+
+        parsed["data"]["album"]["itemlist"]
+            .as_array()
+            .and_then(|list| list.first())
+            .and_then(|item| item["mid"].as_str())
+            .map(|s| s.to_string())
+    }
+
     // Function to fetch albummid for a given songmid using get_song_detail_yqq API
     pub async fn get_album_mid(&self, songmid: &str) -> Result<String> {
         let detail_data = serde_json::json!({
