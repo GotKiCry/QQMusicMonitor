@@ -18,6 +18,9 @@ import { parseTranslation } from '../lyrics/translation.js';
 import { buildLyricsArea, showLoadingPlaceholder } from '../lyrics/builder.js';
 import { setBgImage } from '../utils/dom.js';
 
+/** 切歌后已收到几次非切歌更新（用于延迟歌词构建直到进度稳定） */
+let postChangeCount = 0;
+
 /**
  * @param {Object} els - DOM 元素集合
  * @param {any} data - 后端推送的 SongInfo
@@ -52,13 +55,22 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
         setTransMap([]);
         setLastRenderKey('');
         setLastActiveIdx(-1);
+        postChangeCount = 0;
 
         // 3) 清空旧专辑封面，避免上一首封面残留
         setBgImage(els.albumArt, '');
         setBgImage(els.albumBlurBg, '');
         els.albumBlurBg.classList.remove('active');
 
-        // 4) 后端 SMTC 切歌瞬间可能带着旧歌的 timeline（Position/EndTime），
+        // 4) 重置歌词视口滚动位置：防止旧歌 translateY 残留导致新歌词闪现错位
+        els.lyricsViewport.style.transform = '';
+
+        // 5) 立即重置进度条与时间显示，避免旧歌进度残留
+        els.progressFill.style.width = '0%';
+        els.timeCurrent.textContent = '00:00';
+        els.timeTotal.textContent = '00:00';
+
+        // 6) 后端 SMTC 切歌瞬间可能带着旧歌的 timeline（Position/EndTime），
         //    新歌刚开头不可能处于 >5s 位置，强制归零进度与时长，
         //    防止前端进度条/插值基线从旧歌位置继续走。
         if (data.total_time_ms > 5000) {
@@ -67,7 +79,7 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
         }
         const freshProgress = rawTimeMs > 5000 ? 0 : rawTimeMs;
 
-        // 5) 重置插值基线：从这里开始按新歌进度推进
+        // 6) 重置插值基线：从这里开始按新歌进度推进
         resetForSongChange(freshProgress, performance.now());
         rawTimeMs = freshProgress;
     } else {
@@ -122,19 +134,23 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
     }
 
     // —— 重建歌词 ——
-    // 切歌时已显示加载占位；此处仅当 qrc_data 有内容且签名变化时才重建，
-    // 避免用空 qrc_data 的"无逐字歌词"占位覆盖"正在加载歌词..."。
-    // 用 isSongChanged 局部变量作为强制重建信号，不依赖跨模块 live binding。
+    // 切歌后后端会将 total_time_ms/current_time_ms 归零，直到 SMTC 报告
+    // 新歌的 timeline 才恢复非零值。只有 totalMs > 0 才表示 timeline 已就绪，
+    // 此时 rawTimeMs 也是真实的播放进度，用 t 构建歌词不会闪回。
+    // postChangeCount >= 20（约1秒）作为兜底，防止异常情况下永远不构建。
     const qrcLength = data.qrc_data ? data.qrc_data.length : 0;
     const renderKey = `${data.title}|${data.artist}|${qrcLength}`;
-    const needRebuild = isSongChanged || renderKey !== lastRenderKey;
-    if (qrcLength > 0 && needRebuild) {
-        setLastRenderKey(renderKey);
-        const newTransMap = parseTranslation(data.trans);
-        setTransMap(newTransMap);
-        const newLines = buildLyricsArea(els.lyricsViewport, data, newTransMap, cfg.showTranslation);
-        setLyricLines(newLines);
-        setLastActiveIdx(-1);
+    const needRebuild = renderKey !== lastRenderKey;
+    if (!isSongChanged) {
+        postChangeCount++;
+        if (qrcLength > 0 && needRebuild && (totalMs > 0 || postChangeCount >= 20)) {
+            setLastRenderKey(renderKey);
+            const newTransMap = parseTranslation(data.trans);
+            setTransMap(newTransMap);
+            const newLines = buildLyricsArea(els.lyricsViewport, data, newTransMap, cfg.showTranslation);
+            setLyricLines(newLines);
+            setLastActiveIdx(-1);
+        }
     }
 
     // —— 调试面板 ——
