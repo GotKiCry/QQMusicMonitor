@@ -92,38 +92,7 @@ async fn read_session_info(session: &GlobalSystemMediaTransportControlsSession, 
         false
     };
 
-    // Correct the stale SMTC Position using LastUpdatedTime.
-    // SMTC.Position is a snapshot captured at SMTC.LastUpdatedTime.
-    // Real position = Position + (now - LastUpdatedTime) when playing.
-    let corrected_current_ms = if is_playing {
-        match timeline_properties.LastUpdatedTime() {
-            Ok(last_updated) => {
-                let last_updated_100ns = last_updated.UniversalTime;
-                if last_updated_100ns > 0 {
-                    // Convert current UTC to Windows FILETIME epoch (100-ns intervals since 1601-01-01)
-                    let now_unix_ms = chrono::Utc::now().timestamp_millis();
-                    // Offset between Windows FILETIME epoch and Unix epoch in milliseconds
-                    const WINDOWS_EPOCH_OFFSET_MS: i64 = 11_644_473_600_000;
-                    let now_windows_ms = now_unix_ms + WINDOWS_EPOCH_OFFSET_MS;
-                    let last_updated_ms = last_updated_100ns / 10_000; // 100-ns units to ms
-
-                    let elapsed_ms = (now_windows_ms - last_updated_ms).max(0) as u64;
-                    // Clamp elapsed to 5 seconds to avoid huge jumps from stale timestamps
-                    let clamped_elapsed = elapsed_ms.min(5000);
-                    let corrected = raw_current_ms + clamped_elapsed;
-
-                    // Clamp to total duration
-                    if total_time_ms > 0 { corrected.min(total_time_ms) } else { corrected }
-                } else {
-                    raw_current_ms
-                }
-            }
-            Err(_) => raw_current_ms,
-        }
-    } else {
-        raw_current_ms
-    };
-
+    let corrected_current_ms = raw_current_ms;
     let corrected_seconds = corrected_current_ms as f64 / 1000.0;
     let progress = if total_seconds > 0.0 {
         (corrected_seconds / total_seconds) * 100.0

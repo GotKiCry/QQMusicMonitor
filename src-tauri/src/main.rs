@@ -84,8 +84,9 @@ mod smtc;
 mod lyrics;
 mod song_info;
 mod qrc;
-mod local_qrc; // Enable local QRC cache module
+mod local_qrc;
 mod server;
+mod audio_clock;
 
 use cli::Cli;
 use config::Config;
@@ -404,10 +405,15 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 
     let mut last_song_info: Option<SongInfo> = None;
     let mut update_count = 0;
-    // 切歌后追踪旧歌 total_time_ms，用于跨帧检测 SMTC timeline 是否仍报旧值
     let mut stale_song_total: Option<u64> = None;
-    // 去重歌词日志：同一首歌只打一次缓存命中/查找日志
     let mut last_logged_lyric_key = String::new();
+
+    // IAudioClock 基线：SMTC 快照位置 + 该瞬间的硬件时钟读数
+    let mut audio_clock_baseline_ms: u64 = 0;
+    let mut smtc_baseline_ms: u64 = 0;
+
+    // 预热音频时钟会话
+    audio_clock::refresh_audio_clock().await;
 
     // 主循环
     while running.load(Ordering::SeqCst) {
@@ -808,6 +814,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
             current_song_info.progress_percent = 0.0;
             current_song_info.total_time_ms = 0;
             current_song_info.total_time = 0;
+            audio_clock::refresh_audio_clock().await;
         } else if let Some(old_total) = stale_song_total {
             if current_song_info.total_time_ms == 0
                 || current_song_info.total_time_ms == old_total
@@ -822,19 +829,36 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
             }
         }
 
-        // SMTC positions are now drift-corrected via LastUpdatedTime in smtc.rs.
-        // Only apply the user-configurable offset for fine-tuning.
+        // 使用 IAudioClock 计算实耗时间，替代 SMTC LastUpdatedTime 漂移校正。
+        // 原理：SMTC Position 是快照值，IAudioClock 提供硬件级真实流逝时间。
+        // 每帧以 (SMTC快照, 音频时钟) 为锚点，用硬件时钟增量估算当前播放位置。
+        smtc_baseline_ms = current_song_info.current_time_ms;
+        audio_clock_baseline_ms = audio_clock::get_playback_position_ms()
+            .await
+            .unwrap_or(audio_clock_baseline_ms);
+
         let smtc_offset_ms = config.settings.smtc_offset_ms;
         let display_time_ms = if current_song_info.is_playing {
-            let adjusted = current_song_info.current_time_ms + smtc_offset_ms;
+            let clock_now = audio_clock::get_playback_position_ms()
+                .await
+                .unwrap_or(audio_clock_baseline_ms);
+            let elapsed = clock_now.saturating_sub(audio_clock_baseline_ms);
+            let corrected = (smtc_baseline_ms + elapsed) + smtc_offset_ms;
             if current_song_info.total_time_ms > 0 {
-                adjusted.min(current_song_info.total_time_ms)
+                corrected.min(current_song_info.total_time_ms)
             } else {
-                adjusted
+                corrected
             }
         } else {
             current_song_info.current_time_ms
         };
+
+        current_song_info.current_time_ms = display_time_ms;
+        current_song_info.current_time = display_time_ms / 1000;
+        if current_song_info.total_time_ms > 0 {
+            current_song_info.progress_percent =
+                (display_time_ms as f64 / current_song_info.total_time_ms as f64 * 100.0) as f32;
+        }
 
         // 广播最新状态给所有 WebSocket 客户端
         let _ = tx.send(current_song_info.clone());

@@ -89,9 +89,29 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
             : lastSampleProgress;
 
         if (isPlaying !== oldIsPlaying) {
-            // 播放/暂停切换：取较大值避免恢复时回退
             setLastRawTimeMs(rawTimeMs);
-            setLastSampleProgress(Math.max(rawTimeMs, localEstimate));
+            if (!isPlaying && lastSampleLocalTime > 0) {
+                // play → pause: 把暂停瞬间累积的 elapsed 烘焙进基线，
+                // 让 render-loop 的 paused 分支（lastSampleProgress + offset）
+                // 与暂停前最后一帧的 playing 分支显示位置完全连续，无闪回。
+                const displayNow = lastSampleProgress + (performance.now() - lastSampleLocalTime);
+                setLastSampleProgress(displayNow);
+            } else {
+                // pause → play 或异常初始状态: snap 到 SMTC 真实位置，
+                // 但不回退——防止暂停期间 displayNow 基线比 rawTimeMs
+                // 略大（含暂停瞬间烘焙的 elapsed）导致恢复时闪回。
+                setLastSampleProgress(Math.max(rawTimeMs, lastSampleProgress));
+            }
+            setLastSampleLocalTime(performance.now());
+        } else if (!isPlaying) {
+            // 暂停期间：不动 lastSampleProgress（保持显示稳定），
+            // 但持续刷新 lastSampleLocalTime，防止 setIsPlaying(true)
+            // 与 transition 基线更新之间渲染循环拿到过期的本地时间戳
+            // 导致 elapsed 暴涨、显示瞬间跳到很后面再回弹。
+            if (Math.abs(rawTimeMs - lastSampleProgress) > 1000) {
+                // 暂停时 seek：snap 到新位置
+                setLastSampleProgress(rawTimeMs);
+            }
             setLastSampleLocalTime(performance.now());
         } else if (Math.abs(rawTimeMs - localEstimate) > 1000) {
             // 大跳变（seek 或切歌后 timeline 更新）
