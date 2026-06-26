@@ -112,6 +112,9 @@ struct LyricsCacheEntry {
     qrc_raw: String,
     qrc_data: Vec<QrcLine>,
     album_pic_url: String,
+    /// 本地缓存文件名中解析出的专辑名（QQ 音乐索引时的原始名），
+    /// 比依赖 SMTC 报告的 album 更可靠，用作在线 album_mid 解析的搜索词。
+    local_album: String,
     /// 最后访问时间戳（毫秒），用于 LRU 淘汰
     last_accessed: u64,
 }
@@ -141,6 +144,12 @@ impl LyricsCache {
         let entry = self.entries.get_mut(&key)?;
         entry.last_accessed = now;
         Some(entry)
+    }
+
+    /// 只读访问条目（不更新 LRU 时间戳），用于在 read guard 下读取字段。
+    fn peek_entry(&self, title: &str, artist: &str) -> Option<&LyricsCacheEntry> {
+        let key = format!("{}|{}", title, artist);
+        self.entries.get(&key)
     }
 
     fn insert_entry(&mut self, title: &str, artist: &str, mut entry: LyricsCacheEntry) {
@@ -276,6 +285,7 @@ fn lookup_local_lyrics(title: &str, artist: &str) -> LyricsCacheEntry {
         qrc_raw: String::new(),
         qrc_data: Vec::new(),
         album_pic_url: String::new(),
+        local_album: String::new(),
         last_accessed: 0,
     };
 
@@ -285,18 +295,27 @@ fn lookup_local_lyrics(title: &str, artist: &str) -> LyricsCacheEntry {
 
     // QRC 优先（逐字歌词）
     if let Some(qrc_file) = local_qrc::find_qrc_file(&cache_dir, title, artist) {
-        if let Ok(xml) = qrc::decode_qrc_from_file(&qrc_file) {
-            entry.qrc_raw = "[local]".to_string();
-            if let Ok(lines) = qrc::parse_qrc_xml(&xml) {
-                entry.qrc_data = lines;
-            }
-            if entry.lyrics.is_empty() {
-                entry.lyrics = qrc::extract_lrc_from_xml(&xml).unwrap_or_default();
-            }
-            if let Some(trans_file) = local_qrc::find_qrc_trans_file(&qrc_file) {
-                if let Ok(trans_xml) = qrc::decode_qrc_from_file(&trans_file) {
-                    entry.trans = trans_xml;
+        // 记录本地文件名中的专辑名，供后续在线专辑封面解析复用
+        if let Some(fname) = qrc_file.file_name().and_then(|n| n.to_str()) {
+            entry.local_album = local_qrc::parse_lyric_filename(fname).2;
+        }
+        match qrc::decode_qrc_from_file(&qrc_file) {
+            Ok(xml) => {
+                entry.qrc_raw = "[local]".to_string();
+                if let Ok(lines) = qrc::parse_qrc_xml(&xml) {
+                    entry.qrc_data = lines;
                 }
+                if entry.lyrics.is_empty() {
+                    entry.lyrics = qrc::extract_lrc_from_xml(&xml).unwrap_or_default();
+                }
+                if let Some(trans_file) = local_qrc::find_qrc_trans_file(&qrc_file) {
+                    if let Ok(trans_xml) = qrc::decode_qrc_from_file(&trans_file) {
+                        entry.trans = trans_xml;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  ⚠ QRC解密失败: {:?} — {}", qrc_file.file_name().unwrap_or_default(), e);
             }
         }
     }
@@ -315,6 +334,26 @@ fn lookup_local_lyrics(title: &str, artist: &str) -> LyricsCacheEntry {
                     Err(_) => std::fs::read_to_string(&trans_lrc_file).unwrap_or_default(),
                 };
                 entry.trans = qrc::extract_lrc_from_xml(&trans_raw).unwrap_or(trans_raw);
+            }
+        } else {
+            // LRC 也未找到：打印诊断，帮助判断是文件名匹配问题还是真的没有文件
+            if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                let norm_title = local_qrc::normalize(title);
+                let mut lrc_candidates: Vec<String> = Vec::new();
+                for e in entries.flatten() {
+                    let fname = match e.file_name().to_str() {
+                        Some(n) => n.to_string(), None => continue,
+                    };
+                    if !fname.ends_with("_qm.lrc") { continue; }
+                    let base = fname.trim_end_matches("_qm.lrc");
+                    let parts: Vec<&str> = base.splitn(4, " - ").collect();
+                    if parts.len() >= 2 && local_qrc::normalize(parts[1]).contains(&norm_title) {
+                        lrc_candidates.push(fname);
+                    }
+                }
+                if !lrc_candidates.is_empty() {
+                    eprintln!("  ℹ LRC候选(未匹配): {}", lrc_candidates.join(", "));
+                }
             }
         }
     }
@@ -367,6 +406,8 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
     let mut update_count = 0;
     // 切歌后追踪旧歌 total_time_ms，用于跨帧检测 SMTC timeline 是否仍报旧值
     let mut stale_song_total: Option<u64> = None;
+    // 去重歌词日志：同一首歌只打一次缓存命中/查找日志
+    let mut last_logged_lyric_key = String::new();
 
     // 主循环
     while running.load(Ordering::SeqCst) {
@@ -385,18 +426,34 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
             Ok(info) => {
                 if let Some(mut info) = info {
                     // 后台歌词加载：切歌时后台请求，不阻塞 TUI
+                    let quiet = args.quiet;
+                    let debug = config.settings.debug_mode;
+                    let song_key = format!("{}|{}", info.title, info.artist);
                     let cached_has_song = lyrics_cache.read().await.has_song(&info.title, &info.artist);
 
                     if !cached_has_song {
-                        let quiet = args.quiet;
-                        let debug = config.settings.debug_mode;
-                        if debug { eprintln!("[lyrics] Fetching lyrics for '{} - {}' in background", info.title, info.artist); }
+                        // 立即插入占位条目，阻止后续帧重复 spawn
+                        {
+                            let mut w = lyrics_cache.write().await;
+                            w.insert_entry(&info.title, &info.artist, LyricsCacheEntry {
+                                lyrics: String::new(), trans: String::new(),
+                                qrc_raw: String::new(), qrc_data: Vec::new(),
+                                album_pic_url: String::new(),
+                                local_album: String::new(),
+                                last_accessed: 0,
+                            });
+                        }
+                        if !quiet && song_key != last_logged_lyric_key {
+                            eprintln!("[歌词] {} - {}", info.artist, info.title);
+                            last_logged_lyric_key = song_key;
+                        }
                         let cache = lyrics_cache.clone();
                         let fetcher = lyric_fetcher.clone();
                         let t = info.title.clone();
                         let a = info.artist.clone();
                         let album = info.album.clone();
                         tokio::spawn(async move {
+                            let has_local_qrc;
                             // 1. 本地歌词快速查找并立即插入缓存（~50ms，不阻塞在线获取）
                             {
                                 let t2 = t.clone();
@@ -407,16 +464,78 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                         lyrics: String::new(), trans: String::new(),
                                         qrc_raw: String::new(), qrc_data: Vec::new(),
                                         album_pic_url: String::new(),
+                                        local_album: String::new(),
                                         last_accessed: 0,
                                     });
-                                if !local.lyrics.is_empty() || !local.qrc_data.is_empty() {
+
+                                let local_qrc = local.qrc_data.len();
+                                let local_lrc = !local.lyrics.is_empty();
+                                let local_trans = !local.trans.is_empty();
+                                if !quiet {
+                                    let cache_dir_info = match get_lyric_cache_dir() {
+                                        Some(ref dir) => {
+                                            let file_count = std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0);
+                                            format!("{} ({}个文件)", dir.display(), file_count)
+                                        }
+                                        None => "未找到本地缓存目录".to_string(),
+                                    };
+                                    if local_qrc > 0 || local_lrc || local_trans {
+                                        eprintln!("  本地: QRC {}行 | 歌词 {} | 翻译 {} | {}",
+                                            local_qrc,
+                                            if local_lrc { "✓" } else { "✗" },
+                                            if local_trans { "✓" } else { "✗" },
+                                            cache_dir_info);
+                                    } else {
+                                        eprintln!("  本地: ✗ 无数据 ({})", cache_dir_info);
+                                        // 诊断：显示文件名格式 + 模糊匹配候选
+                                        eprintln!("       搜索词: artist='{}' title='{}'", local_qrc::normalize(&a), local_qrc::normalize(&t));
+                                        if let Some(ref dir) = get_lyric_cache_dir() {
+                                            if let Ok(entries) = std::fs::read_dir(dir) {
+                                                let mut qrc_count = 0u32;
+                                                let mut best_candidate: Option<(String, u32)> = None;
+                                                let norm_title = local_qrc::normalize(&t);
+                                                let norm_artist = local_qrc::normalize(&a);
+                                                for entry in entries.flatten() {
+                                                    let fname = match entry.file_name().to_str() {
+                                                        Some(n) => n.to_string(),
+                                                        None => continue,
+                                                    };
+                                                    if !fname.ends_with("_qm.qrc") { continue; }
+                                                    qrc_count += 1;
+                                                    // 计算与当前歌曲的匹配度
+                                                    let base = fname.trim_end_matches("_qm.qrc");
+                                                    let parts: Vec<&str> = base.splitn(4, " - ").collect();
+                                                    if parts.len() >= 2 {
+                                                        let f_artist = local_qrc::normalize(parts[0]);
+                                                        let f_title = local_qrc::normalize(parts[1]);
+                                                        let mut score: u32 = 0;
+                                                        if f_title == norm_title { score += 100; }
+                                                        else if f_title.contains(&norm_title) || norm_title.contains(&f_title) { score += 60; }
+                                                        if f_artist == norm_artist { score += 50; }
+                                                        else if f_artist.contains(&norm_artist) || norm_artist.contains(&f_artist) { score += 30; }
+                                                        if score > 0 && (best_candidate.is_none() || score > best_candidate.as_ref().unwrap().1) {
+                                                            best_candidate = Some((fname, score));
+                                                        }
+                                                    }
+                                                }
+                                                eprintln!("       目录QRC总数: {} | 最佳候选: {}", qrc_count,
+                                                    best_candidate.map_or("无部分匹配".to_string(), |(f, s)| format!("'{}' (分数:{})", f, s)));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                has_local_qrc = !local.qrc_data.is_empty();
+
+                                if !local.lyrics.is_empty() || has_local_qrc {
                                     let mut w = cache.write().await;
                                     w.insert_entry(&t, &a, local);
                                     if debug { eprintln!("[lyrics] Local cache populated for '{} - {}'", t, a); }
                                 }
                             }
 
-                            // 2. 在线歌词获取（网络 API，1-3s），完成后覆盖本地数据
+                            // 2. 在线歌词获取（仅当本地无 QRC 时才请求，作为备用手段）
+                            if !has_local_qrc {
                             match fetcher.fetch_lyrics(&t, &a).await {
                                 Ok((l, trans, q, pic_url)) => {
                                     let resolved_pic_url = resolve_album_pic_url(&pic_url, &album, &fetcher).await;
@@ -426,6 +545,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                         qrc_raw: q,
                                         qrc_data: Vec::new(),
                                         album_pic_url: resolved_pic_url,
+                                        local_album: String::new(),
                                         last_accessed: 0,
                                     };
 
@@ -472,16 +592,120 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                         }
                                     }
 
+                                    // 复用本地缓存条目中的专辑名（优于依赖 SMTC album）
+                                    if entry.local_album.is_empty() {
+                                        let mut cached = cache.write().await;
+                                        if let Some(cur) = cached.get_entry(&t, &a) {
+                                            entry.local_album = cur.local_album.clone();
+                                        }
+                                    }
+
+                                    // 汇总在线结果
+                                    if !quiet {
+                                        let qrc_lines = entry.qrc_data.len();
+                                        let lrc = !entry.lyrics.is_empty();
+                                        let has_trans = !entry.trans.is_empty();
+                                        let has_pic = !entry.album_pic_url.is_empty();
+                                        if qrc_lines > 0 || lrc || has_trans {
+                                            eprintln!("  在线: QRC {}行 | 歌词 {} | 翻译 {} | 封面 {}",
+                                                qrc_lines,
+                                                if lrc { "✓" } else { "✗" },
+                                                if has_trans { "✓" } else { "✗" },
+                                                if has_pic { "✓" } else { "✗" });
+                                        } else {
+                                            eprintln!("  在线: ✗ 无数据");
+                                        }
+                                    }
+
                                     let mut w = cache.write().await;
                                     w.insert_entry(&t, &a, entry);
                                     if debug { eprintln!("[lyrics] ✓ Background fetch complete for '{} - {}'", t, a); }
                                 }
                                 Err(e) => {
-                                    if !quiet { eprintln!("[lyrics] Background fetch failed for '{} - {}': {}", t, a, e); }
+                                    if !quiet { eprintln!("  在线: ✗ 失败 ({})", e); }
                                     // 本地数据已在步骤 1 插入，无需额外处理
                                 }
                             }
+                            } // if !has_local_qrc
+                            else {
+                                // 本地有 QRC 但缺少封面：解析 album_mid → 优先查本地 QQMusicPicture → 在线 CDN 兜底
+                                //
+                                // 1) 取 album_mid：
+                                //    a. 多策略搜歌曲 songmid → get_album_mid（解决 "(Explicit)" 等括号后缀
+                                //       导致单策略搜不到的问题，与 fetch_lyrics 策略对齐）
+                                //    b. 仍失败则用专辑名搜 SmartBox 专辑，候选为本地文件名专辑名
+                                //       （QQ 音乐索引原始名，比 SMTC album 更可靠）与 SMTC album，
+                                //       均清洗去括号后再搜
+                                // 2) 有了 album_mid：本地命中→base64 data URI（与在线路径一致，
+                                //    避免 file:// 在 webview 受限）；否则返回在线 CDN URL
+                                let get_pic = async {
+                                    let mut album_mid = String::new();
+
+                                    // 1a) 多策略搜歌曲拿 album_mid
+                                    if let Some(songmid) = fetcher.search_song_mid(&t, &a).await {
+                                        album_mid = fetcher.get_album_mid(&songmid).await.unwrap_or_default();
+                                    }
+
+                                    // 1b) 歌曲搜失败 → 用专辑名搜专辑（候选：本地文件名专辑 + SMTC album，
+                                    //     各自清洗去括号后作为额外候选）
+                                    if album_mid.is_empty() {
+                                        // 从本地缓存条目取文件名解析的专辑名
+                                        let local_album = {
+                                            let cached = cache.read().await;
+                                            cached.peek_entry(&t, &a).map(|e| e.local_album.clone()).unwrap_or_default()
+                                        };
+                                        let mut album_variants: Vec<String> = Vec::new();
+                                        for name in [local_album, album.clone()].into_iter().filter(|s| !s.is_empty()) {
+                                            let cleaned = clean_album_name(&name);
+                                            album_variants.push(cleaned.clone());
+                                            if !cleaned.is_empty() && cleaned != name {
+                                                album_variants.push(name);
+                                            }
+                                        }
+                                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                                        for variant in album_variants {
+                                            let v = variant.trim().to_string();
+                                            if v.is_empty() || !seen.insert(v.clone()) { continue; }
+                                            if let Some(am) = fetcher.search_album_mid_by_name(&v).await {
+                                                album_mid = am;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    // 2) album_mid → 本地图片优先，否则在线 URL
+                                    if !album_mid.is_empty() {
+                                        if let Some(pic_dir) = get_cache_root().map(|r| r.join("QQMusicPicture")) {
+                                            if let Some(local_pic) = local_qrc::find_album_pic(&pic_dir, &album_mid) {
+                                                if let Ok(data) = std::fs::read(&local_pic) {
+                                                    use base64::{Engine as _, engine::general_purpose::STANDARD};
+                                                    let data_uri = format!("data:image/jpeg;base64,{}", STANDARD.encode(&data));
+                                                    if !quiet { eprintln!("  封面: ✓ 本地"); }
+                                                    return Some(data_uri);
+                                                }
+                                            }
+                                        }
+                                        let pic_url = format!("https://y.gtimg.cn/music/photo_new/T002R800x800M000{}.jpg?max_age=2592000", album_mid);
+                                        if !quiet { eprintln!("  封面: ✓ 在线"); }
+                                        return Some(pic_url);
+                                    }
+                                    None
+                                };
+
+                                if !quiet { eprintln!("  封面: 查找中..."); }
+                                if let Some(pic_url) = get_pic.await {
+                                    let mut w = cache.write().await;
+                                    w.update_album_pic_url(&t, &a, pic_url);
+                                } else if !quiet {
+                                    eprintln!("  封面: ✗ 未找到");
+                                }
+                            }
                         });
+                    } else {
+                        if !quiet && song_key != last_logged_lyric_key {
+                            eprintln!("[歌词] {} - {}  ◀ 缓存", info.artist, info.title);
+                            last_logged_lyric_key = song_key;
+                        }
                     }
 
                     // 从缓存中获取歌词 + QRC 数据

@@ -195,14 +195,34 @@ pub fn find_lrc_trans_file(lrc_file: &Path) -> Option<PathBuf> {
     }
 }
 
-// Helper to normalize strings for fuzzy comparison
-fn normalize(s: &str) -> String {
+// Helper to normalize strings for fuzzy comparison.
+//
+// 将所有非字母数字字符（含标点、括号、`_`/`/`/`\\`、`(feat.` 的点和括号等）
+// 折叠为单个空格，解决 SMTC 报告 `Go Again (feat. ELYSA)` 与本地缓存文件名
+// `Go Again (feat_ ELYSA)` 因标点差异导致 contains/equal 匹配双双失败的问题。
+// CJK 字符属于 `is_alphanumeric`，故中日韩标题不受影响。
+pub fn normalize(s: &str) -> String {
     s.to_lowercase()
-        .replace('_', " ")
-        .replace('/', " ")
-        .replace('\\', " ")
-        .trim()
-        .to_string()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 从 QRC/LRC 文件名中解析出各字段。
+/// 文件名格式：`Artist - Title - Duration - Album_qm.{qrc,lrc}`
+/// 返回 `(artist, title, album)`；字段缺失时为空串。
+pub fn parse_lyric_filename(file_name: &str) -> (String, String, String) {
+    let base = file_name
+        .trim_end_matches("_qm.qrc")
+        .trim_end_matches("_qm.lrc");
+    let parts: Vec<&str> = base.splitn(4, " - ").collect();
+    let artist = parts.first().copied().unwrap_or("").to_string();
+    let title = parts.get(1).copied().unwrap_or("").to_string();
+    let album = parts.get(3).copied().unwrap_or("").to_string();
+    (artist, title, album)
 }
 
 /// 在 QQ 音乐本地缓存目录中查找专辑封面图。
@@ -251,4 +271,56 @@ pub fn extract_album_mid_from_url(url: &str) -> Option<String> {
     let after_marker = &url[mid_start + marker.len()..];
     let end = after_marker.find(".jpg")?;
     Some(after_marker[..end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归测试：SMTC 报告 `Go Again (feat. ELYSA)` 与本地缓存文件名
+    /// `Go Again (feat_ ELYSA)` 因标点差异（`.` vs `_`、括号）此前
+    /// 在 `find_qrc_file` 的 title 比较中双双失败而被跳过。改进后的
+    /// `normalize` 应将两者折叠为同一结果，从而命中本地 QRC。
+    #[test]
+    fn test_normalize_punctuation_insensitive() {
+        assert_eq!(normalize("Go Again (feat. ELYSA)"), "go again feat elysa");
+        assert_eq!(normalize("Go Again (feat_ ELYSA)"), "go again feat elysa");
+        assert_eq!(
+            normalize("Go Again (feat. ELYSA)"),
+            normalize("Go Again (feat_ ELYSA)"),
+            "SMTC title and cached filename must normalize equal"
+        );
+
+        // 多歌手分隔符 / Explicit 后缀
+        assert_eq!(normalize("King CAAN/ELYSA"), "king caan elysa");
+        assert_eq!(normalize("King CAAN_ELYSA"), "king caan elysa");
+        assert_eq!(normalize("Normal No More (Explicit)"), "normal no more explicit");
+
+        // CJK 标题不受影响
+        assert_eq!(normalize("修炼爱情"), "修炼爱情");
+        assert_eq!(normalize("삐딱하게 (Crooked) (狂放)"), "삐딱하게 crooked 狂放");
+    }
+
+    /// 文件名解析：`Artist - Title - Duration - Album_qm.{qrc,lrc}` 各字段正确切分。
+    #[test]
+    fn test_parse_lyric_filename() {
+        let (artist, title, album) = parse_lyric_filename(
+            "Glass Animals - The Other Side Of Paradise (Explicit) - 320 - How To Be A Human Being (Explicit)_qm.qrc"
+        );
+        assert_eq!(artist, "Glass Animals");
+        assert_eq!(title, "The Other Side Of Paradise (Explicit)");
+        assert_eq!(album, "How To Be A Human Being (Explicit)");
+
+        // LRC 后缀
+        let (a, t, al) = parse_lyric_filename("徐良 - 那时雨 - 200 - 不写完_qm.lrc");
+        assert_eq!(a, "徐良");
+        assert_eq!(t, "那时雨");
+        assert_eq!(al, "不写完");
+
+        // 缺少 album 段：返回空 album
+        let (a, t, al) = parse_lyric_filename("TYSM - Normal No More_qm.qrc");
+        assert_eq!(a, "TYSM");
+        assert_eq!(t, "Normal No More");
+        assert_eq!(al, "");
+    }
 }

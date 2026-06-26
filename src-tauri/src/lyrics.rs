@@ -103,7 +103,7 @@ impl LyricFetcher {
 
     // Function to search and fetch lyrics with multiple fallback strategies
     pub async fn fetch_lyrics(&self, title: &str, artist: &str) -> Result<(String, String, String, String)> {
-        let log = |msg| { if self.debug { eprintln!("{}", msg); } };
+        let log = |msg| { eprintln!("{}", msg); };
         
         // Strategy 1: Search with "artist title" keyword
         let keyword = format!("{} {}", artist, title);
@@ -188,6 +188,43 @@ impl LyricFetcher {
         Ok((String::new(), String::new(), String::new(), String::new()))
     }
 
+
+    /// 多策略搜索歌曲，返回第一个命中候选的 songmid。
+    ///
+    /// 与 `fetch_lyrics` 不同，此处不做歌词非空校验，仅用于需要 songmid 的
+    /// 辅助场景（如本地歌词已命中、仅缺专辑封面时解析 album_mid）。
+    /// 策略顺序与 `fetch_lyrics` 对齐，保证与歌词命中同一首歌：
+    ///   1. "artist title"
+    ///   2. "title"
+    ///   3. "clean_artist clean_title" / "clean_title"
+    pub async fn search_song_mid(&self, title: &str, artist: &str) -> Option<String> {
+        let clean_title = clean_search_term(title);
+        let clean_artist = clean_search_term(artist);
+
+        let mut queries: Vec<String> = Vec::new();
+        queries.push(format!("{} {}", artist, title));
+        queries.push(title.to_string());
+        if clean_title != title || clean_artist != artist {
+            queries.push(format!("{} {}", clean_artist, clean_title));
+            if !clean_title.is_empty() {
+                queries.push(clean_title.clone());
+            }
+        }
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for q in queries {
+            let q = q.trim().to_string();
+            if q.is_empty() || !seen.insert(q.clone()) {
+                continue;
+            }
+            if let Ok(Some(mid)) = self.search_song(&q).await {
+                if !mid.is_empty() {
+                    return Some(mid);
+                }
+            }
+        }
+        None
+    }
 
     // Function to search for a song and return its mid
     // NOTE: Modern API (DoSearchForQQMusicDesktop) no longer returns results,
@@ -467,7 +504,7 @@ fn sanitize_search_keyword(s: &str) -> String {
 }
 
 // Helper to clean search terms by removing parenthetical content and special chars
-fn clean_search_term(s: &str) -> String {
+pub fn clean_search_term(s: &str) -> String {
     let mut result = s.to_string();
     // Remove content in parentheses (both English and Chinese)
     while let Some(start) = result.find('(') {
