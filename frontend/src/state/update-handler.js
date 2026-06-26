@@ -150,6 +150,10 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
             const newLines = buildLyricsArea(els.lyricsViewport, data, newTransMap, cfg.showTranslation);
             setLyricLines(newLines);
             setLastActiveIdx(-1);
+        } else if (qrcLength === 0 && postChangeCount === 20) {
+            setLastRenderKey(renderKey);
+            const newLines = buildLyricsArea(els.lyricsViewport, data, [], cfg.showTranslation);
+            setLyricLines(newLines);
         }
     }
 

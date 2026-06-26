@@ -48,8 +48,14 @@ export function buildLyricsArea(viewport, data, transMap, showTranslation) {
     if (!data.qrc_data || data.qrc_data.length === 0) {
         const div = document.createElement('div');
         div.className = 'lyric-empty';
-        div.textContent = data.lyrics ? data.lyrics.split('\n')[0] : '无逐字歌词';
+        let text = data.lyrics ? data.lyrics.split('\n')[0] : '';
+        // 去除 LRC 时间标签前缀（如 [00:00.00]）
+        text = text.replace(/^\s*\[\d{2}:\d{2}[.:]\d{2,3}\]\s*/g, '');
+        if (!text) text = '纯音乐，请欣赏';
+        div.textContent = text;
         viewport.appendChild(div);
+        // 重置滚动位移，确保占位文本居中
+        viewport.style.transform = 'translateY(0px)';
         return [];
     }
 
