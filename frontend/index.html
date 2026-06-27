@@ -33,6 +33,26 @@
                 <span class="status-indicator" id="status-dot"></span>
                 <span class="status-label" id="status-text">OFFLINE</span>
             </div>
+            <div class="media-controls" id="media-controls">
+                <button class="media-btn" id="btn-prev" title="上一首">
+                    <svg viewBox="0 0 24 24" class="svg-icon">
+                        <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/>
+                    </svg>
+                </button>
+                <button class="media-btn media-btn-play" id="btn-play-pause" title="播放/暂停">
+                    <svg viewBox="0 0 24 24" class="svg-icon" id="icon-play">
+                        <path d="M8 5v14l11-7z"/>
+                    </svg>
+                    <svg viewBox="0 0 24 24" class="svg-icon hidden" id="icon-pause">
+                        <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+                    </svg>
+                </button>
+                <button class="media-btn" id="btn-next" title="下一首">
+                    <svg viewBox="0 0 24 24" class="svg-icon">
+                        <path d="M6 18l8.5-6L6 6v12zM18 6v12h2V6h-2z"/>
+                    </svg>
+                </button>
+            </div>
             <div class="header-title">QQ MUSIC MONITOR</div>
             <button class="settings-trigger-btn" id="btn-settings" title="偏好设置">
                 <svg viewBox="0 0 24 24" class="svg-icon">

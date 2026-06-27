@@ -14,8 +14,8 @@
 import { $, bindElements } from './utils/dom.js';
 import { loadFrontendConfig } from './config/frontend-config.js';
 import { fetchBackendConfig, getDefaultBackendConfig } from './config/backend-config.js';
-import { connect, disconnect, updateConnectionUI } from './connection/ws.js';
-import { listenSongInfo, notifyBackgroundState, isTauri } from './connection/tauri-bridge.js';
+import { connect, disconnect, updateConnectionUI, sendCommand } from './connection/ws.js';
+import { listenSongInfo, notifyBackgroundState, isTauri, mediaControl } from './connection/tauri-bridge.js';
 import {
     animFrame, setAnimFrame, setLastSyncMs,
     setIsIntentionalClose
@@ -70,8 +70,45 @@ const els = bindElements({
     // 调试
     debugPanel: 'debug-panel',
     debugInfo: 'debug-info',
-    rawData: 'raw-data'
+    rawData: 'raw-data',
+    // 媒体控制按钮
+    btnPrev: 'btn-prev',
+    btnPlayPause: 'btn-play-pause',
+    btnNext: 'btn-next',
+    iconPlay: 'icon-play',
+    iconPause: 'icon-pause',
+    mediaControls: 'media-controls'
 });
+
+/* ============================================================
+ * 媒体控制按钮
+ * ============================================================ */
+
+function triggerMediaControl(action) {
+    if (isTauri()) {
+        mediaControl(action);
+    } else {
+        sendCommand(action);
+    }
+}
+
+els.btnPrev.addEventListener('click', () => triggerMediaControl('previous'));
+els.btnNext.addEventListener('click', () => triggerMediaControl('next'));
+els.btnPlayPause.addEventListener('click', () => triggerMediaControl('play_pause'));
+
+/**
+ * 根据播放状态切换播放/暂停图标
+ * @param {boolean} playing
+ */
+function updatePlayPauseIcon(playing) {
+    if (playing) {
+        els.iconPlay.classList.add('hidden');
+        els.iconPause.classList.remove('hidden');
+    } else {
+        els.iconPlay.classList.remove('hidden');
+        els.iconPause.classList.add('hidden');
+    }
+}
 
 /* ============================================================
  * 配置加载
@@ -92,6 +129,9 @@ function onMessage(data) {
     handleSongInfoUpdate(els, data, frontConfig, backConfig, lastSyncMsRef);
     lastSyncMsRef.val = performance.now() - t0;
     setLastSyncMs(lastSyncMsRef.val);
+    if (typeof data.is_playing === 'boolean') {
+        updatePlayPauseIcon(data.is_playing);
+    }
 }
 
 /* ============================================================

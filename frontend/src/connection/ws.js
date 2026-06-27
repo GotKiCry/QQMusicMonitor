@@ -112,4 +112,14 @@ export function disconnect() {
     }
 }
 
+/**
+ * 通过 WebSocket 发送控制命令。
+ * @param {'play_pause' | 'next' | 'previous'} action
+ */
+export function sendCommand(action) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action }));
+    }
+}
+
 export { updateConnectionUI };

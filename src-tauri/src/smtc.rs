@@ -205,3 +205,30 @@ pub async fn get_current_media_info() -> Result<Option<SongInfo>> {
 
     Ok(None)
 }
+
+pub async fn try_toggle_play_pause() -> Result<()> {
+    let reader_mutex = SMTC_READER.get().context("SMTC reader not initialized")?;
+    let reader = reader_mutex.lock().await;
+    if let Some(session) = &reader.current_session {
+        session.TryTogglePlayPauseAsync()?.await?;
+    }
+    Ok(())
+}
+
+pub async fn try_skip_next() -> Result<()> {
+    let reader_mutex = SMTC_READER.get().context("SMTC reader not initialized")?;
+    let reader = reader_mutex.lock().await;
+    if let Some(session) = &reader.current_session {
+        session.TrySkipNextAsync()?.await?;
+    }
+    Ok(())
+}
+
+pub async fn try_skip_previous() -> Result<()> {
+    let reader_mutex = SMTC_READER.get().context("SMTC reader not initialized")?;
+    let reader = reader_mutex.lock().await;
+    if let Some(session) = &reader.current_session {
+        session.TrySkipPreviousAsync()?.await?;
+    }
+    Ok(())
+}

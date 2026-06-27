@@ -32,3 +32,15 @@ export function notifyBackgroundState(isBackground) {
 export function isTauri() {
     return !!window.__TAURI__;
 }
+
+/**
+ * 通过 Tauri invoke 发送媒体控制命令。
+ * @param {'play_pause' | 'next' | 'previous'} action
+ */
+export function mediaControl(action) {
+    if (!window.__TAURI__) return;
+    const cmd = action === 'play_pause' ? 'media_toggle_play_pause'
+               : action === 'next' ? 'media_next'
+               : 'media_previous';
+    window.__TAURI__.core.invoke(cmd);
+}

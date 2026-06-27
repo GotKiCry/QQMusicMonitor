@@ -11,6 +11,12 @@ use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 
 use crate::song_info::SongInfo;
+use crate::smtc;
+
+#[derive(serde::Deserialize)]
+struct WsCommand {
+    action: String,
+}
 
 /// 服务端状态持有 watch::Receiver
 struct AppState {
@@ -49,9 +55,7 @@ async fn ws_handler(
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.receiver.clone();
 
-    // 首次连接时，发送一次当前数据
     let initial = rx.borrow().clone();
-    // axum::extract::ws::Message::Text / axum::extract::ws::Message::Text(...)
     if let Ok(json) = serde_json::to_string(&initial) {
         if socket.send(Message::Text(json)).await.is_err() {
             return;
@@ -59,25 +63,33 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     loop {
-        // 等待数据更新或 socket 关闭
         tokio::select! {
             result = rx.changed() => {
                 if result.is_ok() {
                     let current = rx.borrow().clone();
                     if let Ok(json) = serde_json::to_string(&current) {
-                        // Axum 0.7 需要使用 Message::Text(String)
                         if socket.send(Message::Text(json)).await.is_err() {
                             break;
                         }
                     }
                 } else {
-                    break; // sender 已经断开
+                    break;
                 }
             }
             msg = socket.recv() => {
-                // 如果客户端发送消息或断开连接
-                if let Some(Ok(Message::Close(_))) | None = msg {
-                    break;
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(cmd) = serde_json::from_str::<WsCommand>(&text) {
+                            let _ = match cmd.action.as_str() {
+                                "play_pause" => smtc::try_toggle_play_pause().await,
+                                "next" => smtc::try_skip_next().await,
+                                "previous" => smtc::try_skip_previous().await,
+                                _ => Ok(()),
+                            };
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
                 }
             }
         }

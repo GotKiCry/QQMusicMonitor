@@ -83,6 +83,45 @@
     opacity: 0.85;
 }
 
+/* —— 媒体控制按钮组 —— */
+.media-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.media-btn {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    color: var(--text-sub);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    transition: var(--transition-base);
+}
+
+.media-btn:hover {
+    color: var(--theme-primary);
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+.media-btn:active {
+    transform: scale(0.9);
+}
+
+.media-btn .hidden {
+    display: none;
+}
+
+.media-btn-play {
+    width: 40px;
+    height: 40px;
+}
+
 .settings-trigger-btn {
     background: transparent;
     border: none;

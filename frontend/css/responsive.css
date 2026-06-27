@@ -63,4 +63,18 @@
     .right-lyrics {
         padding: 0 20px;
     }
+
+    .header-title {
+        display: none;
+    }
+
+    .media-btn {
+        width: 32px;
+        height: 32px;
+    }
+
+    .media-btn-play {
+        width: 36px;
+        height: 36px;
+    }
 }

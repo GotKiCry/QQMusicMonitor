@@ -71,6 +71,22 @@ async fn save_app_config(new_cfg: FrontConfig) -> Result<(), String> {
         
     Ok(())
 }
+
+#[tauri::command]
+async fn media_toggle_play_pause() -> Result<(), String> {
+    smtc::try_toggle_play_pause().await.map_err(|e| format!("{}", e))
+}
+
+#[tauri::command]
+async fn media_next() -> Result<(), String> {
+    smtc::try_skip_next().await.map_err(|e| format!("{}", e))
+}
+
+#[tauri::command]
+async fn media_previous() -> Result<(), String> {
+    smtc::try_skip_previous().await.map_err(|e| format!("{}", e))
+}
+
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
@@ -1315,7 +1331,7 @@ async fn main() -> Result<()> {
 
     // 启动 Tauri 窗口
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![set_background_state, get_app_config, save_app_config])
+        .invoke_handler(tauri::generate_handler![set_background_state, get_app_config, save_app_config, media_toggle_play_pause, media_next, media_previous])
         .setup(move |app| {
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
