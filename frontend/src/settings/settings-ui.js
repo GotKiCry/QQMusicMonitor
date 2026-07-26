@@ -13,9 +13,8 @@ import { saveFrontendConfig } from '../config/frontend-config.js';
  * @param {any} els - bindElements 返回的 DOM 集合，需包含所有设置相关元素
  * @param {{front: any, back: any}} configs - 前后端配置对象的引用（可变）
  * @param {() => void} onFrontConfigChange - 前端偏好变化时回调（如重渲染歌词）
- * @param {(songInfo: any) => void} [reapplyOnSongInfo] - 偏移变化时重新应用到当前 songInfo
  */
-export function wireUpSettings({ els, configs, onFrontConfigChange, reapplyOnSongInfo }) {
+export function wireUpSettings({ els, configs, onFrontConfigChange }) {
     const { front, back } = configs;
 
     // —— 抽屉开关 ——
@@ -40,7 +39,6 @@ export function wireUpSettings({ els, configs, onFrontConfigChange, reapplyOnSon
         const val = parseInt(els.cfgOffset.value, 10);
         back.offsetMs = val;
         els.valOffset.textContent = `${val}ms`;
-        if (reapplyOnSongInfo) reapplyOnSongInfo();
     });
     els.cfgOffset.addEventListener('change', () => saveBackendConfig(back));
 
@@ -50,7 +48,6 @@ export function wireUpSettings({ els, configs, onFrontConfigChange, reapplyOnSon
         els.cfgOffset.value = String(val);
         els.valOffset.textContent = `${val}ms`;
         saveBackendConfig(back);
-        if (reapplyOnSongInfo) reapplyOnSongInfo();
     });
 
     els.btnOffsetInc.addEventListener('click', () => {
@@ -59,7 +56,6 @@ export function wireUpSettings({ els, configs, onFrontConfigChange, reapplyOnSon
         els.cfgOffset.value = String(val);
         els.valOffset.textContent = `${val}ms`;
         saveBackendConfig(back);
-        if (reapplyOnSongInfo) reapplyOnSongInfo();
     });
 
     // —— 轮询间隔 ——

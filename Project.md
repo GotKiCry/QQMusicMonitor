@@ -5,7 +5,6 @@
 **QQMusic Monitor** 是一个基于 **Tauri 2** 的 Windows 桌面应用，通过 **SMTC（System Media Transport Controls）** API 实时读取 QQ 音乐客户端的播放状态，并支持：
 
 - **Tauri GUI 前端** — 玻璃拟态桌面界面，唱机组件 + 自动居中滚动歌词 + 60fps 逐字 KTV 扫光
-- **终端 TUI**（可选）— 实时显示歌曲信息、进度条、逐字高亮歌词
 - **文件输出** — `now_playing.txt`（UTF-16 LE，适配 OBS）、`now_playing.json`、`current_lyric.txt`
 - **WebSocket 同步** — HTTP + WebSocket 服务，供浏览器/OBS 等外部场景实时同步播放状态和歌词
 
@@ -16,8 +15,10 @@
   1. QQ 音乐在线 API（`musicu.fcg`），优先获取逐字 QRC 格式
   2. QQ 音乐本地缓存文件（`_qm.qrc` / `_qm.lrc`）
   3. LRC 文本格式兜底
-- **逐字 KTV 高亮** — 解析 QRC（QQ 音乐专有解密格式），在 TUI 和前端实现逐字扫光效果
-- **SMTC 滞后补偿** — 基于 `LastUpdatedTime` 的漂移修正 + 用户可调偏移量，消除轮询间隔导致的闪烁
+- **逐字 KTV 高亮** — 解析 QRC（QQ 音乐专有解密格式），在前端实现逐字扫光效果
+- **暂停/恢复零跳变** — 暂停淡出状态机建模 QQ 音乐 ~1s 淡入淡出（报进/冻结两阶段 + 提交/旧锚点过滤），WASAPI 音频会话提供「是否真实出声」地面真值，逐字歌词在暂停/恢复全程无瞬移、无回退
+- **SMTC 滞后补偿** — 基于 `LastUpdatedTime` 的漂移修正 + 用户可调有符号偏移，消除轮询间隔导致的闪烁
+- **SMTC 事件驱动** — 播放状态/timeline/会话变化事件实时唤醒主循环，状态切换延迟从轮询周期压到 ~10ms 级
 - **切歌瞬间修正** — 检测 SMTC media properties 与 timeline 异步更新间隙，强制归零滞后进度，前端同步清空旧歌词/重置插值基线，杜绝旧歌词残留
 - **多音源过滤** — 只读取 QQ 音乐会话，排除浏览器/其他播放器干扰
 - **后台降频** — 窗口隐藏时前端通知后端将轮询间隔降至 2s，降低 CPU 占用
@@ -31,9 +32,9 @@
 | 桌面框架 | **Tauri 2** (Rust 后端 + WebView 前端) |
 | 语言 | **Rust** (2021 Edition) / **JavaScript** (原生 ES Modules) |
 | 媒体接口 | **Windows SMTC** (`windows` crate `Media_Control` feature) |
+| 音频真值 | **WASAPI 音频会话** (`IAudioSessionControl` / `IAudioMeterInformation`) |
 | 异步运行时 | **tokio** |
 | Web 服务 | **axum** (HTTP + WebSocket) |
-| 终端渲染 | **crossterm** |
 | 歌词解密 | **DES-CBC** + **zlib** (C FFI, 匹配 QQ 音乐魔改算法) |
 | 序列化 | **serde** / **serde_json** |
 | CLI | **clap** |
@@ -46,8 +47,9 @@
 QQMusicMonitor/
 ├── src-tauri/                  # Tauri 后端（Rust）
 │   ├── src/
-│   │   ├── main.rs             # 入口 + Tauri 窗口启动 + 主循环 + TUI 渲染 + 文件输出
-│   │   ├── smtc.rs             # Windows SMTC API 封装（媒体信息读取 + 漂移修正）
+│   │   ├── main.rs             # 入口 + Tauri 窗口启动 + 主循环 + 文件输出
+│   │   ├── smtc.rs             # Windows SMTC API 封装（漂移修正 + 暂停淡出/恢复 hold 状态机）
+│   │   ├── audio_session.rs    # WASAPI 音频会话监控（「是否真实出声」地面真值）
 │   │   ├── lyrics.rs           # QQ 音乐在线歌词 API（多策略搜索 + 专辑图获取）
 │   │   ├── qrc.rs              # QRC 解析器（DES 解密 + zlib 解压 + XML/文本解析）
 │   │   ├── local_qrc.rs        # QQ 音乐本地缓存文件发现与读取
@@ -101,25 +103,25 @@ QQMusicMonitor/
 ### 3.3 数据流
 
 ```
-┌──────────┐  SMTC API (100ms)  ┌────────────────────────────────┐
-│ QQ Music │◄───────────────────│  smtc.rs                        │
-│ Client   │                   │  读取 title/artist/album/position│
-└──────────┘                   │  + LastUpdatedTime 漂移修正      │
-                               └───────────────┬────────────────┘
-                                                │ SongInfo
-                                                ▼
+┌──────────┐  SMTC API (100ms + 事件唤醒)  ┌───────────────────────┐
+│ QQ Music │◄──────────────────────────────│  smtc.rs               │
+│ Client   │                               │  读取媒体信息 + 漂移修正 │
+└──────────┘                               │  暂停淡出 / 恢复 hold   │
+                                           └───────────┬───────────┘
+                                                        │ SongInfo
+                                                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ main.rs (主循环)                                              │
 │                                                             │
-│  ① SMTC 轮询 → SongInfo                                     │
-│  ② 切歌检测 → 后台 fetch: lyrics.rs (在线API多策略搜索)      │
+│  ① SMTC 轮询/事件 → SongInfo（含淡出/恢复建模）              │
+│  ② 音频门控：WASAPI 出声真值修正播放状态（淡出窗口内让路）     │
+│  ③ 切歌检测 → 后台 fetch: lyrics.rs (在线API多策略搜索)      │
 │     └─ qrc.rs (DES解密 + zlib解压 → XML → QrcLine)          │
 │     └─ local_qrc.rs (本地文件兜底)                           │
-│  ③ 切歌瞬间修正：timeline 滞后 → position 归零               │
-│  ④ 时间插值 (smtc_offset_ms)                                │
-│  ⑤ TUI 渲染 (可选：逐字高亮 + 进度条)                       │
-│  ⑥ 文件输出 (TXT/JSON/lyric TXT)                            │
-│  ⑦ 双通道广播：watch channel + Tauri emit("song-info")      │
+│  ④ 切歌瞬间修正：timeline 滞后 → position 归零               │
+│  ⑤ 有符号偏移补偿 (smtc_offset_ms)                          │
+│  ⑥ 文件输出（JSON 限频、当前歌词按变化写入）                 │
+│  ⑦ 双通道广播：watch channel + Tauri event                  │
 └────────────────────────┬────────────────────────────────────┘
                          │
             ┌────────────┴────────────┐
@@ -127,8 +129,8 @@ QQMusicMonitor/
 ┌─────────────────────────┐  ┌─────────────────────────────────┐
 │ server.rs               │  │ Tauri AppHandle.emit             │
 │ axum HTTP + WebSocket   │  │ → frontend/src/connection/       │
-│ ws://127.0.0.1:3000/ws  │  │   tauri-bridge.js 监听            │
-│ (浏览器/OBS 兜底通道)    │  │   (主通道，零回环开销)           │
+│ ws://127.0.0.1:3000/ws  │  │   song-info: 静态完整快照         │
+│ (浏览器/OBS 兜底通道)    │  │   playback-progress: 轻量进度    │
 └─────────────────────────┘  └─────────────┬───────────────────┘
                                            ▼
                             ┌─────────────────────────────────┐
@@ -174,7 +176,7 @@ cargo run --release -- --help         # 完整参数列表
 ```toml
 [settings]
 update_interval_ms = 100   # 轮询间隔（毫秒）
-smtc_offset_ms = 200       # SMTC 滞后补偿（毫秒）
+smtc_offset_ms = 200       # SMTC 滞后补偿（毫秒，可为负数）
 max_retries = 3            # API 重试次数
 output_txt = false         # 输出 now_playing.txt
 output_json = true         # 输出 now_playing.json
@@ -212,30 +214,51 @@ QRC 原始数据（Base64 或 HEX）
 
 ## 7. SMTC 时间模型
 
+### 7.1 播放中
+
 ```
 实际播放位置 ─── SMTC 报告滞后 ─── SMTC.Position() 快照
                                        │
                                LastUpdatedTime（快照采样时刻）
                                        │
-                               elapsed = now - LastUpdatedTime（clamp 5s）
+                               elapsed = now - LastUpdatedTime（clamp 1s）
                                        │
                                corrected = Position + elapsed
                                        │
-                               display = corrected + smtc_offset_ms(200)
+                               display = signed_offset(corrected, smtc_offset_ms)
+                                       + 本机事件传输耗时
 ```
 
-- `LastUpdatedTime` 修正：匹配 Windows 音量浮窗进度条的同款算法，消除 SMTC 快照滞后
-- `smtc_offset_ms = 200`：用户可调的固定前置偏移，用于精细对齐
-- `elapsed` clamp 到 5s，防止 `LastUpdatedTime` 异常时产生大跳变
-- 暂停时冻结进度，恢复后继续插值
+- `LastUpdatedTime` 修正：匹配 Windows 音量浮窗进度条的同款算法，消除 SMTC 快照滞后；实测 QQ 音乐播放中以 ~4Hz 刷新 timeline（位置粒度 10ms），修正后任意时刻误差 <100ms
+- `smtc_offset_ms = 200`：后端唯一应用的有符号偏移；负值可让歌词稍晚显示
+- 播放中 timeline 快照间隙：航位推算（上一帧发出值 + 真实流逝），不因快照迟到而冻结
+- 前端依据 `server_ts` 补偿最多 250ms 的本机传输耗时，再用 `performance.now()` 在采样间插值
+
+### 7.2 暂停/恢复（逐字精度关键）
+
+实测发现「SMTC 报暂停 ≠ 音乐停止」：QQ 音乐默认淡出 ~1s，期间声音与真实位置仍在前进，但 SMTC Position 冻结；淡出结束后 QQ 推送「最终位置」提交（比暂停时刻 ~+1.2s），恢复播放也从该位置继续。若按 SMTC 字面处理，歌词会先停住、提交到达时被迫前跳。为此 `smtc.rs` 实现两个状态机：
+
+**暂停淡出状态机**（两阶段）：
+
+1. **报进阶段**：以暂停前最后一帧播放位置为锚按 1× 继续报进（与可听见的淡出同步）。QQ 可能在淡出进行中就提前写入最终位置（实测最快 +0.28s）——只接受「临近尾声的提交」（`is_tail_commit`），提前到达的一律忽略；WASAPI 连续静音采样（2 次）或超时（1.5s）判定淡出结束，冻结在冻结时刻的推算值（与前端插值显示连续，无回退）
+2. **冻结阶段**：结构保持存活并过滤后续 paused 刷新——提交微调（±100ms）接受；QQ 先刷的落后旧锚点、淡出尾巴的迟到提交（向前 ≤1.5s）在宽限期（4s）内忽略（后者延迟到恢复播放时随锚点自然对齐）；其余移动视为真实 seek 放行
+
+**恢复 hold**：暂停→播放后，在声音真正渲染出来（蓝牙重新建链/设备慢启动）或 QQ 位置真正移动之前，把对外位置冻结在原显示位置（`resume_freeze_floor`），解除后从冻结点平滑继续——与 QQ 恢复点的对齐跳变被推迟到出声瞬间，被音乐起步掩盖
+
+**WASAPI 音频门控**（`audio_session.rs`）：SMTC 只是播放器「声称」的状态，音频会话的峰值电平/会话状态来自音频引擎本身：
+
+- 播放中持续静音 >2s → 判定停滞（缓冲），提前按暂停显示
+- 会话停止流 >150ms 但 SMTC 未报 → 提前按暂停显示
+- 淡出窗口内门控让路（`pause_fade_active`），避免与淡出报进打架
+- 找不到 QQ 音频会话时整体回退为纯 SMTC 行为
 
 ## 8. 前端（Tauri Webview）
 
-前端（`frontend/`，原生 ES Modules，无打包工具）与 TUI 保持一致的渲染逻辑：
+前端使用原生 ES Modules，无需额外打包工具：
 
 ### 8.1 数据通道
 
-- **Tauri 环境（主通道）**：`listen('song-info')` 事件接收实时 `SongInfo`，零回环开销
+- **Tauri 环境（主通道）**：`song-info` 仅在歌曲/歌词/封面变化时发送完整快照，`playback-progress` 按轮询频率发送轻量进度；监听建立后主动调用 `get_current_song_info` 防止遗漏首次快照
 - **浏览器/独立调试（兜底）**：WebSocket `ws://127.0.0.1:3000/ws` + 指数退避重连
 
 ### 8.2 渲染
@@ -243,7 +266,7 @@ QRC 原始数据（Base64 或 HEX）
 - 歌词状态：`before`（灰色）→ `active`（逐字高亮）→ `after`（已完成）
 - 逐字扫光：`background-clip: text` + `linear-gradient`，通过 `.word-fg` 宽度 0~100% 控制
 - 居中滚动：CSS `transform: translateY` + transition，活跃行变化时平滑居中（不改动 scrollTop）
-- SMTC 偏移 + 只进不退的插值策略，消除闪烁
+- 后端单次偏移 + 前端只进不退的插值策略，消除重复偏移和闪烁
 
 ### 8.3 切歌处理（关键）
 
@@ -255,8 +278,17 @@ QRC 原始数据（Base64 或 HEX）
   2. `setLyricLines([])` 清空歌词数据，渲染循环直接 return
   3. `resetForSongChange()` 重置插值基线（`lastSampleProgress`/`lastSampleLocalTime`/`lastRawTimeMs`）
   4. 仅当后端推送非空 `qrc_data` 时才重建真歌词覆盖占位，避免用"无逐字歌词"覆盖加载提示
+  5. 启动首帧（`songInfo` 为空）不套用 >5s 归零：后端启动时不存在"新歌名 + 旧 timeline"错配窗口，首帧暂停进度是权威值，直接信任，避免进度先闪 0 再跳回
 
-### 8.4 后台降频
+### 8.4 暂停/恢复处理（前端）
+
+- **play→pause**：直接 snap 到服务端权威位置——后端报暂停时携带的是淡出建模后的真实停止点；本地插值因事件/传输延迟必然略有偏差，烘焙本地值只会固化超调
+- **暂停稳态**：始终跟随服务端位置（恒定且权威），同时覆盖暂停中任意幅度 seek
+- **尾音蠕升抑制**：以未加传输补偿的 `current_time_ms` 检测「is_playing=true 但位置不变」的尾音帧，停止本地插值蠕升，把冻结时刻的回退量压到 ≈0
+- **pause→play**：服务端略落后（≤500ms）时本地时间基准向未来平移，原地 hold 等待追平，不回跳也不累积超前
+- **播放中后退 seek**：向后移动 >250ms 立即跟随（锚点抖动 ±50ms 触不到该阈值），避免死区拖慢 ~0.5s
+
+### 8.5 后台降频
 
 `visibilitychange` 监听窗口隐藏，通过 `invoke('set_background_state')` 通知后端将轮询间隔从 100ms 降至 2s，降低 CPU 占用；窗口恢复时自动回滚。
 

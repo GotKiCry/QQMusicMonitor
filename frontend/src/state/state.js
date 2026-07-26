@@ -33,6 +33,8 @@ export let lastSampleProgress = 0;
 export let lastSampleLocalTime = 0;
 /** 上一次原始 current_time_ms，用于去重/跳变检测 */
 export let lastRawTimeMs = -1;
+/** 上一次未加传输补偿的 current_time_ms（淡出尾音判定：钉住时严格不变） */
+export let lastServerPosMs = -1;
 /** 是否正在播放 */
 export let isPlaying = false;
 
@@ -67,6 +69,8 @@ export function setLastSampleProgress(v) { lastSampleProgress = v; }
 export function setLastSampleLocalTime(v) { lastSampleLocalTime = v; }
 /** @param {number} v */
 export function setLastRawTimeMs(v) { lastRawTimeMs = v; }
+/** @param {number} v */
+export function setLastServerPosMs(v) { lastServerPosMs = v; }
 /** @param {boolean} v */
 export function setIsPlaying(v) { isPlaying = v; }
 /** @param {WebSocket | null} v */

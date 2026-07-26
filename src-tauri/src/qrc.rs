@@ -353,7 +353,7 @@ pub fn extract_lrc_from_xml(xml_content: &str) -> Option<String> {
     let root = Element::parse(xml_content.as_bytes()).ok()?;
     
     // Collect all Lyric_* elements by traversing the tree recursively
-    fn find_lyric_elements<'a>(elem: &'a Element) -> Vec<&'a Element> {
+    fn find_lyric_elements(elem: &Element) -> Vec<&Element> {
         let mut results = Vec::new();
         if elem.name.starts_with("Lyric_") || elem.name.starts_with("Lyric") {
             results.push(elem);
@@ -604,29 +604,30 @@ mod tests {
             }
         }
     }
-}
 
-fn check_decompress(label: &str, data: &[u8]) {
-    if data.len() < 4 { return; }
-    if let Ok(s) = try_decompress(data, false) {
-        eprintln!("  ✅ {} → zlib 成功! 前100字: {}", label, &s[..100.min(s.len())]);
+    fn check_decompress(label: &str, data: &[u8]) {
+        if data.len() < 4 { return; }
+        if let Ok(s) = try_decompress(data, false) {
+            eprintln!("  ✅ {} → zlib 成功! 前100字: {}", label, &s[..100.min(s.len())]);
+        }
+        if let Ok(s) = try_decompress(data, true) {
+            eprintln!("  ✅ {} → deflate 成功! 前100字: {}", label, &s[..100.min(s.len())]);
+        }
     }
-    if let Ok(s) = try_decompress(data, true) {
-        eprintln!("  ✅ {} → deflate 成功! 前100字: {}", label, &s[..100.min(s.len())]);
-    }
-}
 
-fn try_decompress(data: &[u8], raw_deflate: bool) -> Result<String> {
-    if raw_deflate {
-        let mut d = DeflateDecoder::new(data);
-        let mut s = String::new();
-        d.read_to_string(&mut s)?;
-        Ok(s)
-    } else {
-        let mut d = ZlibDecoder::new(data);
-        let mut s = String::new();
-        d.read_to_string(&mut s)?;
-        Ok(s)
+    fn try_decompress(data: &[u8], raw_deflate: bool) -> Result<String> {
+        if raw_deflate {
+            let mut d = DeflateDecoder::new(data);
+            let mut s = String::new();
+            d.read_to_string(&mut s)?;
+            Ok(s)
+        } else {
+            let mut d = ZlibDecoder::new(data);
+            let mut s = String::new();
+            d.read_to_string(&mut s)?;
+            Ok(s)
+        }
     }
+
 }
 

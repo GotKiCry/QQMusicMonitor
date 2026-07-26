@@ -19,28 +19,28 @@ import {
 import { formatMs } from '../utils/format.js';
 import { setTextIfChanged } from '../utils/dom.js';
 
-/** @typedef {{offsetMs: number}} RenderConfig */
-
 /**
  * @param {HTMLElement} elTimeCurrent
  * @param {HTMLElement} elTimeTotal
  * @param {HTMLElement} elProgressFill
  * @param {HTMLElement} elLyricsContainer - 用于计算居中高度
  * @param {HTMLElement} elLyricsViewport - 被 translateY 的容器
- * @param {RenderConfig} cfg
  */
-export function startRenderLoop(elTimeCurrent, elTimeTotal, elProgressFill, elLyricsContainer, elLyricsViewport, cfg) {
+export function startRenderLoop(elTimeCurrent, elTimeTotal, elProgressFill, elLyricsContainer, elLyricsViewport) {
     function loop() {
         setAnimFrame(requestAnimationFrame(loop));
         if (!songInfo) return;
 
-        // 前进推算插值时间（含用户配置的音频延迟补偿）
+        // 后端采样已经完成 SMTC 漂移修正和用户偏移补偿；
+        // 前端只负责用本地单调时钟补齐两次采样之间的流逝时间。
+        // elapsed clamp >= 0：pause→play 时 update-handler 会把
+        // lastSampleLocalTime 向未来平移实现原地 hold，负 elapsed 归零。
         let t;
         if (isPlaying && lastSampleLocalTime > 0) {
-            const elapsed = performance.now() - lastSampleLocalTime;
-            t = lastSampleProgress + elapsed + cfg.offsetMs;
+            const elapsed = Math.max(0, performance.now() - lastSampleLocalTime);
+            t = lastSampleProgress + elapsed;
         } else {
-            t = lastSampleProgress + cfg.offsetMs;
+            t = lastSampleProgress;
         }
         t = Math.max(0, t);
 
@@ -98,12 +98,28 @@ export function startRenderLoop(elTimeCurrent, elTimeTotal, elProgressFill, elLy
             }
         }
 
-        // 活跃行变化时平滑居中
-        if (activeIdx !== lastActiveIdx && activeIdx >= 0) {
-            setLastActiveIdx(activeIdx);
-            const activeLineEl = lyricLines[activeIdx].el;
+        // 活跃行变化时平滑居中。
+        // 空档兜底：当前时间不落在任何一行内（行间空隙/前奏/尾声）时
+        // activeIdx 为 -1，若只按活跃行居中，启动/切歌后首次落在空档
+        // 会一直停留在歌词列表顶部，留下大片空白。此时以「最近停留行」
+        // 为居中锚点：前奏取第一行，空档取上一行（与正常播放中空档的
+        // 停留位置一致），保证视图停在正确的空档位置。
+        let anchorIdx = activeIdx;
+        if (anchorIdx < 0 && lyricLines.length > 0) {
+            if (t < lyricLines[0].start) {
+                anchorIdx = 0;
+            } else {
+                for (let i = lyricLines.length - 1; i >= 0; i--) {
+                    if (lyricLines[i].start <= t) { anchorIdx = i; break; }
+                }
+            }
+        }
+
+        if (anchorIdx !== lastActiveIdx && anchorIdx >= 0) {
+            setLastActiveIdx(anchorIdx);
+            const anchorLineEl = lyricLines[anchorIdx].el;
             const viewportCenter = elLyricsContainer.clientHeight / 2;
-            const targetScrollY = viewportCenter - activeLineEl.offsetTop - (activeLineEl.clientHeight / 2);
+            const targetScrollY = viewportCenter - anchorLineEl.offsetTop - (anchorLineEl.clientHeight / 2);
             elLyricsViewport.style.transform = `translateY(${targetScrollY}px)`;
         }
     }

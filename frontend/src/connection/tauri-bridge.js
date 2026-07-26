@@ -7,14 +7,28 @@
 
 /**
  * @param {(data: any) => void} onSongInfo
+ * @param {(data: any) => void} onPlaybackProgress
  * @param {() => void} onConnected - 首次监听建立后启动渲染循环
  */
-export function listenSongInfo(onSongInfo, onConnected) {
+export async function listenSongInfo(onSongInfo, onPlaybackProgress, onConnected) {
     if (!window.__TAURI__) return false;
     const { listen } = window.__TAURI__.event;
-    listen('song-info', (event) => {
-        if (event.payload) onSongInfo(event.payload);
-    });
+    await Promise.all([
+        listen('song-info', (event) => {
+            if (event.payload) onSongInfo(event.payload);
+        }),
+        listen('playback-progress', (event) => {
+            if (event.payload) onPlaybackProgress(event.payload);
+        })
+    ]);
+
+    try {
+        const current = await window.__TAURI__.core.invoke('get_current_song_info');
+        if (current) onSongInfo(current);
+    } catch (error) {
+        console.error('Failed to get initial song state:', error);
+    }
+
     onConnected();
     return true;
 }

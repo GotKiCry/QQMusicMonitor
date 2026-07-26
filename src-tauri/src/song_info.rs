@@ -35,6 +35,31 @@ pub struct SongInfo {
     pub server_ts: u64,           // 后端采样时的绝对时间戳（毫秒）
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq)]
+pub struct PlaybackProgress {
+    pub current_time: u64,
+    pub total_time: u64,
+    pub current_time_ms: u64,
+    pub total_time_ms: u64,
+    pub progress_percent: f32,
+    pub is_playing: bool,
+    pub server_ts: u64,
+}
+
+impl From<&SongInfo> for PlaybackProgress {
+    fn from(info: &SongInfo) -> Self {
+        Self {
+            current_time: info.current_time,
+            total_time: info.total_time,
+            current_time_ms: info.current_time_ms,
+            total_time_ms: info.total_time_ms,
+            progress_percent: info.progress_percent,
+            is_playing: info.is_playing,
+            server_ts: info.server_ts,
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl SongInfo {
     /// 检查歌曲信息是否有效（有标题）
@@ -70,4 +95,30 @@ fn format_time(seconds: u64) -> String {
     let minutes = seconds / 60;
     let secs = seconds % 60;
     format!("{:02}:{:02}", minutes, secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_progress_contains_only_dynamic_state() {
+        let info = SongInfo {
+            title: "Song".to_string(),
+            current_time: 12,
+            total_time: 180,
+            current_time_ms: 12_345,
+            total_time_ms: 180_000,
+            progress_percent: 6.858,
+            is_playing: true,
+            server_ts: 123,
+            ..SongInfo::default()
+        };
+
+        let progress = PlaybackProgress::from(&info);
+        assert_eq!(progress.current_time_ms, 12_345);
+        assert_eq!(progress.total_time_ms, 180_000);
+        assert!(progress.is_playing);
+        assert_eq!(progress.server_ts, 123);
+    }
 }

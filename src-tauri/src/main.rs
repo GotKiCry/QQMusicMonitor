@@ -7,11 +7,12 @@ use tokio::sync::RwLock;
 static IS_BACKGROUND: AtomicBool = AtomicBool::new(false);
 static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
 static CACHED_CACHE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+static LATEST_SONG_INFO: OnceLock<RwLock<Arc<SongInfo>>> = OnceLock::new();
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct FrontConfig {
     pub server_port: u16,
-    pub smtc_offset_ms: u64,
+    pub smtc_offset_ms: i64,
     pub update_interval_ms: u64,
     pub output_txt: bool,
     pub output_json: bool,
@@ -102,11 +103,11 @@ mod song_info;
 mod qrc;
 mod local_qrc;
 mod server;
-mod audio_clock;
+mod audio_session;
 
 use cli::Cli;
 use config::Config;
-use song_info::{SongInfo, QrcLine};
+use song_info::{PlaybackProgress, QrcLine, SongInfo};
 use lyrics::LyricFetcher;
 
 use std::collections::HashMap;
@@ -119,9 +120,103 @@ fn current_timestamp_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[tauri::command]
+async fn get_current_song_info() -> Result<SongInfo, String> {
+    let latest = LATEST_SONG_INFO
+        .get()
+        .ok_or("Song state not initialized")?;
+    Ok(latest.read().await.as_ref().clone())
+}
+
+fn apply_signed_offset(time_ms: u64, offset_ms: i64) -> u64 {
+    if offset_ms >= 0 {
+        time_ms.saturating_add(offset_ms as u64)
+    } else {
+        time_ms.saturating_sub(offset_ms.unsigned_abs())
+    }
+}
+
+struct LastSongState {
+    title: String,
+    artist: String,
+    total_time_ms: u64,
+}
+
+impl From<&SongInfo> for LastSongState {
+    fn from(info: &SongInfo) -> Self {
+        Self {
+            title: info.title.clone(),
+            artist: info.artist.clone(),
+            total_time_ms: info.total_time_ms,
+        }
+    }
+}
+
+fn same_gui_payload(previous: &SongInfo, current: &SongInfo) -> bool {
+    previous.title == current.title
+        && previous.artist == current.artist
+        && previous.album == current.album
+        && previous.lyrics == current.lyrics
+        && previous.trans == current.trans
+        && previous.qrc_data == current.qrc_data
+        && previous.album_pic_url == current.album_pic_url
+}
+
+#[cfg(test)]
+mod synchronization_tests {
+    use super::*;
+
+    #[test]
+    fn signed_offset_supports_advance_and_delay() {
+        assert_eq!(apply_signed_offset(1_000, 200), 1_200);
+        assert_eq!(apply_signed_offset(1_000, -200), 800);
+        assert_eq!(apply_signed_offset(100, -200), 0);
+        assert_eq!(apply_signed_offset(u64::MAX - 5, 10), u64::MAX);
+    }
+
+    #[test]
+    fn gui_payload_ignores_progress_only_changes() {
+        let previous = SongInfo {
+            title: "Song".to_string(),
+            artist: "Artist".to_string(),
+            lyrics: "lyrics".to_string(),
+            current_time_ms: 1_000,
+            ..SongInfo::default()
+        };
+        let mut current = previous.clone();
+        current.current_time_ms = 1_100;
+        current.progress_percent = 12.5;
+        current.server_ts = 42;
+
+        assert!(same_gui_payload(&previous, &current));
+
+        current.lyrics = "updated lyrics".to_string();
+        assert!(!same_gui_payload(&previous, &current));
+    }
+
+    #[test]
+    fn lyrics_cache_blocks_duplicate_and_immediate_retry() {
+        let mut cache = LyricsCache::new();
+        assert!(cache.begin_fetch("Song", "Artist"));
+        assert!(!cache.begin_fetch("Song", "Artist"));
+
+        cache.mark_retry("Song", "Artist");
+        assert!(!cache.begin_fetch("Song", "Artist"));
+    }
+}
+
 /// 缓存淘汰上限：超出后淘汰最久未访问的条目。
 /// 每条含歌词文本 + QRC 逐字数据，按平均 8KB/条估算，128 条约 1MB 内存。
 const LYRICS_CACHE_MAX_ENTRIES: usize = 128;
+const LYRICS_RETRY_DELAY_MS: u64 = 30_000;
+const FILE_OUTPUT_MIN_INTERVAL_MS: u64 = 100;
+
+#[derive(Clone, Copy)]
+enum LyricsFetchState {
+    Loading,
+    Ready,
+    RetryAfter(u64),
+}
 
 struct LyricsCacheEntry {
     lyrics: String,
@@ -134,6 +229,22 @@ struct LyricsCacheEntry {
     local_album: String,
     /// 最后访问时间戳（毫秒），用于 LRU 淘汰
     last_accessed: u64,
+    fetch_state: LyricsFetchState,
+}
+
+impl LyricsCacheEntry {
+    fn loading() -> Self {
+        Self {
+            lyrics: String::new(),
+            trans: String::new(),
+            qrc_raw: String::new(),
+            qrc_data: Vec::new(),
+            album_pic_url: String::new(),
+            local_album: String::new(),
+            last_accessed: 0,
+            fetch_state: LyricsFetchState::Loading,
+        }
+    }
 }
 
 /// 后台歌词缓存 — 由主循环读取、后台任务写入 (使用 HashMap 支持多歌曲缓存，防止切歌竞态)
@@ -149,10 +260,36 @@ impl LyricsCache {
         }
     }
 
-    /// 检查歌曲是否已缓存
-    fn has_song(&self, title: &str, artist: &str) -> bool {
+    fn begin_fetch(&mut self, title: &str, artist: &str) -> bool {
         let key = format!("{}|{}", title, artist);
-        self.entries.contains_key(&key)
+        let now = current_timestamp_ms();
+
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_accessed = now;
+            return match entry.fetch_state {
+                LyricsFetchState::RetryAfter(retry_at) if now >= retry_at => {
+                    entry.fetch_state = LyricsFetchState::Loading;
+                    true
+                }
+                LyricsFetchState::Loading
+                | LyricsFetchState::Ready
+                | LyricsFetchState::RetryAfter(_) => false,
+            };
+        }
+
+        self.insert_entry(title, artist, LyricsCacheEntry::loading());
+        true
+    }
+
+    fn mark_retry(&mut self, title: &str, artist: &str) {
+        let key = format!("{}|{}", title, artist);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            let now = current_timestamp_ms();
+            entry.last_accessed = now;
+            entry.fetch_state = LyricsFetchState::RetryAfter(
+                now.saturating_add(LYRICS_RETRY_DELAY_MS),
+            );
+        }
     }
 
     fn get_entry(&mut self, title: &str, artist: &str) -> Option<&LyricsCacheEntry> {
@@ -204,7 +341,9 @@ impl LyricsCache {
 
 /// 缓存 QQ 音乐本地缓存根目录，只探测一次避免每帧扫盘
 fn get_cache_root() -> Option<PathBuf> {
-    CACHED_CACHE_ROOT.get_or_init(|| local_qrc::auto_detect_cache_root()).clone()
+    CACHED_CACHE_ROOT
+        .get_or_init(local_qrc::auto_detect_cache_root)
+        .clone()
 }
 
 /// 获取歌词缓存目录（QQMusicLyricNew）
@@ -296,15 +435,7 @@ async fn resolve_album_pic_url(online_url: &str, album_name: &str, fetcher: &Lyr
 /// 从本地 QQ 音乐缓存目录查找歌词（QRC 优先，LRC 兜底），返回完整的缓存条目。
 /// 此函数包含文件 I/O 与 DES 解密，仅应在 spawn_blocking 中调用。
 fn lookup_local_lyrics(title: &str, artist: &str) -> LyricsCacheEntry {
-    let mut entry = LyricsCacheEntry {
-        lyrics: String::new(),
-        trans: String::new(),
-        qrc_raw: String::new(),
-        qrc_data: Vec::new(),
-        album_pic_url: String::new(),
-        local_album: String::new(),
-        last_accessed: 0,
-    };
+    let mut entry = LyricsCacheEntry::loading();
 
     let Some(cache_dir) = get_lyric_cache_dir() else {
         return entry;
@@ -400,8 +531,12 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
     let lyric_fetcher = Arc::new(LyricFetcher::with_debug(config.settings.debug_mode));
     let lyrics_cache = Arc::new(RwLock::new(LyricsCache::new()));
 
+    // WASAPI 音频会话门控：实时检测 QQ音乐是否真的在出声
+    audio_session::AudioGate::ensure_com_init();
+    let mut audio_gate = audio_session::AudioGate::new();
+
     // 初始化数据广播通道并启动服务
-    let (tx, rx) = tokio::sync::watch::channel(SongInfo::default());
+    let (tx, rx) = tokio::sync::watch::channel(Arc::new(SongInfo::default()));
     if config.settings.enable_server {
         let port = config.settings.server_port;
         if config.settings.debug_mode {
@@ -419,17 +554,12 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 
 
 
-    let mut last_song_info: Option<SongInfo> = None;
-    let mut update_count = 0;
+    let mut last_song_state: Option<LastSongState> = None;
+    let mut last_gui_snapshot: Option<SongInfo> = None;
     let mut stale_song_total: Option<u64> = None;
     let mut last_logged_lyric_key = String::new();
-
-    // IAudioClock 基线：SMTC 快照位置 + 该瞬间的硬件时钟读数
-    let mut audio_clock_baseline_ms: u64 = 0;
-    let mut smtc_baseline_ms: u64 = 0;
-
-    // 预热音频时钟会话
-    audio_clock::refresh_audio_clock().await;
+    let mut last_json_write_at: Option<tokio::time::Instant> = None;
+    let mut last_written_lyric: Option<String> = None;
 
     // 主循环
     while running.load(Ordering::SeqCst) {
@@ -451,20 +581,12 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                     let quiet = args.quiet;
                     let debug = config.settings.debug_mode;
                     let song_key = format!("{}|{}", info.title, info.artist);
-                    let cached_has_song = lyrics_cache.read().await.has_song(&info.title, &info.artist);
+                    let should_fetch = lyrics_cache
+                        .write()
+                        .await
+                        .begin_fetch(&info.title, &info.artist);
 
-                    if !cached_has_song {
-                        // 立即插入占位条目，阻止后续帧重复 spawn
-                        {
-                            let mut w = lyrics_cache.write().await;
-                            w.insert_entry(&info.title, &info.artist, LyricsCacheEntry {
-                                lyrics: String::new(), trans: String::new(),
-                                qrc_raw: String::new(), qrc_data: Vec::new(),
-                                album_pic_url: String::new(),
-                                local_album: String::new(),
-                                last_accessed: 0,
-                            });
-                        }
+                    if should_fetch {
                         if !quiet && song_key != last_logged_lyric_key {
                             eprintln!("[歌词] {} - {}", info.artist, info.title);
                             last_logged_lyric_key = song_key;
@@ -474,21 +596,16 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                         let t = info.title.clone();
                         let a = info.artist.clone();
                         let album = info.album.clone();
+                        let max_attempts = config.settings.max_retries.saturating_add(1);
                         tokio::spawn(async move {
                             let has_local_qrc;
                             // 1. 本地歌词快速查找并立即插入缓存（~50ms，不阻塞在线获取）
                             {
                                 let t2 = t.clone();
                                 let a2 = a.clone();
-                                let local = tokio::task::spawn_blocking(move || lookup_local_lyrics(&t2, &a2))
+                                let mut local = tokio::task::spawn_blocking(move || lookup_local_lyrics(&t2, &a2))
                                     .await
-                                    .unwrap_or_else(|_| LyricsCacheEntry {
-                                        lyrics: String::new(), trans: String::new(),
-                                        qrc_raw: String::new(), qrc_data: Vec::new(),
-                                        album_pic_url: String::new(),
-                                        local_album: String::new(),
-                                        last_accessed: 0,
-                                    });
+                                    .unwrap_or_else(|_| LyricsCacheEntry::loading());
 
                                 let local_qrc = local.qrc_data.len();
                                 let local_lrc = !local.lyrics.is_empty();
@@ -550,6 +667,11 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                 has_local_qrc = !local.qrc_data.is_empty();
 
                                 if !local.lyrics.is_empty() || has_local_qrc {
+                                    local.fetch_state = if has_local_qrc {
+                                        LyricsFetchState::Ready
+                                    } else {
+                                        LyricsFetchState::Loading
+                                    };
                                     let mut w = cache.write().await;
                                     w.insert_entry(&t, &a, local);
                                     if debug { eprintln!("[lyrics] Local cache populated for '{} - {}'", t, a); }
@@ -558,7 +680,27 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 
                             // 2. 在线歌词获取（仅当本地无 QRC 时才请求，作为备用手段）
                             if !has_local_qrc {
-                            match fetcher.fetch_lyrics(&t, &a).await {
+                            let mut attempt = 0u32;
+                            let online_result = loop {
+                                attempt += 1;
+                                match fetcher.fetch_lyrics(&t, &a).await {
+                                    Ok(result) => break Ok(result),
+                                    Err(error) if attempt < max_attempts => {
+                                        let backoff_ms = 250u64
+                                            .saturating_mul(1u64 << (attempt - 1).min(3));
+                                        if debug {
+                                            eprintln!(
+                                                "[lyrics] attempt {}/{} failed, retrying in {}ms: {}",
+                                                attempt, max_attempts, backoff_ms, error
+                                            );
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                    }
+                                    Err(error) => break Err(error),
+                                }
+                            };
+
+                            match online_result {
                                 Ok((l, trans, q, pic_url)) => {
                                     let resolved_pic_url = resolve_album_pic_url(&pic_url, &album, &fetcher).await;
                                     let mut entry = LyricsCacheEntry {
@@ -569,6 +711,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                         album_pic_url: resolved_pic_url,
                                         local_album: String::new(),
                                         last_accessed: 0,
+                                        fetch_state: LyricsFetchState::Ready,
                                     };
 
                                     // 在线 QRC 解密
@@ -645,7 +788,8 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                 }
                                 Err(e) => {
                                     if !quiet { eprintln!("  在线: ✗ 失败 ({})", e); }
-                                    // 本地数据已在步骤 1 插入，无需额外处理
+                                    let mut cached = cache.write().await;
+                                    cached.mark_retry(&t, &a);
                                 }
                             }
                             } // if !has_local_qrc
@@ -744,18 +888,6 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                         }
                     }
 
-                    // 即时本地封面重解析：若缓存的 album_pic_url 是 QQ 音乐在线 URL，
-                    // 尝试找本地缓存文件替代。对已缓存歌曲避免永远使用旧 URL。
-                    // resolve_album_pic_url 分两步：URL 中的 album_mid 查本地 → SmartBox 用专辑名查。
-                    if info.album_pic_url.contains("y.gtimg.cn") {
-                        let resolved = resolve_album_pic_url(&info.album_pic_url, &info.album, &lyric_fetcher).await;
-                        if resolved != info.album_pic_url {
-                            let mut w = lyrics_cache.write().await;
-                            w.update_album_pic_url(&info.title, &info.artist, resolved.clone());
-                            info.album_pic_url = resolved;
-                        }
-                    }
-
                     if info.lyrics.is_empty() && !info.trans.is_empty() {
                         info.lyrics = info.trans.clone();
                     }
@@ -806,7 +938,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
         };
 
         // 检查歌曲是否有变化 (用于切歌修正与文件输出)
-        let song_changed = match &last_song_info {
+        let song_changed = match &last_song_state {
             Some(last) => last.title != current_song_info.title || last.artist != current_song_info.artist,
             None => true,
         };
@@ -817,10 +949,10 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
         // 只靠 song_changed 一帧归零不够：后续帧 title 未变但 timeline 仍旧，
         // 前端会收到"新歌名 + 旧进度"错配——旧歌词继续渲染，进度来回跳。
         //
-        // 解法：用 last_song_info.total_time_ms 做锚点——若当前 total 与旧歌
+        // 解法：用上一首歌的 total_time_ms 做锚点——若当前 total 与旧歌
         // 相同（±500ms），判定 timeline 未更新，强制归零。total 变化后清除追踪。
         if song_changed {
-            if let Some(old) = &last_song_info {
+            if let Some(old) = &last_song_state {
                 if old.total_time_ms > 0 {
                     stale_song_total = Some(old.total_time_ms);
                 }
@@ -830,7 +962,6 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
             current_song_info.progress_percent = 0.0;
             current_song_info.total_time_ms = 0;
             current_song_info.total_time = 0;
-            audio_clock::refresh_audio_clock().await;
         } else if let Some(old_total) = stale_song_total {
             if current_song_info.total_time_ms == 0
                 || current_song_info.total_time_ms == old_total
@@ -845,28 +976,36 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
             }
         }
 
-        // 使用 IAudioClock 计算实耗时间，替代 SMTC LastUpdatedTime 漂移校正。
-        // 原理：SMTC Position 是快照值，IAudioClock 提供硬件级真实流逝时间。
-        // 每帧以 (SMTC快照, 音频时钟) 为锚点，用硬件时钟增量估算当前播放位置。
-        smtc_baseline_ms = current_song_info.current_time_ms;
-        audio_clock_baseline_ms = audio_clock::get_playback_position_ms()
-            .await
-            .unwrap_or(audio_clock_baseline_ms);
-
-        let smtc_offset_ms = config.settings.smtc_offset_ms;
-        let display_time_ms = if current_song_info.is_playing {
-            let clock_now = audio_clock::get_playback_position_ms()
-                .await
-                .unwrap_or(audio_clock_baseline_ms);
-            let elapsed = clock_now.saturating_sub(audio_clock_baseline_ms);
-            let corrected = (smtc_baseline_ms + elapsed) + smtc_offset_ms;
-            if current_song_info.total_time_ms > 0 {
-                corrected.min(current_song_info.total_time_ms)
-            } else {
-                corrected
+        // —— WASAPI 音频会话门控：用「是否真实出声」修正 SMTC 声称的状态 ——
+        // - 播放中持续静音：判定停滞，冻结在当前位置（QQ 恢复后锚定修正）
+        // - 会话停止流但 SMTC 未报：提前按暂停显示
+        // 恢复播放的位置冻结在 smtc.rs 的 resume hold 里处理（感知锚定状态）。
+        // 找不到 QQ 音频会话时 AudioGate 内部回退为透传。
+        if song_changed {
+            audio_gate.reset();
+        }
+        // 暂停淡出窗口内由 smtc 的淡出状态机全权处理 is_playing，
+        // 门控的 inactive 判定会在淡出收尾前抢先把状态翻成暂停，
+        // 与仍在前进的淡出报进打架（前端「已暂停但位置还在走」）
+        if current_song_info.is_valid() && !smtc::pause_fade_active().await {
+            match audio_gate.update(current_song_info.is_playing) {
+                audio_session::GateDecision::Pass => {}
+                audio_session::GateDecision::ForcePause => {
+                    current_song_info.is_playing = false;
+                }
             }
+        }
+
+        // SMTC positions are drift-corrected via LastUpdatedTime in smtc.rs.
+        // Apply the user-configurable offset for fine-tuning.
+        // 注意：playing 和 pause 都加 offset，避免 play→pause 切换瞬间 display 因
+        // offset 消失而回退（~200ms），造成歌词行瞬间变灰再回正的闪烁。
+        let smtc_offset_ms = config.settings.smtc_offset_ms;
+        let adjusted = apply_signed_offset(current_song_info.current_time_ms, smtc_offset_ms);
+        let display_time_ms = if current_song_info.total_time_ms > 0 {
+            adjusted.min(current_song_info.total_time_ms)
         } else {
-            current_song_info.current_time_ms
+            adjusted
         };
 
         current_song_info.current_time_ms = display_time_ms;
@@ -876,13 +1015,33 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                 (display_time_ms as f64 / current_song_info.total_time_ms as f64 * 100.0) as f32;
         }
 
-        // 广播最新状态给所有 WebSocket 客户端
-        let _ = tx.send(current_song_info.clone());
+        let current_song_info = Arc::new(current_song_info);
 
-        // 如果存在 Tauri app_handle，则广播给 GUI 前端
+        if let Some(latest) = LATEST_SONG_INFO.get() {
+            *latest.write().await = Arc::clone(&current_song_info);
+        }
+
+        // WebSocket/API 保持完整 SongInfo 协议；watch 通道仅克隆 Arc，
+        // 避免每个轮询周期深拷贝整份逐字歌词。
+        let _ = tx.send(Arc::clone(&current_song_info));
+
+        // Tauri 主通道只在静态内容变化时发送完整快照；普通轮询仅发送
+        // 数十字节的进度事件，前端仍按原轮询频率接收并进行 60fps 插值。
         if let Some(ref handle) = app_handle {
             use tauri::Emitter;
-            let _ = handle.emit("song-info", current_song_info.clone());
+            let static_changed = last_gui_snapshot
+                .as_ref()
+                .map(|previous| !same_gui_payload(previous, current_song_info.as_ref()))
+                .unwrap_or(true);
+
+            if static_changed {
+                if handle.emit("song-info", current_song_info.as_ref()).is_ok() {
+                    last_gui_snapshot = Some(current_song_info.as_ref().clone());
+                }
+            } else {
+                let progress = PlaybackProgress::from(current_song_info.as_ref());
+                let _ = handle.emit("playback-progress", progress);
+            }
         }
 
         // 写入文件
@@ -895,11 +1054,26 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
         }
 
         if config.settings.output_json {
-            if let Err(e) = write_info_to_json(&current_song_info, &config.settings.json_filename) {
-                if config.settings.debug_mode && !args.quiet {
-                    eprintln!("Error writing to json file: {}", e);
+            let json_due = song_changed
+                || last_json_write_at
+                    .map(|last_write| {
+                        last_write.elapsed()
+                            >= Duration::from_millis(FILE_OUTPUT_MIN_INTERVAL_MS)
+                    })
+                    .unwrap_or(true);
+
+            if json_due {
+                match write_info_to_json(&current_song_info, &config.settings.json_filename) {
+                    Ok(()) => last_json_write_at = Some(tokio::time::Instant::now()),
+                    Err(e) => {
+                        if config.settings.debug_mode && !args.quiet {
+                            eprintln!("Error writing to json file: {}", e);
+                        }
+                    }
                 }
             }
+        } else {
+            last_json_write_at = None;
         }
 
         if config.settings.output_lyric {
@@ -931,15 +1105,21 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                 filtered_lyrics
             };
 
-            if let Err(e) = write_info_to_lyric_txt(&display_lyric, &config.settings.lyric_filename) {
-                if config.settings.debug_mode && !args.quiet {
-                    eprintln!("Error writing lyric to txt file: {}", e);
+            if last_written_lyric.as_deref() != Some(display_lyric.as_str()) {
+                match write_info_to_lyric_txt(&display_lyric, &config.settings.lyric_filename) {
+                    Ok(()) => last_written_lyric = Some(display_lyric),
+                    Err(e) => {
+                        if config.settings.debug_mode && !args.quiet {
+                            eprintln!("Error writing lyric to txt file: {}", e);
+                        }
+                    }
                 }
             }
+        } else {
+            last_written_lyric = None;
         }
 
-        last_song_info = Some(current_song_info);
-        update_count += 1;
+        last_song_state = Some(LastSongState::from(current_song_info.as_ref()));
 
             Ok(())
         }.await;
@@ -957,7 +1137,13 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                 Duration::from_millis(config.settings.update_interval_ms)
             };
             if elapsed < current_interval {
-                tokio::time::sleep(current_interval - elapsed).await;
+                // 除周期 tick 外，SMTC 事件（暂停/恢复/seek/切歌）随时
+                // 唤醒主循环做下一轮，把状态切换延迟从轮询周期压到 ~10ms 级
+                let state_notify = smtc::state_changed_notify();
+                tokio::select! {
+                    _ = tokio::time::sleep(current_interval - elapsed) => {}
+                    _ = state_notify.notified() => {}
+                }
             }
         }
     }
@@ -1043,11 +1229,9 @@ fn get_current_qrc_line<'a>(qrc_data: &'a [QrcLine], trans: &'a str, current_tim
 
     for line in qrc_data {
         // 如果当前时间已经超过这行的开始时间
-        if current_time_ms >= line.start_time_ms {
-            if line.start_time_ms >= max_start_time {
-                max_start_time = line.start_time_ms;
-                current_line = Some(line);
-            }
+        if current_time_ms >= line.start_time_ms && line.start_time_ms >= max_start_time {
+            max_start_time = line.start_time_ms;
+            current_line = Some(line);
         }
     }
 
@@ -1084,12 +1268,10 @@ fn get_current_qrc_line<'a>(qrc_data: &'a [QrcLine], trans: &'a str, current_tim
 
 /// 在字符索引处拆分字符串（支持中文字符）
 fn split_str_at_char(s: &str, char_idx: usize) -> (&str, &str) {
-    let mut ci = 0;
-    for (i, _) in s.char_indices() {
+    for (ci, (i, _)) in s.char_indices().enumerate() {
         if ci == char_idx {
             return (&s[..i], &s[i..]);
         }
-        ci += 1;
     }
     (s, "")
 }
@@ -1186,11 +1368,9 @@ fn filter_lyrics(lyrics: &str, trans: &str, current_time_sec: u64) -> String {
             if let Some(end_bracket) = line.find(']') {
                 let time_str = &line[start_bracket+1..end_bracket];
                 if let Ok(time_val) = parse_lrc_time(time_str) {
-                    if time_val <= current_time_sec as f64 {
-                        if time_val > max_time {
-                            max_time = time_val;
-                            current_lyric = line[end_bracket+1..].trim().to_string();
-                        }
+                    if time_val <= current_time_sec as f64 && time_val > max_time {
+                        max_time = time_val;
+                        current_lyric = line[end_bracket+1..].trim().to_string();
                     }
                 }
             }
@@ -1325,13 +1505,16 @@ async fn main() -> Result<()> {
     // Initialize global config lock
     CONFIG.set(RwLock::new(config.clone()))
         .map_err(|_| anyhow::anyhow!("Failed to initialize global config OnceLock"))?;
+    LATEST_SONG_INFO
+        .set(RwLock::new(Arc::new(SongInfo::default())))
+        .map_err(|_| anyhow::anyhow!("Failed to initialize latest song state"))?;
 
     let monitor_args = args.clone();
     let monitor_config = config.clone();
 
     // 启动 Tauri 窗口
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![set_background_state, get_app_config, save_app_config, media_toggle_play_pause, media_next, media_previous])
+        .invoke_handler(tauri::generate_handler![set_background_state, get_app_config, save_app_config, get_current_song_info, media_toggle_play_pause, media_next, media_previous])
         .setup(move |app| {
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {

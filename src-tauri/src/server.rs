@@ -20,10 +20,10 @@ struct WsCommand {
 
 /// 服务端状态持有 watch::Receiver
 struct AppState {
-    receiver: watch::Receiver<SongInfo>,
+    receiver: watch::Receiver<Arc<SongInfo>>,
 }
 
-pub async fn start_server(port: u16, receiver: watch::Receiver<SongInfo>) {
+pub async fn start_server(port: u16, receiver: watch::Receiver<Arc<SongInfo>>) {
     let state = Arc::new(AppState { receiver });
 
     let app = Router::new()
@@ -41,7 +41,7 @@ pub async fn start_server(port: u16, receiver: watch::Receiver<SongInfo>) {
 }
 
 async fn get_current(State(state): State<Arc<AppState>>) -> Json<SongInfo> {
-    let current = state.receiver.borrow().clone();
+    let current = state.receiver.borrow().as_ref().clone();
     Json(current)
 }
 
@@ -55,8 +55,11 @@ async fn ws_handler(
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.receiver.clone();
 
-    let initial = rx.borrow().clone();
-    if let Ok(json) = serde_json::to_string(&initial) {
+    let initial_json = {
+        let initial = rx.borrow();
+        serde_json::to_string(initial.as_ref())
+    };
+    if let Ok(json) = initial_json {
         if socket.send(Message::Text(json)).await.is_err() {
             return;
         }
@@ -66,8 +69,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
         tokio::select! {
             result = rx.changed() => {
                 if result.is_ok() {
-                    let current = rx.borrow().clone();
-                    if let Ok(json) = serde_json::to_string(&current) {
+                    let current_json = {
+                        let current = rx.borrow();
+                        serde_json::to_string(current.as_ref())
+                    };
+                    if let Ok(json) = current_json {
                         if socket.send(Message::Text(json)).await.is_err() {
                             break;
                         }

@@ -14,9 +14,13 @@
 - 📝 **智能歌词系统**：
   - 多级搜索策略匹配 QQ 音乐在线 API，优先获取逐字 QRC 格式
   - 自动探测 QQ 音乐本地 `qrc` 缓存目录，离线兜底
+  - 在线请求失败自动退避重试，避免一次网络抖动导致整首歌无歌词
   - 支持双语对照翻译
-- 🎤 **逐字 KTV 高亮**：解析 QQ 音乐专有加密 QRC，实现字级扫光效果（前端 CSS `background-clip: text`，终端 Stylize 渲染）
-- ⏱️ **SMTC 滞后补偿**：基于 `LastUpdatedTime` 的漂移修正 + 用户可调偏移量，消除进度闪烁
+- 🎤 **逐字 KTV 高亮**：解析 QQ 音乐专有加密 QRC，通过前端 CSS `background-clip: text` 实现字级扫光
+- ⏱️ **逐字级进度精度**：
+  - 后端统一完成 `LastUpdatedTime` 漂移修正与有符号偏移补偿，前端仅用单调时钟插值
+  - 暂停淡出状态机建模 QQ 音乐 ~1s 淡入淡出，WASAPI 音频会话提供「是否真实出声」地面真值，暂停/恢复全程无瞬移、无回退
+- 🎛️ **播放控制**：界面内置 上一首 / 播放暂停 / 下一首 按钮（SMTC 控制通道）
 - 🔄 **切歌瞬间修正**：前后端协同处理 SMTC media properties 与 timeline 异步更新间隙，杜绝切歌后旧歌词残留
 - 📄 **多渠道输出**：
   - `now_playing.txt`（UTF-16 LE，适配 OBS）/ `now_playing.json` / `current_lyric.txt`
@@ -55,7 +59,7 @@ GUI 界面采用极光午夜设计风格，左侧黑胶唱机组件随播放状�
    cargo tauri build
    ```
 
-GUI 窗口启动后自动连接后端；浏览器/外部场景可访问 `http://127.0.0.1:3000` 或连 `ws://127.0.0.1:3000/ws`。
+GUI 窗口启动后自动连接后端；浏览器/外部场景可读取 `http://127.0.0.1:3000/api/current` 或连接 `ws://127.0.0.1:3000/ws`。
 
 ## 常用运行参数
 
@@ -64,6 +68,7 @@ cargo run --release -- --debug          # 调试模式（详细 QRC 解析日志
 cargo run --release -- --port 8080      # 自定义 WebSocket 服务端口
 cargo run --release -- --interval 200   # 自定义 SMTC 轮询间隔（毫秒）
 cargo run --release -- --offset 150     # 自定义 SMTC 滞后补偿（毫秒）
+cargo run --release -- --offset=-100    # 使用负偏移让歌词稍晚显示
 cargo run --release -- --no-server      # 禁用 WebSocket 服务
 cargo run --release -- --help           # 完整参数列表
 ```
@@ -71,7 +76,8 @@ cargo run --release -- --help           # 完整参数列表
 ## 技术实现
 
 ### 后端核心模块（`src-tauri/src/`）
-- **`smtc.rs`**：Windows SMTC API 封装，基于 `LastUpdatedTime` 的漂移修正算法（匹配 Windows 音量浮窗进度条）
+- **`smtc.rs`**：Windows SMTC API 封装，`LastUpdatedTime` 漂移修正 + 暂停淡出/恢复 hold 状态机
+- **`audio_session.rs`**：WASAPI 音频会话监控（峰值电平/会话状态），提供「QQ 音乐是否真实出声」的实时地面真值
 - **`qrc.rs`**：QRC 加解密核心，支持 QQ 音乐专有 DES-CBC 魔改算法 + zlib 解压 + XML/文本解析
 - **`local_qrc.rs`**：自动扫描 `AppData\Roaming\Tencent\QQMusic` 缓存目录，读取本地加密歌词
 - **`lyrics.rs`**：多级搜索策略的在线歌词获取引擎（含韩文等非 ASCII 标题的修正匹配）
@@ -79,7 +85,7 @@ cargo run --release -- --help           # 完整参数列表
 - **`qq_des/`**：C FFI 实现 QQ 音乐魔改 DES 算法
 
 ### 前端（`frontend/`，原生 ES Modules，无打包工具）
-- **`src/connection/`**：Tauri event 监听（主通道）+ WebSocket 兜底（含指数退避重连）
+- **`src/connection/`**：Tauri 静态快照/轻量进度事件（主通道）+ WebSocket 兜底（含指数退避重连）
 - **`src/state/`**：全局状态管理 + SongInfo 更新处理 + 切歌重置逻辑
 - **`src/lyrics/`**：翻译解析 + 歌词 DOM 构建（word-bg/word-fg 双层剪裁实现逐字扫光）
 - **`src/render/`**：60fps requestAnimationFrame 渲染循环（插值 + 逐字剪裁 + translateY 居中滚动）
@@ -88,7 +94,7 @@ cargo run --release -- --help           # 完整参数列表
 
 ## 文档
 
-- [详细项目文档](Project.md) — 架构、数据流、QRC 解密流程、SMTC 时间模型、切歌处理细节
+- [详细项目文档](Project.md) — 架构、数据流、QRC 解密流程、SMTC 时间模型（含暂停淡出/恢复模型）、切歌处理细节
 
 ## 开发者说明
 

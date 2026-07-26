@@ -17,7 +17,7 @@ import { fetchBackendConfig, getDefaultBackendConfig } from './config/backend-co
 import { connect, disconnect, updateConnectionUI, sendCommand } from './connection/ws.js';
 import { listenSongInfo, notifyBackgroundState, isTauri, mediaControl } from './connection/tauri-bridge.js';
 import {
-    animFrame, setAnimFrame, setLastSyncMs,
+    animFrame, songInfo, setAnimFrame, setLastSyncMs,
     setIsIntentionalClose
 } from './state/state.js';
 import { handleSongInfoUpdate } from './state/update-handler.js';
@@ -134,6 +134,11 @@ function onMessage(data) {
     }
 }
 
+function onPlaybackProgress(progress) {
+    if (!songInfo) return;
+    onMessage({ ...songInfo, ...progress });
+}
+
 /* ============================================================
  * 渲染循环启动
  * ============================================================ */
@@ -142,8 +147,7 @@ function startRendering() {
     if (!animFrame) {
         startRenderLoop(
             els.timeCurrent, els.timeTotal, els.progressFill,
-            els.lyricsContainer, els.lyricsViewport,
-            { offsetMs: backConfig.offsetMs }
+            els.lyricsContainer, els.lyricsViewport
         );
     }
 }
@@ -170,13 +174,7 @@ syncConfigToUI(els, frontConfig, backConfig);
 wireUpSettings({
     els,
     configs: { front: frontConfig, back: backConfig },
-    onFrontConfigChange,
-    // 偏移变化时重新应用插值（通过重新处理当前 songInfo 实现）
-    reapplyOnSongInfo: () => {
-        import('./state/state.js').then(({ songInfo }) => {
-            if (songInfo) onMessage(songInfo);
-        });
-    }
+    onFrontConfigChange
 });
 
 // 3. 加载后端配置并启动数据源
@@ -186,7 +184,7 @@ if (isTauri()) {
         Object.assign(backConfig, cfg);
         syncConfigToUI(els, frontConfig, backConfig);
     });
-    listenSongInfo(onMessage, startRendering);
+    listenSongInfo(onMessage, onPlaybackProgress, startRendering);
     updateConnectionUI('connected', els.statusDot, els.statusText);
 } else {
     // 浏览器/独立调试环境：用 WebSocket 连接后端

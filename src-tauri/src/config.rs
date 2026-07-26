@@ -12,7 +12,7 @@ pub struct Config {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Settings {
     pub update_interval_ms: u64,
-    pub smtc_offset_ms: u64,
+    pub smtc_offset_ms: i64,
     pub max_retries: u32,
     pub output_txt: bool,
     pub output_json: bool,

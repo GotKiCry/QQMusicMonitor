@@ -30,7 +30,9 @@ impl LyricFetcher {
         match self.get_album_mid(songmid).await {
             Ok(album_mid) => format!("https://y.gtimg.cn/music/photo_new/T002R800x800M000{}.jpg?max_age=2592000", album_mid),
             Err(e) => {
-                eprintln!("[lyrics] Failed to fetch album mid for {}: {}", songmid, e);
+                if self.debug {
+                    eprintln!("[lyrics] Failed to fetch album mid for {}: {}", songmid, e);
+                }
                 String::new()
             }
         }
@@ -103,7 +105,11 @@ impl LyricFetcher {
 
     // Function to search and fetch lyrics with multiple fallback strategies
     pub async fn fetch_lyrics(&self, title: &str, artist: &str) -> Result<(String, String, String, String)> {
-        let log = |msg| { eprintln!("{}", msg); };
+        let log = |msg| {
+            if self.debug {
+                eprintln!("{}", msg);
+            }
+        };
         
         // Strategy 1: Search with "artist title" keyword
         let keyword = format!("{} {}", artist, title);

@@ -50,7 +50,7 @@ pub struct Cli {
 
     /// SMTC 滞后补偿量（毫秒），不指定则使用配置文件
     #[arg(short, long)]
-    pub offset: Option<u64>,
+    pub offset: Option<i64>,
 
     /// 同步服务端口
     #[arg(long, default_value_t = 3000)]
