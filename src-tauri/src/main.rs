@@ -4,10 +4,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use tokio::sync::RwLock;
 
-static IS_BACKGROUND: AtomicBool = AtomicBool::new(false);
 static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
 static CACHED_CACHE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
 static LATEST_SONG_INFO: OnceLock<RwLock<Arc<SongInfo>>> = OnceLock::new();
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 全局调试开关（main 启动时按配置设置，供非异步路径打印诊断）
+fn debug_mode_enabled() -> bool {
+    DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct FrontConfig {
@@ -17,12 +22,6 @@ pub struct FrontConfig {
     pub output_txt: bool,
     pub output_json: bool,
     pub output_lyric: bool,
-}
-
-#[tauri::command]
-// Function to set background state.
-fn set_background_state(is_background: bool) {
-    IS_BACKGROUND.store(is_background, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -90,7 +89,7 @@ async fn media_previous() -> Result<(), String> {
 
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use widestring::U16String;
@@ -160,6 +159,7 @@ fn same_gui_payload(previous: &SongInfo, current: &SongInfo) -> bool {
         && previous.trans == current.trans
         && previous.qrc_data == current.qrc_data
         && previous.album_pic_url == current.album_pic_url
+        && previous.album_pic_hd_url == current.album_pic_hd_url
 }
 
 #[cfg(test)]
@@ -203,6 +203,101 @@ mod synchronization_tests {
         cache.mark_retry("Song", "Artist");
         assert!(!cache.begin_fetch("Song", "Artist"));
     }
+
+    #[test]
+    fn album_names_match_accepts_consistent_names() {
+        // 标点/括号差异容忍（SMTC 带括号后缀 vs 实际专辑名）
+        assert!(album_names_match("ONE PIECE SUPER BEST (海贼王10周年 SUPER BEST)", "ONE PIECE SUPER BEST"));
+        assert!(album_names_match("听！我们的歌", "听！我们的歌"));
+        // 完全无关的专辑名不得误判为一致（如搜索 "Jay" 首条返回"钢琴曲纯音乐经典"）
+        assert!(!album_names_match("Jay", "钢琴曲纯音乐经典"));
+        assert!(!album_names_match("COUP D'ETAT [+ ONE OF A KIND & HEARTBREAKER]", "G-DRAGON 2ND ALBUM : COUP D`ETAT"));
+        // 空串不可匹配
+        assert!(!album_names_match("", "Jay"));
+        assert!(!album_names_match("Jay", ""));
+    }
+
+    #[test]
+    fn album_names_match_accepts_variant_naming() {
+        // 同一专辑的不同命名变体：SMTC 报 "World War Joy (Explicit)"，
+        // 歌曲详情返回 "World War Joy...Takeaway (Explicit)"——单词重叠应判为同一专辑
+        assert!(album_names_match("World War Joy (Explicit)", "World War Joy...Takeaway (Explicit)"));
+        // 重叠度不足的仍拒绝：相似但不同的专辑（0.75 重叠）与无关专辑
+        assert!(!album_names_match("World War Joy (Explicit)", "World War III (Explicit)"));
+        assert!(!album_names_match("Suicide Squad: The Album", "The Eminem Show (Clean)"));
+        // 子集关系（"The Monster" ⊂ "The Monster Mash"）属于包含匹配，仍放行
+        assert!(album_names_match("The Monster", "The Monster Mash"));
+    }
+
+    #[test]
+    fn artist_names_match_stays_strict() {
+        // 歌手判断必须严格：The Chainsmokers/Halsey 与 新田真剑佑/The Chainsmokers
+        // 共享单词但完全不是同一首歌的歌手，不得误判
+        assert!(!artist_names_match("The Chainsmokers/Halsey", "新田真剑佑/The Chainsmokers"));
+        // 多歌手子集仍应放行（feat. 变体）
+        assert!(artist_names_match("Eminem/Survivor", "Eminem"));
+        assert!(artist_names_match("G-DRAGON (권지용)", "G-DRAGON"));
+    }
+
+    #[test]
+    fn song_match_ok_rejects_wrong_artist_cover() {
+        use lyrics::{AlbumCover, CoverKind};
+        let refs = ["STAY (Explicit)"];
+        // "Stay explicit" - 屈直林：歌手与查询不符，Single 封面也必须拒绝
+        let wrong = AlbumCover {
+            mid: "004LS1ro32YK1a".into(),
+            name: String::new(),
+            singer: "屈直林（Quandos-Lin）".into(),
+            kind: CoverKind::Single,
+        };
+        assert!(!song_match_ok(&wrong, "The Kid LAROI/Justin Bieber", &refs),
+            "歌手不符的单曲封面必须被拒绝");
+
+        // 正确候选：STAY - The Kid LAROI/Justin Bieber，专辑名一致
+        let right = AlbumCover {
+            mid: "004OTM9c0OfNRw".into(),
+            name: "STAY (Explicit)".into(),
+            singer: "The Kid LAROI/Justin Bieber".into(),
+            kind: CoverKind::Album,
+        };
+        assert!(song_match_ok(&right, "The Kid LAROI/Justin Bieber", &refs));
+
+        // 多歌手子集（Eminem/Survivor vs Eminem）应放行
+        let sub = AlbumCover {
+            mid: "x".into(),
+            name: "The Eminem Show (Clean)".into(),
+            singer: "Eminem/Survivor".into(),
+            kind: CoverKind::Album,
+        };
+        assert!(song_match_ok(&sub, "Eminem", &["The Eminem Show (Clean)"]));
+
+        // 专辑名不符的 Album 候选拒绝（同歌手、不同专辑 = 不同版本）
+        let wrong_album = AlbumCover {
+            mid: "001sDxZZ0lzDJX".into(),
+            name: "Suicide Squad: The Album".into(),
+            singer: "Eminem".into(),
+            kind: CoverKind::Album,
+        };
+        assert!(!song_match_ok(&wrong_album, "Eminem", &["The Eminem Show (Clean)"]));
+    }
+
+    #[test]
+    fn album_pic_is_hd_detects_500_vs_150() {
+        assert!(album_pic_is_hd(Path::new("T002R500x500M000004JAIMT1Pl1z9_1.jpg")));
+        assert!(album_pic_is_hd(Path::new("T062R500x500M000002PE0rX0FxNck.jpg")));
+        assert!(!album_pic_is_hd(Path::new("T002R150x150M000001rWGUJ3Gvypx_2.jpg")));
+        assert!(!album_pic_is_hd(Path::new("T062R150x150M000002PE0rX0FxNck.jpg")));
+        assert!(!album_pic_is_hd(Path::new("weird.txt")));
+    }
+
+    #[test]
+    fn cover_cdn_url_uses_kind_prefix() {
+        use lyrics::CoverKind;
+        let album = cover_cdn_url(CoverKind::Album, "004JAIMT1Pl1z9");
+        assert!(album.starts_with("https://y.gtimg.cn/music/photo_new/T002R800x800M000004JAIMT1Pl1z9.jpg"));
+        let single = cover_cdn_url(CoverKind::Single, "002PE0rX0FxNck");
+        assert!(single.starts_with("https://y.gtimg.cn/music/photo_new/T062R800x800M000002PE0rX0FxNck.jpg"));
+    }
 }
 
 /// 缓存淘汰上限：超出后淘汰最久未访问的条目。
@@ -218,18 +313,29 @@ enum LyricsFetchState {
     RetryAfter(u64),
 }
 
+/// 歌词/封面数据来源（日志与缓存标识：让用户明确看到用的是本地还是在线）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LyricsSource {
+    Local,
+    Online,
+    None,
+}
+
 struct LyricsCacheEntry {
     lyrics: String,
     trans: String,
     qrc_raw: String,
     qrc_data: Vec<QrcLine>,
     album_pic_url: String,
+    /// 高清封面 URL：album_pic_url 为低清本地图(150x150)时携带 800x800 在线地址
+    album_pic_hd_url: String,
     /// 本地缓存文件名中解析出的专辑名（QQ 音乐索引时的原始名），
     /// 比依赖 SMTC 报告的 album 更可靠，用作在线 album_mid 解析的搜索词。
     local_album: String,
     /// 最后访问时间戳（毫秒），用于 LRU 淘汰
     last_accessed: u64,
     fetch_state: LyricsFetchState,
+    source: LyricsSource,
 }
 
 impl LyricsCacheEntry {
@@ -240,9 +346,11 @@ impl LyricsCacheEntry {
             qrc_raw: String::new(),
             qrc_data: Vec::new(),
             album_pic_url: String::new(),
+            album_pic_hd_url: String::new(),
             local_album: String::new(),
             last_accessed: 0,
             fetch_state: LyricsFetchState::Loading,
+            source: LyricsSource::None,
         }
     }
 }
@@ -317,11 +425,12 @@ impl LyricsCache {
         self.entries.insert(key, entry);
     }
 
-    /// 部分更新：仅覆盖缓存中某首歌的 album_pic_url
-    fn update_album_pic_url(&mut self, title: &str, artist: &str, url: String) {
+    /// 部分更新：覆盖缓存中某首歌的封面（主图 + 高清升级地址）
+    fn update_album_pic_url(&mut self, title: &str, artist: &str, url: String, hd_url: String) {
         let key = format!("{}|{}", title, artist);
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.album_pic_url = url;
+            entry.album_pic_hd_url = hd_url;
             entry.last_accessed = current_timestamp_ms();
         }
     }
@@ -378,58 +487,204 @@ fn clean_album_name(raw: &str) -> String {
     s.trim().to_string()
 }
 
+/// 歌手名一致性校验：normalize（小写 + 标点折叠）后互相包含即视为一致。
+/// 严格匹配——歌手判断不能放宽（防止标题模糊命中其他歌手的翻唱）。
+fn artist_names_match(a: &str, b: &str) -> bool {
+    let na = local_qrc::normalize(a);
+    let nb = local_qrc::normalize(b);
+    !na.is_empty() && !nb.is_empty() && (na.contains(&nb) || nb.contains(&na))
+}
+
+/// 专辑名一致性校验：normalize 后互相包含即视为一致；
+/// 或单词重叠度足够高（处理同一专辑的不同命名变体，
+/// 如 "World War Joy (Explicit)" vs "World War Joy...Takeaway (Explicit)"）。
+fn album_names_match(a: &str, b: &str) -> bool {
+    let na = local_qrc::normalize(a);
+    let nb = local_qrc::normalize(b);
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    if na.contains(&nb) || nb.contains(&na) {
+        return true;
+    }
+    // 单词重叠：过滤单字母词后，共同词数占较短者比例足够高即视为同一专辑
+    let wa: std::collections::HashSet<String> = na
+        .split(' ')
+        .filter(|w| w.chars().count() > 1)
+        .map(String::from)
+        .collect();
+    let wb: std::collections::HashSet<String> = nb
+        .split(' ')
+        .filter(|w| w.chars().count() > 1)
+        .map(String::from)
+        .collect();
+    if wa.is_empty() || wb.is_empty() {
+        return false;
+    }
+    let shared = wa.intersection(&wb).count();
+    let min_len = wa.len().min(wb.len());
+    // 0.8 阈值：变体命名（"World War Joy...Takeaway (Explicit)" vs
+    // "World War Joy (Explicit)"，重叠 1.0）放行；相似但不同的专辑
+    // （"World War Joy" vs "World War III"，重叠 0.75）拒绝
+    shared >= 2 && (shared as f64 / min_len as f64) >= 0.8
+}
+
+/// 歌曲候选身份校验：只有候选歌曲与播放中歌曲一致时才采信其封面。
+///
+/// 1. 歌手必须匹配（normalize 互相包含）；候选或查询歌手为空时跳过。
+///    防止标题模糊匹配命中别的歌（如 "STAY (Explicit)" 命中 "Stay explicit"，
+///    歌手完全不同，其 vs 单曲封面也是错的）。
+/// 2. Album 类候选：专辑名必须与参考专辑（本地 QRC 文件名 / SMTC）一致。
+///    Single 类（无专辑，vs 单曲封面）在歌手通过后直接采信。
+fn song_match_ok(cover: &lyrics::AlbumCover, query_artist: &str, refs: &[&str]) -> bool {
+    if !cover.singer.is_empty() && !query_artist.is_empty() {
+        if !artist_names_match(&cover.singer, query_artist) {
+            return false;
+        }
+    }
+    if cover.kind == lyrics::CoverKind::Album {
+        if refs.is_empty() {
+            return true;
+        }
+        return refs.iter().any(|r| album_names_match(r, &cover.name));
+    }
+    true
+}
+
+/// 本地封面文件是否为高清（R500x500）。
+/// 仅 R150x150 时视为低清：调用方应以低清 data URI 即时显示，
+/// 并携带 800x800 在线地址（album_pic_hd_url）供前端预加载后升级。
+fn album_pic_is_hd(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.contains("R500x500"))
+        .unwrap_or(false)
+}
+
+/// 按封面类型生成 800x800 在线 CDN URL（T002 专辑 / T062 单曲）
+fn cover_cdn_url(kind: lyrics::CoverKind, mid: &str) -> String {
+    let prefix = match kind {
+        lyrics::CoverKind::Album => "T002",
+        lyrics::CoverKind::Single => "T062",
+    };
+    format!("https://y.gtimg.cn/music/photo_new/{}R800x800M000{}.jpg?max_age=2592000", prefix, mid)
+}
+
 /// 优先使用本地缓存的专辑封面图，找不到则返回原始在线 URL。
 ///
-/// 本地封面文件名含 album_mid，可从在线 URL 中提取 mid 后在 QQMusicPicture 目录查找。
-/// 找到则读取文件转为 base64 data URI（与 SMTC 缩略图格式一致，前端可直接加载）。
+/// 解析顺序：
+///  0. SMTC 专辑名可用时，先解析「实际播放专辑」的封面——歌词搜索匹配到的
+///     可能是不同版本（单曲版/合辑版，如 High Hopes 的 Pray for the Wicked
+///     vs Summer 2018），其专辑封面与正在播放的不一致。专辑名搜索
+///     （候选名逐条验证）→ legacy 兜底（强制歌手校验，防止通用专辑名
+///     匹配到别的歌手的同名专辑）；本地优先，无本地图直接采用其 CDN URL。
+///  1. 原在线 URL 的 album_mid 查本地（SMTC 专辑名为空时的兜底）。
+///  2. 都未命中 → 原在线 URL。
 ///
-/// 当 API 返回的 album_mid 在本地没找到时（如单曲版 vs 合辑版不一致），
-/// 用 SMTC 报告的专辑名通过 SmartBox 搜索正确的 album_mid，再查本地。
-async fn resolve_album_pic_url(online_url: &str, album_name: &str, fetcher: &LyricFetcher) -> String {
+/// 覆盖采用判定（matched_album 为歌词匹配版本的专辑名）：
+///  解析出的 mid 与原文 URL mid 不同时，若歌词版本与 SMTC 专辑一致
+///  （"Unstoppable" 场景：The Score 有两张同名专辑，legacy 排序可能
+///  命中错版 002vztFj10OO9E）→ 原 URL（歌词精确匹配版本）更权威，回退；
+///  不一致（合辑版场景）→ 解析结果才是实际播放专辑，采用。
+///
+/// 返回 (主图, 高清升级地址)：
+///  - 本地命中 500x500 → (data URI, "")：已高清，无需升级
+///  - 本地仅 150x150 → (data URI, 800x800 在线 URL)：先即时显示低清，
+///    前端预加载高清后平滑升级（避免直接上在线 URL 的加载空白）
+///  - 无本地图 → (在线 URL, "")：主图即在线高清图
+async fn resolve_album_pic_url(
+    online_url: &str,
+    album_name: &str,
+    matched_album: &str,
+    title: &str,
+    artist: &str,
+    fetcher: &LyricFetcher,
+) -> (String, String) {
     if online_url.is_empty() {
-        return String::new();
+        return (String::new(), String::new());
     }
 
     // 只处理 QQ 音乐 CDN 的在线 URL（data:image base64 是 SMTC 缩略图，不替换）
     if !online_url.contains("y.gtimg.cn") {
-        return online_url.to_string();
+        return (online_url.to_string(), String::new());
     }
 
     let Some(pic_dir) = get_picture_cache_dir() else {
-        return online_url.to_string();
+        return (online_url.to_string(), String::new());
     };
 
-    // 第一次尝试：用在线 URL 中的 album_mid 查本地
-    if let Some(album_mid) = local_qrc::extract_album_mid_from_url(online_url) {
-        if let Some(local_path) = local_qrc::find_album_pic(&pic_dir, &album_mid) {
-            if let Ok(data) = std::fs::read(&local_path) {
-                use base64::{Engine as _, engine::general_purpose::STANDARD};
-                return format!("data:image/jpeg;base64,{}", STANDARD.encode(&data));
-            }
-        }
+    // 本地图 → data URI；返回 (uri, 该 mid 的高清在线 URL)。
+    // 本地只有 150x150 时主图仍是 data URI（即时显示），高清地址交给前端升级。
+    fn local_to_uri(pic_dir: &Path, mid: &str, hd_url: &str) -> Option<(String, String)> {
+        let local_path = local_qrc::find_album_pic(pic_dir, mid)?;
+        let data = std::fs::read(&local_path).ok()?;
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let uri = format!("data:image/jpeg;base64,{}", STANDARD.encode(&data));
+        let hd = if album_pic_is_hd(&local_path) { String::new() } else { hd_url.to_string() };
+        Some((uri, hd))
     }
 
-    // 第二次尝试：用 SMTC 专辑名搜 SmartBox，拿到用户实际播放专辑的 album_mid。
-    // 尝试原始名和去括号清洗后的变体，处理 SMTC 返回"ONE PIECE SUPER BEST (海贼王…)" 但 SmartBox 只索引"ONE PIECE SUPER BEST"的情况。
+    // 第 0 步：SMTC 专辑名解析"实际播放专辑"的封面（正确性优先——
+    // 歌词匹配到的版本可能来自不同专辑，如合辑版 vs 原版）。
     if !album_name.is_empty() {
-        let mut variants: Vec<&str> = vec![album_name];
+        let mut variants: Vec<String> = vec![album_name.to_string()];
         let cleaned = clean_album_name(album_name);
         if cleaned != album_name {
-            variants.push(&cleaned);
+            variants.push(cleaned);
         }
+        // 0a. SmartBox 专辑搜索（候选名去括号验证 + 歌手校验，
+        //     通用专辑名会命中别的歌手的同名专辑，如 "Way Back" → "Way Back Home"）
+        let mut correct_mid: Option<String> = None;
         for variant in &variants {
-            if let Some(correct_mid) = fetcher.search_album_mid_by_name(variant).await {
-                if let Some(local_path) = local_qrc::find_album_pic(&pic_dir, &correct_mid) {
-                    if let Ok(data) = std::fs::read(&local_path) {
-                        use base64::{Engine as _, engine::general_purpose::STANDARD};
-                        return format!("data:image/jpeg;base64,{}", STANDARD.encode(&data));
+            if let Some(am) = fetcher.search_album_mid_by_name(variant, artist).await {
+                correct_mid = Some(am);
+                break;
+            }
+        }
+        // 0b. legacy 歌曲搜索按专辑名兜底（三重校验：专辑名 + 歌名 + 歌手）
+        if correct_mid.is_none() {
+            if let Some(songmid) = fetcher.find_song_by_album_name(&variants, title, artist, album_name).await {
+                if let Ok(cover) = fetcher.get_album_cover(&songmid).await {
+                    if cover.kind == lyrics::CoverKind::Album && album_names_match(album_name, &cover.name) {
+                        correct_mid = Some(cover.mid);
                     }
                 }
             }
         }
+        if let Some(mid) = correct_mid.as_ref() {
+            // 采用判定：解析结果与原 URL 不同时，若歌词匹配版本与 SMTC 专辑一致，
+            // 则原 URL（歌词精确匹配的专辑）更权威，拒绝覆盖（同名同歌手双专辑
+            // 场景，如 The Score 的 Unstoppable 有 001wHjwD0IWIRm 与 002vztFj10OO9E
+            // 两张同名专辑，legacy 排序可能命中错版）。
+            let online_mid = local_qrc::extract_album_mid_from_url(online_url);
+            if online_mid.as_deref() != Some(mid.as_str()) {
+                if !matched_album.is_empty() && album_names_match(matched_album, album_name) {
+                    if debug_mode_enabled() {
+                        eprintln!("[lyrics] 封面: 歌词版本专辑'{}'与SMTC'{}'一致,拒绝覆盖解析结果 {}", matched_album, album_name, mid);
+                    }
+                    correct_mid = None;
+                } else if debug_mode_enabled() {
+                    eprintln!("[lyrics] 封面: 歌词版本'{}'≠SMTC'{}',采用解析结果 {}", matched_album, album_name, mid);
+                }
+            }
+        }
+        if let Some(mid) = correct_mid {
+            let hd_url = format!("https://y.gtimg.cn/music/photo_new/T002R800x800M000{}.jpg?max_age=2592000", mid);
+            if let Some(res) = local_to_uri(&pic_dir, &mid, &hd_url) {
+                return res;
+            }
+            return (hd_url, String::new());
+        }
     }
 
-    online_url.to_string()
+    // 第 1 步（兜底）：用在线 URL 中的 album_mid 查本地
+    if let Some(album_mid) = local_qrc::extract_album_mid_from_url(online_url) {
+        if let Some(res) = local_to_uri(&pic_dir, &album_mid, online_url) {
+            return res;
+        }
+    }
+
+    (online_url.to_string(), String::new())
 }
 
 /// 从本地 QQ 音乐缓存目录查找歌词（QRC 优先，LRC 兜底），返回完整的缓存条目。
@@ -526,6 +781,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
         println!("⚠️  正在使用 Windows 系统媒体控制接口");
         println!("========================================\n");
     }
+    DEBUG_ENABLED.store(config.settings.debug_mode, Ordering::SeqCst);
 
     // 初始化歌词获取器和后台缓存
     let lyric_fetcher = Arc::new(LyricFetcher::with_debug(config.settings.debug_mode));
@@ -587,10 +843,8 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                         .begin_fetch(&info.title, &info.artist);
 
                     if should_fetch {
-                        if !quiet && song_key != last_logged_lyric_key {
-                            eprintln!("[歌词] {} - {}", info.artist, info.title);
-                            last_logged_lyric_key = song_key;
-                        }
+                        // 标记已记录：避免同一首歌在获取完成前被缓存命中路径重复输出
+                        last_logged_lyric_key = song_key;
                         let cache = lyrics_cache.clone();
                         let fetcher = lyric_fetcher.clone();
                         let t = info.title.clone();
@@ -610,24 +864,17 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                 let local_qrc = local.qrc_data.len();
                                 let local_lrc = !local.lyrics.is_empty();
                                 let local_trans = !local.trans.is_empty();
-                                if !quiet {
-                                    let cache_dir_info = match get_lyric_cache_dir() {
-                                        Some(ref dir) => {
-                                            let file_count = std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0);
-                                            format!("{} ({}个文件)", dir.display(), file_count)
-                                        }
-                                        None => "未找到本地缓存目录".to_string(),
-                                    };
+                                if debug {
                                     if local_qrc > 0 || local_lrc || local_trans {
-                                        eprintln!("  本地: QRC {}行 | 歌词 {} | 翻译 {} | {}",
-                                            local_qrc,
-                                            if local_lrc { "✓" } else { "✗" },
-                                            if local_trans { "✓" } else { "✗" },
-                                            cache_dir_info);
+                                        let mut parts: Vec<String> = Vec::new();
+                                        if local_qrc > 0 { parts.push(format!("QRC {}行", local_qrc)); }
+                                        if local_lrc { parts.push("歌词".to_string()); }
+                                        if local_trans { parts.push("翻译".to_string()); }
+                                        eprintln!("[lyrics] 本地: ✓ {}", parts.join(" + "));
                                     } else {
-                                        eprintln!("  本地: ✗ 无数据 ({})", cache_dir_info);
+                                        eprintln!("[lyrics] 本地: ✗ 无数据");
                                         // 诊断：显示文件名格式 + 模糊匹配候选
-                                        eprintln!("       搜索词: artist='{}' title='{}'", local_qrc::normalize(&a), local_qrc::normalize(&t));
+                                        eprintln!("[lyrics]   搜索词: artist='{}' title='{}'", local_qrc::normalize(&a), local_qrc::normalize(&t));
                                         if let Some(ref dir) = get_lyric_cache_dir() {
                                             if let Ok(entries) = std::fs::read_dir(dir) {
                                                 let mut qrc_count = 0u32;
@@ -657,7 +904,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                                         }
                                                     }
                                                 }
-                                                eprintln!("       目录QRC总数: {} | 最佳候选: {}", qrc_count,
+                                                eprintln!("[lyrics]   目录QRC总数: {} | 最佳候选: {}", qrc_count,
                                                     best_candidate.map_or("无部分匹配".to_string(), |(f, s)| format!("'{}' (分数:{})", f, s)));
                                             }
                                         }
@@ -672,6 +919,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                     } else {
                                         LyricsFetchState::Loading
                                     };
+                                    local.source = LyricsSource::Local;
                                     let mut w = cache.write().await;
                                     w.insert_entry(&t, &a, local);
                                     if debug { eprintln!("[lyrics] Local cache populated for '{} - {}'", t, a); }
@@ -701,17 +949,20 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                             };
 
                             match online_result {
-                                Ok((l, trans, q, pic_url)) => {
-                                    let resolved_pic_url = resolve_album_pic_url(&pic_url, &album, &fetcher).await;
+                                Ok((l, trans, q, pic_url, matched_album)) => {
+                                    let (resolved_pic_url, resolved_hd_url) =
+                                        resolve_album_pic_url(&pic_url, &album, &matched_album, &t, &a, &fetcher).await;
                                     let mut entry = LyricsCacheEntry {
                                         lyrics: l,
                                         trans,
                                         qrc_raw: q,
                                         qrc_data: Vec::new(),
                                         album_pic_url: resolved_pic_url,
+                                        album_pic_hd_url: resolved_hd_url,
                                         local_album: String::new(),
                                         last_accessed: 0,
                                         fetch_state: LyricsFetchState::Ready,
+                                        source: LyricsSource::None,
                                     };
 
                                     // 在线 QRC 解密
@@ -767,109 +1018,199 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 
                                     // 汇总在线结果
                                     if !quiet {
-                                        let qrc_lines = entry.qrc_data.len();
-                                        let lrc = !entry.lyrics.is_empty();
-                                        let has_trans = !entry.trans.is_empty();
-                                        let has_pic = !entry.album_pic_url.is_empty();
-                                        if qrc_lines > 0 || lrc || has_trans {
-                                            eprintln!("  在线: QRC {}行 | 歌词 {} | 翻译 {} | 封面 {}",
-                                                qrc_lines,
-                                                if lrc { "✓" } else { "✗" },
-                                                if has_trans { "✓" } else { "✗" },
-                                                if has_pic { "✓" } else { "✗" });
+                                        let has_lyric = !entry.lyrics.is_empty() || !entry.qrc_data.is_empty();
+                                        let art_label = if entry.album_pic_url.starts_with("data:") {
+                                            "本地"
+                                        } else if !entry.album_pic_url.is_empty() {
+                                            "在线"
                                         } else {
-                                            eprintln!("  在线: ✗ 无数据");
-                                        }
+                                            "无"
+                                        };
+                                        eprintln!("[歌词] {} - {} | 歌词: {} | 封面: {}",
+                                            a, t,
+                                            if has_lyric { "在线" } else { "无" },
+                                            art_label);
                                     }
 
+                                    entry.source = LyricsSource::Online;
                                     let mut w = cache.write().await;
                                     w.insert_entry(&t, &a, entry);
                                     if debug { eprintln!("[lyrics] ✓ Background fetch complete for '{} - {}'", t, a); }
                                 }
                                 Err(e) => {
-                                    if !quiet { eprintln!("  在线: ✗ 失败 ({})", e); }
+                                    if !quiet {
+                                        eprintln!("[歌词] {} - {} | 歌词: 无 | 封面: 无 (失败,稍后重试)", a, t);
+                                    }
+                                    if debug { eprintln!("[lyrics] 在线获取失败: {}", e); }
                                     let mut cached = cache.write().await;
                                     cached.mark_retry(&t, &a);
                                 }
                             }
                             } // if !has_local_qrc
                             else {
-                                // 本地有 QRC 但缺少封面：解析 album_mid → 优先查本地 QQMusicPicture → 在线 CDN 兜底
+                                // 本地有 QRC 但缺少封面：解析封面 mid → 优先查本地 QQMusicPicture → 在线 CDN 兜底
                                 //
-                                // 1) 取 album_mid：
-                                //    a. 多策略搜歌曲 songmid → get_album_mid（解决 "(Explicit)" 等括号后缀
-                                //       导致单策略搜不到的问题，与 fetch_lyrics 策略对齐）
-                                //    b. 仍失败则用专辑名搜 SmartBox 专辑，候选为本地文件名专辑名
-                                //       （QQ 音乐索引原始名，比 SMTC album 更可靠）与 SMTC album，
-                                //       均清洗去括号后再搜
-                                // 2) 有了 album_mid：本地命中→base64 data URI（与在线路径一致，
+                                // 1) 取封面 mid：
+                                //    a. 多策略搜歌曲 songmid → get_album_cover（解决 "(Explicit)" 等括号后缀
+                                //       导致单策略搜不到的问题，与 fetch_lyrics 策略对齐）；
+                                //       有可对照专辑名时校验一致性，防止匹配到同名翻唱/合辑版本
+                                //    b. 失败/被拒则用专辑名搜 SmartBox 专辑（候选名逐条验证，
+                                //       候选为本地文件名专辑名（QQ 音乐索引原始名，比 SMTC album
+                                //       更可靠）与 SMTC album，均清洗去括号后再搜）
+                                // 2) 有了封面 mid：本地命中→base64 data URI（与在线路径一致，
                                 //    避免 file:// 在 webview 受限）；否则返回在线 CDN URL
+                                //    （T002 专辑封面 / T062 无专辑歌曲的单曲封面）
                                 let get_pic = async {
-                                    let mut album_mid = String::new();
+                                    // 从本地缓存条目取文件名解析的专辑名（QQ 音乐索引时的原始名，
+                                    // 比 SMTC 报告的 album 更可靠，用作校验与专辑搜索的参照）
+                                    let local_album = {
+                                        let cached = cache.read().await;
+                                        cached.peek_entry(&t, &a).map(|e| e.local_album.clone()).unwrap_or_default()
+                                    };
+                                    let mut cover: Option<lyrics::AlbumCover> = None;
+                                    // 无专辑单曲(vs 封面)兜底：1a 命中的候选无专辑信息时先记住，
+                                    // 等 1b/1c 按专辑名解析失败后再回退——避免 vs 单曲封面
+                                    // 直接胜出、错失正确专辑（如 BIGBANG 一天一天：smartbox 命中
+                                    // 无专辑单曲版，但正在播放的是 Stand Up 专辑版）。
+                                    let mut single_fallback: Option<lyrics::AlbumCover> = None;
 
-                                    // 1a) 多策略搜歌曲拿 album_mid
+                                    // 1a) 多策略搜歌曲 → 歌曲详情取封面 mid。
+                                    //     候选必须通过身份校验（歌手一致 + 有专辑时专辑名与
+                                    //     本地文件名/SMTC 一致），防止标题模糊匹配命中别的歌
+                                    //     （如 "STAY (Explicit)" 命中 "Stay explicit" 的翻唱，
+                                    //     其 vs 单曲封面是错歌的封面）。
                                     if let Some(songmid) = fetcher.search_song_mid(&t, &a).await {
-                                        album_mid = fetcher.get_album_mid(&songmid).await.unwrap_or_default();
-                                    }
-
-                                    // 1b) 歌曲搜失败 → 用专辑名搜专辑（候选：本地文件名专辑 + SMTC album，
-                                    //     各自清洗去括号后作为额外候选）
-                                    if album_mid.is_empty() {
-                                        // 从本地缓存条目取文件名解析的专辑名
-                                        let local_album = {
-                                            let cached = cache.read().await;
-                                            cached.peek_entry(&t, &a).map(|e| e.local_album.clone()).unwrap_or_default()
-                                        };
-                                        let mut album_variants: Vec<String> = Vec::new();
-                                        for name in [local_album, album.clone()].into_iter().filter(|s| !s.is_empty()) {
-                                            let cleaned = clean_album_name(&name);
-                                            album_variants.push(cleaned.clone());
-                                            if !cleaned.is_empty() && cleaned != name {
-                                                album_variants.push(name);
+                                        if let Ok(c) = fetcher.get_album_cover(&songmid).await {
+                                            let refs: Vec<&str> = [local_album.as_str(), album.as_str()]
+                                                .into_iter()
+                                                .filter(|s| !s.is_empty())
+                                                .collect();
+                                            if song_match_ok(&c, &a, &refs) {
+                                                if c.kind == lyrics::CoverKind::Single && !refs.is_empty() {
+                                                    // 候选无专辑(vs 单曲封面)但播放中歌曲有专辑名可对照：
+                                                    // 多半是不同版本，降级为兜底，优先按专辑名解析正确专辑
+                                                    if debug { eprintln!("[lyrics] 候选为无专辑单曲(vs封面), 优先按专辑名解析"); }
+                                                    single_fallback = Some(c);
+                                                } else {
+                                                    cover = Some(c);
+                                                }
+                                            } else if debug {
+                                                eprintln!("[lyrics] 封面: 歌曲身份不符('{}' - '{}'), 尝试专辑名搜索", c.singer, c.name);
                                             }
                                         }
+                                    }
+
+                                    // 1b) 歌曲搜索失败或被校验拒绝 → 用专辑名搜专辑（候选：本地文件名
+                                    //     专辑 + SMTC album，各自清洗去括号后作为额外候选）
+                                    let mut album_variants: Vec<String> = Vec::new();
+                                    for name in [local_album.clone(), album.clone()].into_iter().filter(|s| !s.is_empty()) {
+                                        let cleaned = clean_album_name(&name);
+                                        album_variants.push(cleaned.clone());
+                                        if !cleaned.is_empty() && cleaned != name {
+                                            album_variants.push(name);
+                                        }
+                                    }
+                                    if cover.is_none() {
                                         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                                        for variant in album_variants {
+                                        for variant in album_variants.iter() {
                                             let v = variant.trim().to_string();
                                             if v.is_empty() || !seen.insert(v.clone()) { continue; }
-                                            if let Some(am) = fetcher.search_album_mid_by_name(&v).await {
-                                                album_mid = am;
+                                            if let Some(am) = fetcher.search_album_mid_by_name(&v, &a).await {
+                                                cover = Some(lyrics::AlbumCover { mid: am, name: String::new(), singer: String::new(), kind: lyrics::CoverKind::Album });
                                                 break;
                                             }
                                         }
                                     }
 
-                                    // 2) album_mid → 本地图片优先，否则在线 URL
-                                    if !album_mid.is_empty() {
-                                        if let Some(pic_dir) = get_cache_root().map(|r| r.join("QQMusicPicture")) {
-                                            if let Some(local_pic) = local_qrc::find_album_pic(&pic_dir, &album_mid) {
-                                                if let Ok(data) = std::fs::read(&local_pic) {
-                                                    use base64::{Engine as _, engine::general_purpose::STANDARD};
-                                                    let data_uri = format!("data:image/jpeg;base64,{}", STANDARD.encode(&data));
-                                                    if !quiet { eprintln!("  封面: ✓ 本地"); }
-                                                    return Some(data_uri);
+                                    // 1c) SmartBox 专辑搜索索引不到的专辑（实测 "The Eminem Show" 返回 0 条）：
+                                    //     legacy 歌曲搜索按专辑名找候选歌（结果自带专辑名，可与参考专辑
+                                    //     校验），命中后走歌曲详情取封面，同样过身份校验
+                                    if cover.is_none() && !album_variants.is_empty() {
+                                        let ref_name = if !local_album.is_empty() { local_album.as_str() } else { album.as_str() };
+                                        if let Some(songmid) = fetcher.find_song_by_album_name(&album_variants, &t, &a, ref_name).await {
+                                            if let Ok(c) = fetcher.get_album_cover(&songmid).await {
+                                                let refs: Vec<&str> = [local_album.as_str(), album.as_str()]
+                                                    .into_iter()
+                                                    .filter(|s| !s.is_empty())
+                                                    .collect();
+                                                if song_match_ok(&c, &a, &refs) {
+                                                    if debug { eprintln!("[lyrics] 封面: legacy 专辑搜索命中 '{}'", c.name); }
+                                                    cover = Some(c);
                                                 }
                                             }
                                         }
-                                        let pic_url = format!("https://y.gtimg.cn/music/photo_new/T002R800x800M000{}.jpg?max_age=2592000", album_mid);
-                                        if !quiet { eprintln!("  封面: ✓ 在线"); }
-                                        return Some(pic_url);
+                                    }
+
+                                    // 1d) 专辑名解析均未命中 → 回退 1a 的无专辑单曲(vs)封面兜底
+                                    if cover.is_none() {
+                                        cover = single_fallback;
+                                    }
+
+                                    // 2) 封面 mid → 本地图片优先（T002 专辑 / T062 单曲），否则在线 URL。
+                                    //    返回 (主图, 高清升级地址)：本地仅 150x150 时主图用低清 data URI
+                                    //    即时显示，高清 800x800 在线地址交给前端预加载后平滑升级；
+                                    //    本地 500x500 或直接在线 URL 时主图即高清，无升级地址。
+                                    if let Some(c) = cover {
+                                        if let Some(pic_dir) = get_cache_root().map(|r| r.join("QQMusicPicture")) {
+                                            if let Some(local_pic) = local_qrc::find_album_pic(&pic_dir, &c.mid) {
+                                                if let Ok(data) = std::fs::read(&local_pic) {
+                                                    use base64::{Engine as _, engine::general_purpose::STANDARD};
+                                                    let data_uri = format!("data:image/jpeg;base64,{}", STANDARD.encode(&data));
+                                                    let is_hd = album_pic_is_hd(&local_pic);
+                                                    if debug { eprintln!("[lyrics] 封面: ✓ 本地{}", if is_hd { "" } else { " (低清,将升级高清)" }); }
+                                                    let hd_url = if is_hd {
+                                                        String::new()
+                                                    } else {
+                                                        cover_cdn_url(c.kind, &c.mid)
+                                                    };
+                                                    return Some((data_uri, hd_url));
+                                                }
+                                            }
+                                        }
+                                        let pic_url = cover_cdn_url(c.kind, &c.mid);
+                                        if debug { eprintln!("[lyrics] 封面: ✓ 在线"); }
+                                        return Some((pic_url, String::new()));
                                     }
                                     None
                                 };
 
-                                if !quiet { eprintln!("  封面: 查找中..."); }
-                                if let Some(pic_url) = get_pic.await {
+                                if let Some((pic_url, hd_url)) = get_pic.await {
+                                    let art_label = if pic_url.starts_with("data:") { "本地" } else { "在线" };
                                     let mut w = cache.write().await;
-                                    w.update_album_pic_url(&t, &a, pic_url);
+                                    w.update_album_pic_url(&t, &a, pic_url, hd_url);
+                                    if !quiet {
+                                        eprintln!("[歌词] {} - {} | 歌词: 本地 | 封面: {}", a, t, art_label);
+                                    }
                                 } else if !quiet {
-                                    eprintln!("  封面: ✗ 未找到");
+                                    eprintln!("[歌词] {} - {} | 歌词: 本地 | 封面: 无", a, t);
                                 }
                             }
                         });
                     } else {
                         if !quiet && song_key != last_logged_lyric_key {
-                            eprintln!("[歌词] {} - {}  ◀ 缓存", info.artist, info.title);
+                            let (lyric_label, art_label) = {
+                                let cached = lyrics_cache.read().await;
+                                match cached.peek_entry(&info.title, &info.artist) {
+                                    Some(e) => {
+                                        let l = match e.source {
+                                            LyricsSource::Local => "本地",
+                                            LyricsSource::Online => "在线",
+                                            LyricsSource::None => "无",
+                                        };
+                                        let a = if e.album_pic_url.starts_with("data:") {
+                                            "本地"
+                                        } else if !e.album_pic_url.is_empty() {
+                                            "在线"
+                                        } else {
+                                            "无"
+                                        };
+                                        (l, a)
+                                    }
+                                    None => ("无", "无"),
+                                }
+                            };
+                            eprintln!("[歌词] {} - {} | 歌词: {} | 封面: {} (缓存)",
+                                info.artist, info.title, lyric_label, art_label);
                             last_logged_lyric_key = song_key;
                         }
                     }
@@ -884,6 +1225,9 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                             info.qrc_data = entry.qrc_data.clone();
                             if !entry.album_pic_url.is_empty() {
                                 info.album_pic_url = entry.album_pic_url.clone();
+                            }
+                            if !entry.album_pic_hd_url.is_empty() {
+                                info.album_pic_hd_url = entry.album_pic_hd_url.clone();
                             }
                         }
                     }
@@ -909,6 +1253,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                         progress_percent: 0.0,
                         is_playing: false,
                         album_pic_url: String::new(),
+                        album_pic_hd_url: String::new(),
                         server_ts: 0,
                     }
                 }
@@ -932,6 +1277,7 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                     progress_percent: 0.0,
                     is_playing: false,
                     album_pic_url: String::new(),
+                    album_pic_hd_url: String::new(),
                     server_ts: 0,
                 }
             }
@@ -1000,8 +1346,15 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
         // Apply the user-configurable offset for fine-tuning.
         // 注意：playing 和 pause 都加 offset，避免 play→pause 切换瞬间 display 因
         // offset 消失而回退（~200ms），造成歌词行瞬间变灰再回正的闪烁。
+        // 例外：切歌后 timeline 归零窗口（total==0）内不套偏移——占位值保持 0，
+        // 否则前端插值基线从 200ms 起跑，timeline 就绪时被拉回真实位置
+        // （回跳近 500ms，叠加前端"淡出尾音"钉回逻辑 = 歌词开头疯狂闪烁）。
         let smtc_offset_ms = config.settings.smtc_offset_ms;
-        let adjusted = apply_signed_offset(current_song_info.current_time_ms, smtc_offset_ms);
+        let adjusted = if current_song_info.total_time_ms > 0 {
+            apply_signed_offset(current_song_info.current_time_ms, smtc_offset_ms)
+        } else {
+            current_song_info.current_time_ms
+        };
         let display_time_ms = if current_song_info.total_time_ms > 0 {
             adjusted.min(current_song_info.total_time_ms)
         } else {
@@ -1131,11 +1484,12 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
             tokio::time::sleep(Duration::from_secs(2)).await;
         } else {
             let elapsed = loop_start.elapsed();
-            let current_interval = if IS_BACKGROUND.load(Ordering::Relaxed) {
-                Duration::from_millis(2000)
-            } else {
-                Duration::from_millis(config.settings.update_interval_ms)
-            };
+            // 固定按 update_interval_ms 轮询，不再随窗口可见性降频。
+            // 本程序的核心职责是实时向外提供数据（WebSocket/HTTP/文件），
+            // 窗口最小化/隐藏时若把轮询降到 2s，所有消费方（如壁纸应用）
+            // 的歌词/进度更新会滞后 ~2s——而 SMTC 事件通知已让空闲期的
+            // 实际唤醒次数很低，降频省下的 CPU 与体验损失不成比例。
+            let current_interval = Duration::from_millis(config.settings.update_interval_ms);
             if elapsed < current_interval {
                 // 除周期 tick 外，SMTC 事件（暂停/恢复/seek/切歌）随时
                 // 唤醒主循环做下一轮，把状态切换延迟从轮询周期压到 ~10ms 级
@@ -1514,7 +1868,7 @@ async fn main() -> Result<()> {
 
     // 启动 Tauri 窗口
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![set_background_state, get_app_config, save_app_config, get_current_song_info, media_toggle_play_pause, media_next, media_previous])
+        .invoke_handler(tauri::generate_handler![get_app_config, save_app_config, get_current_song_info, media_toggle_play_pause, media_next, media_previous])
         .setup(move |app| {
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {

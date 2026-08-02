@@ -16,7 +16,7 @@ import {
 } from './state.js';
 import { parseTranslation } from '../lyrics/translation.js';
 import { buildLyricsArea, showLoadingPlaceholder } from '../lyrics/builder.js';
-import { setBgImage } from '../utils/dom.js';
+import { preloadAlbumArt, resetAlbumArt } from '../utils/dom.js';
 
 /** 切歌后已收到几次非切歌更新（用于延迟歌词构建直到进度稳定） */
 let postChangeCount = 0;
@@ -81,10 +81,8 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
         postChangeCount = 0;
         serverBehindCount = 0;
 
-        // 3) 清空旧专辑封面，避免上一首封面残留
-        setBgImage(els.albumArt, '');
-        setBgImage(els.albumBlurBg, '');
-        els.albumBlurBg.classList.remove('active');
+        // 3) 清空旧专辑封面，避免上一首封面残留（同时作废进行中的预加载）
+        resetAlbumArt(els);
 
         // 4) 重置歌词视口滚动位置：防止旧歌 translateY 残留导致新歌词闪现错位
         els.lyricsViewport.style.transform = '';
@@ -150,6 +148,15 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
             serverBehindCount = 0;
             setLastSampleProgress(rawTimeMs);
             setLastSampleLocalTime(performance.now());
+        } else if (totalMs <= 0) {
+            // 切歌后 timeline 归零窗口（新歌 timeline 尚未就绪）：
+            // 服务端 current_time 是占位值（归零+偏移，恒定不变）。
+            // 若按下方"淡出尾音/seek/死区"逻辑处理，会把插值基线反复
+            // 钉回占位值——歌词开头逐字高亮来回跳 = 疯狂闪烁。
+            // 这里让基线随本地时钟自然前进，timeline 就绪后由下方分支对齐。
+            serverBehindCount = 0;
+            setLastSampleProgress(localEstimate);
+            setLastSampleLocalTime(performance.now());
         } else if (Math.abs(rawTimeMs - localEstimate) > 1000) {
             // 大跳变（seek 或切歌后 timeline 更新）
             serverBehindCount = 0;
@@ -161,6 +168,8 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
             // 正常播放时后端每帧都在前进，「is_playing=true 且未补偿位置不变」
             // 只出现在尾音窗口——钉住显示并停止插值蠕升，冻结时刻
             // （play→pause snap）的回退量压到 ≈0。
+            // 注意：此分支仅当 totalMs > 0（timeline 就绪）时可达，
+            // 归零窗口已由上方 totalMs <= 0 分支接管。
             serverBehindCount = 0;
             setLastSampleProgress(serverPosMs);
             setLastSampleLocalTime(performance.now());
@@ -197,18 +206,15 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
     els.songArtist.textContent = data.artist || 'QQ音乐监听器';
     els.songAlbum.textContent = data.album || 'SMTC 模式';
 
-    // —— 专辑封面 ——
+    // —— 专辑封面（渐进式加载）——
+    // 本地/SMTC data URI 立即应用；在线 URL 预加载完成后再应用，期间保留
+    // 当前封面，消除 CDN 加载延迟造成的空白/闪烁。
+    // album_pic_hd_url：低清本地图(150x150)时携带 800x800 高清地址，
+    // 主图先即时显示，高清预加载完成后平滑升级。
     if (data.album_pic_url) {
-        setBgImage(els.albumArt, data.album_pic_url);
-        const newBg = `url("${data.album_pic_url}")`;
-        if (els.albumBlurBg.style.backgroundImage !== newBg) {
-            setBgImage(els.albumBlurBg, data.album_pic_url);
-        }
-        els.albumBlurBg.classList.add('active');
+        preloadAlbumArt(els, data.album_pic_url, data.album_pic_hd_url);
     } else if (!data.title || data.title === 'No music playing' || data.title === 'ERROR') {
-        setBgImage(els.albumArt, '');
-        setBgImage(els.albumBlurBg, '');
-        els.albumBlurBg.classList.remove('active');
+        resetAlbumArt(els);
     }
 
     // —— 播放状态动画 ——
@@ -219,20 +225,28 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
     }
 
     // —— 重建歌词 ——
-    // 切歌后后端会将 total_time_ms/current_time_ms 归零，直到 SMTC 报告
-    // 新歌的 timeline 才恢复非零值。只有 totalMs > 0 才表示 timeline 已就绪，
-    // 此时 rawTimeMs 也是真实的播放进度，用 t 构建歌词不会闪回。
-    // postChangeCount >= 20（约1秒）作为兜底，防止异常情况下永远不构建。
+    // buildLyricsArea 只按 qrc_data 构建纯 DOM，不依赖时间轴；
+    // 滚动/活跃行定位完全由渲染循环基于插值基线驱动，timeline 就绪后
+    // 会自动纠正。因此歌词数据一到达即可构建，无需等待 totalMs>0——
+    // 否则每次切歌都会先闪过"正在加载歌词"占位（后端切歌后会把
+    // timeline 归零直到 SMTC 报新歌数据）。
+    // LRC 兜底路径同理：歌词文本到达即可构建；数据尚未到达时保留
+    // postChangeCount 兜底（防止把"加载中"误判为"纯音乐"）。
     const qrcLength = data.qrc_data ? data.qrc_data.length : 0;
     const renderKey = `${data.title}|${data.artist}|${qrcLength}`;
     const needRebuild = renderKey !== lastRenderKey;
     if (!isSongChanged) {
         postChangeCount++;
-        if (qrcLength > 0 && needRebuild && (totalMs > 0 || postChangeCount >= 20)) {
+        if (qrcLength > 0 && needRebuild) {
             setLastRenderKey(renderKey);
             const newTransMap = parseTranslation(data.trans);
             setTransMap(newTransMap);
             const newLines = buildLyricsArea(els.lyricsViewport, data, newTransMap, cfg.showTranslation);
+            setLyricLines(newLines);
+            setLastActiveIdx(-1);
+        } else if (qrcLength === 0 && needRebuild && (data.lyrics || '').trim()) {
+            setLastRenderKey(renderKey);
+            const newLines = buildLyricsArea(els.lyricsViewport, data, [], cfg.showTranslation);
             setLyricLines(newLines);
             setLastActiveIdx(-1);
         } else if (qrcLength === 0 && postChangeCount === 20) {

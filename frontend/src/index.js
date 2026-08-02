@@ -15,7 +15,7 @@ import { $, bindElements } from './utils/dom.js';
 import { loadFrontendConfig } from './config/frontend-config.js';
 import { fetchBackendConfig, getDefaultBackendConfig } from './config/backend-config.js';
 import { connect, disconnect, updateConnectionUI, sendCommand } from './connection/ws.js';
-import { listenSongInfo, notifyBackgroundState, isTauri, mediaControl } from './connection/tauri-bridge.js';
+import { listenSongInfo, isTauri, mediaControl } from './connection/tauri-bridge.js';
 import {
     animFrame, songInfo, setAnimFrame, setLastSyncMs,
     setIsIntentionalClose
@@ -204,13 +204,7 @@ if (isTauri()) {
     });
 }
 
-// 4. 可见性监听：后台时通知后端降频
-document.addEventListener('visibilitychange', () => {
-    const isHidden = document.visibilityState === 'hidden';
-    notifyBackgroundState(isHidden);
-});
-
-// 5. 卸载时清理 WebSocket
+// 4. 卸载时清理 WebSocket
 window.addEventListener('beforeunload', () => {
     setIsIntentionalClose(true);
     disconnect();

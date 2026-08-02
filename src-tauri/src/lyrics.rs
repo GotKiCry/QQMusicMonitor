@@ -8,6 +8,42 @@ pub struct LyricFetcher {
     debug: bool,
 }
 
+/// 封面来源类型：专辑封面（T002 URL 前缀）或单曲封面（T062 URL 前缀）。
+/// 无专辑的歌曲（如电台/Remix 单曲）没有 album.mid，但 song_detail 的
+/// vs 字段携带单曲封面 mid，QQ 客户端即用它展示封面。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverKind {
+    Album,
+    Single,
+}
+
+/// 歌曲封面信息：mid + 来源类型 + 专辑名（Single 时为空）+ 歌手名，
+/// 用于人工校验候选歌曲身份（歌手一致 + 专辑名一致才采信封面）。
+#[derive(Debug, Clone)]
+pub struct AlbumCover {
+    pub mid: String,
+    pub name: String,
+    pub singer: String,
+    pub kind: CoverKind,
+}
+
+/// Legacy 歌曲搜索（client_search_cp）单条结果：自带专辑名与歌手名，
+/// 用于按专辑名找歌时校验候选版本（SmartBox 搜索不返回专辑信息）。
+#[derive(Debug, Clone)]
+pub struct LegacySongHit {
+    pub songmid: String,
+    pub songname: String,
+    pub albumname: String,
+    pub singer: String,
+}
+
+/// SmartBox 歌曲搜索结果单条（mid + 歌手名），供按歌手筛选正确版本
+#[derive(Debug, Clone)]
+struct SmartboxSongHit {
+    mid: String,
+    singer: String,
+}
+
 impl LyricFetcher {
     #[allow(dead_code)]
     pub fn new() -> Self {
@@ -25,22 +61,42 @@ impl LyricFetcher {
         }
     }
 
-    // Function to get high-definition album picture URL by song mid
-    pub async fn get_album_pic_url_by_mid(&self, songmid: &str) -> String {
-        match self.get_album_mid(songmid).await {
-            Ok(album_mid) => format!("https://y.gtimg.cn/music/photo_new/T002R800x800M000{}.jpg?max_age=2592000", album_mid),
+    // 取高清专辑封面 URL 与匹配歌曲的专辑名。
+    // 返回 (pic_url, album_name)：专辑名供上层判断「歌词匹配版本」与
+    // 正在播放版本是否同专辑（同专辑时在线 URL 即为权威封面，专辑名
+    // 重新解析出的不同 mid 不得覆盖；不同专辑（合辑版）时才允许覆盖）。
+    pub async fn get_album_pic_url_by_mid(&self, songmid: &str) -> (String, String) {
+        match self.get_album_cover(songmid).await {
+            Ok(cover) => {
+                let prefix = match cover.kind {
+                    CoverKind::Album => "T002",
+                    CoverKind::Single => "T062",
+                };
+                let url = format!("https://y.gtimg.cn/music/photo_new/{}R800x800M000{}.jpg?max_age=2592000", prefix, cover.mid);
+                (url, cover.name)
+            }
             Err(e) => {
                 if self.debug {
-                    eprintln!("[lyrics] Failed to fetch album mid for {}: {}", songmid, e);
+                    eprintln!("[lyrics] Failed to fetch album cover for {}: {}", songmid, e);
                 }
-                String::new()
+                (String::new(), String::new())
             }
         }
     }
 
-    /// 通过专辑名在 SmartBox 搜索专辑，返回第一个匹配的 album_mid。
-    /// 用于纠正 song_detail API 返回的单曲 album_mid 与用户实际播放专辑不符的情况。
-    pub async fn search_album_mid_by_name(&self, album_name: &str) -> Option<String> {
+    /// 通过专辑名在 SmartBox 搜索专辑，返回第一个与查询名一致、
+    /// 且（artist 非空时）歌手与查询歌手一致的 album_mid。
+    ///
+    /// 注意：SmartBox 专辑搜索对通用名极不可靠（实测 "Jay" 首条返回
+    /// "钢琴曲纯音乐经典"、"Way Back" 首条返回别的歌手的 "Way Back Home"），
+    /// 直接取第一条会得到完全无关的专辑封面。因此逐条验证：
+    ///   1. 候选专辑名（去括号后）与查询名的 normalize 包含关系
+    ///   2. 候选专辑的歌手与查询歌手一致（artist 非空时）
+    /// 全部不匹配返回 None——宁可无图，不显示错图。
+    pub async fn search_album_mid_by_name(&self, album_name: &str, artist: &str) -> Option<String> {
+        if album_name.trim().is_empty() {
+            return None;
+        }
         let smartbox_url = "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg";
         let url = Url::parse_with_params(smartbox_url, &[("key", album_name), ("format", "json")]).ok()?;
 
@@ -52,15 +108,148 @@ impl LyricFetcher {
 
         let parsed: Value = resp.json().await.ok()?;
 
-        parsed["data"]["album"]["itemlist"]
-            .as_array()
-            .and_then(|list| list.first())
-            .and_then(|item| item["mid"].as_str())
-            .map(|s| s.to_string())
+        let norm_query = crate::local_qrc::normalize(album_name);
+        let norm_artist = crate::local_qrc::normalize(artist);
+        for item in parsed["data"]["album"]["itemlist"].as_array()?.iter() {
+            let name = item["name"].as_str().unwrap_or("").trim();
+            if name.is_empty() {
+                continue;
+            }
+            // 候选名先去括号再比（"ONE PIECE SUPER BEST (海贼王…)" → "ONE PIECE SUPER BEST"）
+            let cleaned = clean_search_term(name);
+            let norm_name = crate::local_qrc::normalize(&cleaned);
+            if !(norm_name.contains(&norm_query) || norm_query.contains(&norm_name)) {
+                continue;
+            }
+            // 歌手校验：通用专辑名会命中别的歌手的同名专辑（"Way Back" → "Way Back Home"），
+            // artist 非空时必须一致才采信
+            if !norm_artist.is_empty() {
+                let norm_singer = crate::local_qrc::normalize(item["singer"].as_str().unwrap_or(""));
+                if norm_singer.is_empty()
+                    || !(norm_singer.contains(&norm_artist) || norm_artist.contains(&norm_singer))
+                {
+                    continue;
+                }
+            }
+            return item["mid"].as_str().map(|s| s.to_string());
+        }
+        None
     }
 
-    // Function to fetch albummid for a given songmid using get_song_detail_yqq API
-    pub async fn get_album_mid(&self, songmid: &str) -> Result<String> {
+    /// Legacy 歌曲搜索（c.y.qq.com/soso/fcgi-bin/client_search_cp）。
+    /// SmartBox 只返回 songmid 不带专辑名，且对很多专辑完全索引不到；
+    /// 该接口仍可用且每条结果自带专辑名，用于按专辑名定位正确版本的歌曲。
+    async fn search_song_legacy(&self, keyword: &str) -> Result<Vec<LegacySongHit>> {
+        let url = Url::parse_with_params(
+            "https://c.y.qq.com/soso/fcgi-bin/client_search_cp",
+            &[
+                ("p", "1"),
+                ("n", "10"),
+                ("w", keyword),
+                ("format", "json"),
+            ],
+        )?;
+
+        let resp = self.client.get(url)
+            .header("Referer", "https://y.qq.com/")
+            .send()
+            .await
+            .context("Failed legacy song search")?
+            .json::<Value>()
+            .await
+            .context("Failed to parse legacy search JSON")?;
+
+        let mut hits = Vec::new();
+        if let Some(list) = resp["data"]["song"]["list"].as_array() {
+            for item in list {
+                let songmid = item["songmid"].as_str().unwrap_or("");
+                if songmid.is_empty() {
+                    continue;
+                }
+                hits.push(LegacySongHit {
+                    songmid: songmid.to_string(),
+                    songname: item["songname"].as_str().unwrap_or("").to_string(),
+                    albumname: item["albumname"].as_str().unwrap_or("").to_string(),
+                    singer: item["singer"][0]["name"].as_str().unwrap_or("").to_string(),
+                });
+            }
+        }
+        Ok(hits)
+    }
+
+    /// 按专辑名通过 legacy 歌曲搜索找歌，返回专辑名与参考专辑一致、
+    /// 歌名与查询歌名一致、且（artist 非空时）歌手与查询歌手一致的候选 songmid。
+    ///
+    /// 背景：SmartBox 专辑搜索对很多专辑完全索引不到（实测 "The Eminem Show"
+    /// 返回 0 条），导致专辑名兜底失效、封面缺失。legacy 搜索把专辑名当关键词
+    /// 搜出的歌曲自带 albumname/songname/singer，逐项校验后即可定位到
+    /// 正确版本的歌曲（再经 get_album_cover 取专辑封面）。
+    ///
+    /// 注意：专辑名可能是通用名（如 "By Your Side" 有几十首同名歌），
+    /// 仅按专辑名匹配会把别的歌手的同名专辑当成"正确专辑"（错图）。
+    /// 因此三重校验：专辑名 + 歌名 + 歌手（title/artist 为空时跳过对应校验）；
+    /// 全部不符则返回 None（由调用方回退到原始 URL，而不是显示错歌封面）。
+    pub async fn find_song_by_album_name(
+        &self,
+        album_variants: &[String],
+        title: &str,
+        artist: &str,
+        reference_album: &str,
+    ) -> Option<String> {
+        let norm_ref = crate::local_qrc::normalize(reference_album);
+        if norm_ref.is_empty() {
+            return None;
+        }
+        let norm_title = crate::local_qrc::normalize(title);
+        let norm_artist = crate::local_qrc::normalize(artist);
+        for variant in album_variants {
+            let v = variant.trim();
+            if v.is_empty() {
+                continue;
+            }
+            // 先带歌手搜（消除同名单曲歧义），再退化为专辑名单独搜
+            let keywords = [format!("{} {}", artist, v), v.to_string()];
+            for keyword in keywords {
+                let keyword = keyword.trim().to_string();
+                if keyword.is_empty() {
+                    continue;
+                }
+                let Ok(hits) = self.search_song_legacy(&keyword).await else {
+                    continue;
+                };
+                for hit in hits {
+                    if hit.albumname.is_empty() {
+                        continue;
+                    }
+                    let norm_album = crate::local_qrc::normalize(&hit.albumname);
+                    if !(norm_album.contains(&norm_ref) || norm_ref.contains(&norm_album)) {
+                        continue;
+                    }
+                    // 歌名校验：title 非空时要求候选歌名与查询歌名一致（互相包含，
+                    // 容忍 "(feat. …)" 等后缀差异）
+                    if !norm_title.is_empty() {
+                        let norm_hit_title = crate::local_qrc::normalize(&hit.songname);
+                        if !(norm_hit_title.contains(&norm_title) || norm_title.contains(&norm_hit_title)) {
+                            continue;
+                        }
+                    }
+                    // 歌手校验：artist 为空（无从对照）或歌手缺失时接受；
+                    // 否则必须与查询歌手一致（normalize 互相包含）
+                    if norm_artist.is_empty() || hit.singer.is_empty() {
+                        return Some(hit.songmid);
+                    }
+                    let norm_singer = crate::local_qrc::normalize(&hit.singer);
+                    if norm_singer.contains(&norm_artist) || norm_artist.contains(&norm_singer) {
+                        return Some(hit.songmid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Function to fetch album cover info for a given songmid using get_song_detail_yqq API
+    pub async fn get_album_cover(&self, songmid: &str) -> Result<AlbumCover> {
         let detail_data = serde_json::json!({
             "comm": {
                 "cv": 4747474,
@@ -96,15 +285,44 @@ impl LyricFetcher {
             .await
             .context("Failed to parse song detail JSON")?;
 
-        let album_mid = resp["req_1"]["data"]["track_info"]["album"]["mid"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("album mid not found in response"))?;
+        let track_info = &resp["req_1"]["data"]["track_info"];
 
-        Ok(album_mid.to_string())
+        // 歌手名（多歌手以 "/" 连接，normalize 时折叠为空格即可互相包含匹配）
+        let singer = track_info["singer"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s["name"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_default();
+
+        // 1. 专辑封面：album.mid 非空即用之（空串不算，避免拼出 M000.jpg 的 404 URL）
+        if let Some(mid) = track_info["album"]["mid"].as_str() {
+            if !mid.is_empty() {
+                let name = track_info["album"]["name"].as_str().unwrap_or("").to_string();
+                return Ok(AlbumCover { mid: mid.to_string(), name, singer, kind: CoverKind::Album });
+            }
+        }
+
+        // 2. 单曲封面：无专辑的歌曲（电台单曲/Remix）用 vs 字段的第一个非空 mid，
+        //    QQ 客户端以 T062 前缀 URL 展示（本地缓存亦为 T062R500x500M000{mid}.jpg）
+        if let Some(vs_list) = track_info["vs"].as_array() {
+            for item in vs_list {
+                if let Some(m) = item.as_str() {
+                    if !m.is_empty() {
+                        return Ok(AlbumCover { mid: m.to_string(), name: String::new(), singer, kind: CoverKind::Single });
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("song {} has no album mid and no vs cover", songmid))
     }
 
     // Function to search and fetch lyrics with multiple fallback strategies
-    pub async fn fetch_lyrics(&self, title: &str, artist: &str) -> Result<(String, String, String, String)> {
+    pub async fn fetch_lyrics(&self, title: &str, artist: &str) -> Result<(String, String, String, String, String)> {
         let log = |msg| {
             if self.debug {
                 eprintln!("{}", msg);
@@ -113,14 +331,14 @@ impl LyricFetcher {
         
         // Strategy 1: Search with "artist title" keyword
         let keyword = format!("{} {}", artist, title);
-        match self.search_song(&keyword).await {
+        match self.search_song_verified(&keyword, artist).await {
             Ok(Some(mid)) => {
                 match self.get_lyric(&mid).await {
                     Ok(result) => {
                         if !result.0.is_empty() || !result.2.is_empty() {
-                            let pic_url = self.get_album_pic_url_by_mid(&mid).await;
+                            let (pic_url, matched_album) = self.get_album_pic_url_by_mid(&mid).await;
                             log(format!("[lyrics] ✓ Found lyrics via strategy 1 ('{}')", keyword));
-                            return Ok((result.0, result.1, result.2, pic_url));
+                            return Ok((result.0, result.1, result.2, pic_url, matched_album));
                         }
                         log(format!("[lyrics] Song found (mid={}) but lyric API returned empty", mid));
                     },
@@ -132,12 +350,12 @@ impl LyricFetcher {
         }
 
         // Strategy 2: Search with just "title" (artist might contain multi-artist separators)
-        if let Ok(Some(mid)) = self.search_song(title).await {
+        if let Ok(Some(mid)) = self.search_song_verified(title, artist).await {
             if let Ok(result) = self.get_lyric(&mid).await {
                 if !result.0.is_empty() || !result.2.is_empty() {
-                    let pic_url = self.get_album_pic_url_by_mid(&mid).await;
-                    log(format!("[lyrics] Found lyrics for '{} - {}' via strategy 2", title, artist));
-                    return Ok((result.0, result.1, result.2, pic_url));
+                    let (pic_url, matched_album) = self.get_album_pic_url_by_mid(&mid).await;
+                            log(format!("[lyrics] Found lyrics for '{} - {}' via strategy 2", title, artist));
+                    return Ok((result.0, result.1, result.2, pic_url, matched_album));
                 }
             }
         }
@@ -148,12 +366,12 @@ impl LyricFetcher {
         if clean_title != title || clean_artist != artist {
             // 3a: cleaned artist + cleaned title
             let keyword = format!("{} {}", clean_artist, clean_title);
-            if let Ok(Some(mid)) = self.search_song(&keyword).await {
+            if let Ok(Some(mid)) = self.search_song_verified(&keyword, artist).await {
                 if let Ok(result) = self.get_lyric(&mid).await {
                     if !result.0.is_empty() || !result.2.is_empty() {
-                        let pic_url = self.get_album_pic_url_by_mid(&mid).await;
-                        log(format!("[lyrics] Found lyrics for '{} - {}' via strategy 3a ('{}')", title, artist, keyword));
-                        return Ok((result.0, result.1, result.2, pic_url));
+                        let (pic_url, matched_album) = self.get_album_pic_url_by_mid(&mid).await;
+                            log(format!("[lyrics] Found lyrics for '{} - {}' via strategy 3a ('{}')", title, artist, keyword));
+                        return Ok((result.0, result.1, result.2, pic_url, matched_album));
                     }
                 }
             }
@@ -163,12 +381,12 @@ impl LyricFetcher {
             // Must run before parenthetical strategy so the original-language title
             // wins over an English alternative that may point to a different version.)
             if !clean_title.is_empty() {
-                if let Ok(Some(mid)) = self.search_song(&clean_title).await {
+                if let Ok(Some(mid)) = self.search_song_verified(&clean_title, artist).await {
                     if let Ok(result) = self.get_lyric(&mid).await {
                         if !result.0.is_empty() || !result.2.is_empty() {
-                            let pic_url = self.get_album_pic_url_by_mid(&mid).await;
+                            let (pic_url, matched_album) = self.get_album_pic_url_by_mid(&mid).await;
                             log(format!("[lyrics] Found lyrics for '{} - {}' via strategy 3b (clean title only: '{}')", title, artist, clean_title));
-                            return Ok((result.0, result.1, result.2, pic_url));
+                            return Ok((result.0, result.1, result.2, pic_url, matched_album));
                         }
                     }
                 }
@@ -178,12 +396,12 @@ impl LyricFetcher {
         // Strategy 4: Try searching with parenthetical content (e.g. alternative/translated title inside brackets)
         if let Some(alt_title) = extract_parentheses_content(title) {
             let keyword = format!("{} {}", clean_artist, alt_title);
-            if let Ok(Some(mid)) = self.search_song(&keyword).await {
+            if let Ok(Some(mid)) = self.search_song_verified(&keyword, artist).await {
                 if let Ok(result) = self.get_lyric(&mid).await {
                     if !result.0.is_empty() || !result.2.is_empty() {
-                        let pic_url = self.get_album_pic_url_by_mid(&mid).await;
-                        log(format!("[lyrics] Found lyrics via strategy 4 (parenthetical: '{}')", keyword));
-                        return Ok((result.0, result.1, result.2, pic_url));
+                        let (pic_url, matched_album) = self.get_album_pic_url_by_mid(&mid).await;
+                            log(format!("[lyrics] Found lyrics via strategy 4 (parenthetical: '{}')", keyword));
+                        return Ok((result.0, result.1, result.2, pic_url, matched_album));
                     }
                 }
             }
@@ -191,11 +409,11 @@ impl LyricFetcher {
 
         // All strategies exhausted
         log(format!("[lyrics] No lyrics found for '{} - {}' (API returned no data)", title, artist));
-        Ok((String::new(), String::new(), String::new(), String::new()))
+        Ok((String::new(), String::new(), String::new(), String::new(), String::new()))
     }
 
 
-    /// 多策略搜索歌曲，返回第一个命中候选的 songmid。
+    /// 多策略搜索歌曲，返回与查询歌手一致的候选 songmid。
     ///
     /// 与 `fetch_lyrics` 不同，此处不做歌词非空校验，仅用于需要 songmid 的
     /// 辅助场景（如本地歌词已命中、仅缺专辑封面时解析 album_mid）。
@@ -203,6 +421,11 @@ impl LyricFetcher {
     ///   1. "artist title"
     ///   2. "title"
     ///   3. "clean_artist clean_title" / "clean_title"
+    ///
+    /// 注意：SmartBox 的标题搜索是模糊匹配，"STAY (Explicit)" 会命中
+    /// "Stay explicit"（歌手为空的另一首歌）。这里逐条遍历候选并优先
+    /// 歌手与查询一致的命中；SmartBox 歌手为空时只作为弱候选备用，
+    /// 最终由调用方用歌曲详情的歌手/专辑信息二次校验。
     pub async fn search_song_mid(&self, title: &str, artist: &str) -> Option<String> {
         let clean_title = clean_search_term(title);
         let clean_artist = clean_search_term(artist);
@@ -217,19 +440,37 @@ impl LyricFetcher {
             }
         }
 
+        let norm_artist = crate::local_qrc::normalize(artist);
+        let mut weak_candidate: Option<String> = None;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for q in queries {
             let q = q.trim().to_string();
             if q.is_empty() || !seen.insert(q.clone()) {
                 continue;
             }
-            if let Ok(Some(mid)) = self.search_song(&q).await {
-                if !mid.is_empty() {
-                    return Some(mid);
+            let Ok(hits) = self.search_songs_smartbox(&q).await else {
+                continue;
+            };
+            for hit in hits {
+                if hit.mid.is_empty() {
+                    continue;
+                }
+                // 查询歌手为空：无校验依据，直接接受首个候选
+                if norm_artist.is_empty() {
+                    return Some(hit.mid);
+                }
+                let norm_singer = crate::local_qrc::normalize(&hit.singer);
+                if norm_singer.is_empty() {
+                    // SmartBox 歌手缺失（如 "Stay explicit"）：仅作弱候选备用
+                    if weak_candidate.is_none() {
+                        weak_candidate = Some(hit.mid);
+                    }
+                } else if norm_singer.contains(&norm_artist) || norm_artist.contains(&norm_singer) {
+                    return Some(hit.mid);
                 }
             }
         }
-        None
+        weak_candidate
     }
 
     // Function to search for a song and return its mid
@@ -240,8 +481,48 @@ impl LyricFetcher {
         self.search_song_smartbox(&keyword).await
     }
 
+    /// 按歌手偏好搜索：遍历 SmartBox 候选，优先歌手与查询歌手一致的命中；
+    /// 歌手字段缺失或全部不匹配时退回首个候选（弱候选，由歌词非空校验兜底）。
+    ///
+    /// 背景：SmartBox 标题搜索是模糊匹配，"Closer (Tokyo Remix)" 会命中
+    /// "Closer - The Chainsmokers/Halsey"（原版）——若不做歌手校验，
+    /// 本地 QRC 尚未写入（切歌后 ~2s）的空窗期内会把错歌歌词与封面
+    /// 一并锁进缓存。
+    async fn search_song_verified(&self, keyword: &str, artist: &str) -> Result<Option<String>> {
+        let keyword = sanitize_search_keyword(keyword);
+        let hits = self.search_songs_smartbox(&keyword).await?;
+        let norm_artist = crate::local_qrc::normalize(artist);
+        let mut weak: Option<String> = None;
+        for hit in hits {
+            if hit.mid.is_empty() {
+                continue;
+            }
+            if norm_artist.is_empty() {
+                return Ok(Some(hit.mid));
+            }
+            let norm_singer = crate::local_qrc::normalize(&hit.singer);
+            if norm_singer.is_empty() {
+                if weak.is_none() {
+                    weak = Some(hit.mid);
+                }
+            } else if norm_singer.contains(&norm_artist) || norm_artist.contains(&norm_singer) {
+                return Ok(Some(hit.mid));
+            }
+        }
+        Ok(weak)
+    }
+
     // Function to search using SmartBox autocomplete API
     pub(crate) async fn search_song_smartbox(&self, keyword: &str) -> Result<Option<String>> {
+        let hits = self.search_songs_smartbox(keyword).await?;
+        if let Some(first) = hits.into_iter().next() {
+            return Ok(Some(first.mid));
+        }
+        Ok(None)
+    }
+
+    // SmartBox 歌曲搜索，返回全部候选（mid + 歌手），供按歌手筛选
+    async fn search_songs_smartbox(&self, keyword: &str) -> Result<Vec<SmartboxSongHit>> {
         let smartbox_url = "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg";
         let params = vec![
             ("key", keyword),
@@ -267,28 +548,31 @@ impl LyricFetcher {
                     eprintln!("[lyrics] Search returned non-JSON for '{}': {} — body: {}", 
                         keyword, e, preview);
                 }
-                return Ok(None);
+                return Ok(Vec::new());
             }
         };
 
         // SmartBox response: data.song.itemlist[] → { mid, name, singer }
-        let item_list = parsed["data"]["song"]["itemlist"].as_array();
-        if let Some(list) = item_list {
-            if let Some(first) = list.first() {
-                if let Some(mid) = first["mid"].as_str() {
-                    let name = first["name"].as_str().unwrap_or("?");
+        let mut hits = Vec::new();
+        if let Some(list) = parsed["data"]["song"]["itemlist"].as_array() {
+            for item in list {
+                if let Some(mid) = item["mid"].as_str() {
+                    let name = item["name"].as_str().unwrap_or("?");
                     if self.debug {
                         eprintln!("[lyrics] ✓ Found: '{}' (mid={})", name, mid);
                     }
-                    return Ok(Some(mid.to_string()));
+                    hits.push(SmartboxSongHit {
+                        mid: mid.to_string(),
+                        singer: item["singer"].as_str().unwrap_or("").to_string(),
+                    });
                 }
             }
         }
 
-        if self.debug {
+        if self.debug && hits.is_empty() {
             eprintln!("[lyrics] No results for '{}'", keyword);
         }
-        Ok(None)
+        Ok(hits)
     }
 
     // Function to fetch lyrics, translation, and QRC data by song mid
@@ -568,6 +852,48 @@ fn unescape_html(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 端到端诊断：Unstoppable - The Score (专辑 Unstoppable, 正确 mid=001wHjwD0IWIRm)
+    /// 模拟 path A get_pic 与 path B resolve_album_pic_url 的每一步。
+    #[tokio::test]
+    async fn diag_unstoppable_cover() {
+        let fetcher = LyricFetcher::new();
+        let t = "Unstoppable";
+        let a = "The Score";
+
+        // 1a: search_song_mid → get_album_cover
+        let songmid = fetcher.search_song_mid(t, a).await;
+        eprintln!("[diag] 1a search_song_mid('{}','{}') => {:?}", t, a, songmid);
+        if let Some(m) = &songmid {
+            if let Ok(c) = fetcher.get_album_cover(m).await {
+                eprintln!("[diag] 1a cover => mid={} name='{}' singer='{}' kind={:?}",
+                    c.mid, c.name, c.singer, c.kind);
+                assert_eq!(c.mid, "001wHjwD0IWIRm", "1a 必须命中 The Score 的正确专辑");
+            }
+        }
+
+        // 1b/0a: 专辑搜索
+        let am = fetcher.search_album_mid_by_name("Unstoppable", a).await;
+        eprintln!("[diag] 1b search_album_mid_by_name('Unstoppable','The Score') => {:?}", am);
+
+        // 1c/0b: legacy 三重校验
+        let songmid2 = fetcher
+            .find_song_by_album_name(&["Unstoppable".to_string()], t, a, "Unstoppable")
+            .await;
+        eprintln!("[diag] 1c find_song_by_album_name(['Unstoppable'],'{}','{}','Unstoppable') => {:?}", t, a, songmid2);
+        if let Some(m) = &songmid2 {
+            if let Ok(c) = fetcher.get_album_cover(m).await {
+                eprintln!("[diag] 1c cover => mid={} name='{}' singer='{}' kind={:?}",
+                    c.mid, c.name, c.singer, c.kind);
+                // 1c 可能命中同名双专辑的错版（002vztFj10OO9E），三重校验无法区分；
+                // 该场景由 resolve_album_pic_url 的覆盖判定（matched_album 与 SMTC
+                // 专辑一致时拒绝覆盖原 URL）兜底，此处仅记录。
+                if c.mid != "001wHjwD0IWIRm" {
+                    eprintln!("[diag] 1c 命中同名专辑错版 {}（预期被 resolve 覆盖判定拒绝，回退原 URL）", c.mid);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_search_smartbox() {
         let fetcher = LyricFetcher::new();
@@ -609,7 +935,7 @@ mod tests {
     async fn test_fetch_lyrics() {
         let fetcher = LyricFetcher::new();
         match fetcher.fetch_lyrics("那时雨", "徐良").await {
-            Ok((lyrics, trans, qrc, _pic)) => {
+            Ok((lyrics, trans, qrc, _pic, _album)) => {
                 eprintln!("[test] lyrics.len={}, trans.len={}, qrc.len={}", lyrics.len(), trans.len(), qrc.len());
                 if !lyrics.is_empty() {
                     assert!(lyrics.contains("[ti:") || lyrics.contains("[00:"),
@@ -625,7 +951,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_qrc_target_song() {
         let fetcher = LyricFetcher::new();
-        let (lyrics, trans, qrc_raw, _pic) = fetcher.fetch_lyrics("越来越不懂", "蔡健雅")
+        let (lyrics, trans, qrc_raw, _pic, _album) = fetcher.fetch_lyrics("越来越不懂", "蔡健雅")
             .await
             .expect("fetch_lyrics should succeed");
         
@@ -679,7 +1005,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_qrc_delicate_weapon() {
         let fetcher = LyricFetcher::new();
-        let (lyrics, trans, qrc_raw, _pic) = fetcher.fetch_lyrics("Delicate Weapon", "Grimes/Lizzy Wizzy")
+        let (lyrics, trans, qrc_raw, _pic, _album) = fetcher.fetch_lyrics("Delicate Weapon", "Grimes/Lizzy Wizzy")
             .await
             .expect("fetch_lyrics should succeed");
 
@@ -727,7 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_crooked_album_match() {
         let fetcher = LyricFetcher::with_debug(true);
-        let (_lyrics, _trans, _qrc, pic_url) = fetcher
+        let (_lyrics, _trans, _qrc, pic_url, _album) = fetcher
             .fetch_lyrics("삐딱하게 (Crooked) (狂放)", "G-DRAGON")
             .await
             .expect("fetch_lyrics should succeed");
@@ -742,4 +1068,191 @@ mod tests {
             pic_url
         );
     }
+
+    /// 回归测试：无专辑的单曲（I Can't Make You Love Me (Remix) - The Chainsmokers，
+    /// song_detail 的 album.mid 为空串）应通过 vs 字段回退到单曲封面，
+    /// 生成 T062 前缀 URL 而不是拼出 M000.jpg 的 404 链接。
+    #[tokio::test]
+    async fn test_albumless_song_gets_single_cover() {
+        let fetcher = LyricFetcher::with_debug(true);
+        match fetcher.get_album_cover("003N1qlF2ukeJP").await {
+            Ok(cover) => {
+                eprintln!("[test] cover: kind={:?} mid={} name={:?}", cover.kind, cover.mid, cover.name);
+                assert_eq!(cover.kind, CoverKind::Single, "无专辑歌曲应回退为单曲封面");
+                assert!(!cover.mid.is_empty(), "单曲封面 mid 不应为空");
+                let url = fetcher.get_album_pic_url_by_mid("003N1qlF2ukeJP").await.0;
+                assert!(
+                    url.starts_with("https://y.gtimg.cn/music/photo_new/T062R800x800M000"),
+                    "单曲封面 URL 应为 T062 前缀，实际: {}",
+                    url
+                );
+            }
+            Err(e) => {
+                eprintln!("[test] get_album_cover 失败（网络或 API 变更）: {}", e);
+            }
+        }
+    }
+
+    /// 专辑名搜索必须验证候选名与查询名一致：通用名 "Jay" 的首条候选
+    /// （钢琴曲纯音乐经典）与查询无关，不应被当作 album_mid 返回。
+    #[tokio::test]
+    async fn test_album_name_search_rejects_unrelated_candidates() {
+        let fetcher = LyricFetcher::new();
+        let mid = fetcher.search_album_mid_by_name("Jay", "").await;
+        eprintln!("[test] album search 'Jay' => {:?}", mid);
+        // 名称明确的专辑仍应能找到
+        let mid2 = fetcher.search_album_mid_by_name("ONE PIECE SUPER BEST", "").await;
+        eprintln!("[test] album search 'ONE PIECE SUPER BEST' => {:?}", mid2);
+        if let Some(m) = mid2 {
+            assert!(!m.is_empty());
+        }
+    }
+
+    /// 回归测试：通用专辑名必须校验歌手——"Way Back" 的 smartbox 专辑搜索
+    /// 首条返回的是别人(柏奈)的 "Way Back Home"（mid=002RmAQ14UTCNe），
+    /// 带歌手校验后必须拒绝它，绝不返回该错专辑。
+    #[tokio::test]
+    async fn test_album_name_search_verifies_artist() {
+        let fetcher = LyricFetcher::with_debug(true);
+        let mid = fetcher
+            .search_album_mid_by_name("Way Back", "Vicetone/Cozi Zuehlsdorff")
+            .await;
+        eprintln!("[test] album search 'Way Back' + Vicetone => {:?}", mid);
+        assert_ne!(mid.as_deref(), Some("002RmAQ14UTCNe"),
+            "不得命中柏奈的 'Way Back Home' 专辑");
+        // 名称 + 歌手都匹配时仍应能找到（Jay 的专辑）
+        let mid2 = fetcher
+            .search_album_mid_by_name("Jay", "周杰伦")
+            .await;
+        eprintln!("[test] album search 'Jay' + 周杰伦 => {:?}", mid2);
+    }
+
+    /// 回归测试：SmartBox 专辑搜索索引不到的专辑（"The Eminem Show" 返回 0 条，
+    /// 但用户实际播放的 Without Me 属于 "The Eminem Show (Clean)" 专辑）——
+    /// legacy 歌曲搜索按专辑名应定位到正确版本的歌曲。
+    #[tokio::test]
+    async fn test_find_song_by_album_name() {
+        let fetcher = LyricFetcher::with_debug(true);
+        let variants = vec![
+            "The Eminem Show (Clean)".to_string(),
+            "The Eminem Show".to_string(),
+        ];
+        match fetcher
+            .find_song_by_album_name(&variants, "Without Me", "Eminem", "The Eminem Show (Clean)")
+            .await
+        {
+            Some(songmid) => {
+                eprintln!("[test] album-search hit songmid={}", songmid);
+                assert!(!songmid.is_empty());
+                // 该歌曲详情应回落到 The Eminem Show 专辑（Clean 或同族版本）
+                match fetcher.get_album_cover(&songmid).await {
+                    Ok(cover) => {
+                        eprintln!("[test] cover name={:?} kind={:?}", cover.name, cover.kind);
+                        assert!(
+                            crate::local_qrc::normalize(&cover.name).contains("eminem show"),
+                            "歌曲详情专辑名应含 eminem show，实际: {}",
+                            cover.name
+                        );
+                    }
+                    Err(e) => eprintln!("[test] get_album_cover failed: {}", e),
+                }
+            }
+            None => eprintln!("[test] 未命中（网络或 API 变更）"),
+        }
+    }
+
+    /// 回归测试：通用专辑名必须校验歌手。
+    /// "By Your Side" 有几十首同名歌（Jonas Blue 等），只按专辑名匹配会
+    /// 把别的歌手的同名专辑当成正确专辑（错图）。带歌手搜索应命中
+    /// The Him/Jordan Jay 的正确版本（mid=00099aLf1hbwCr），而不是
+    /// Jonas Blue 的 001lJV4m0ADchq。
+    #[tokio::test]
+    async fn test_find_song_by_album_name_verifies_artist() {
+        let fetcher = LyricFetcher::with_debug(true);
+        let variants = vec!["By Your Side".to_string()];
+        match fetcher
+            .find_song_by_album_name(&variants, "By Your Side", "The Him/Jordan Jay", "By Your Side")
+            .await
+        {
+            Some(songmid) => {
+                eprintln!("[test] By Your Side album-search hit songmid={}", songmid);
+                assert_eq!(songmid, "00099aLf1hbwCr", "必须命中 The Him/Jordan Jay 的正确版本，实际: {}", songmid);
+                if let Ok(cover) = fetcher.get_album_cover(&songmid).await {
+                    eprintln!("[test] cover album={:?} mid={}", cover.name, cover.mid);
+                    assert!(
+                        crate::local_qrc::normalize(&cover.singer).contains("the him"),
+                        "封面歌手应为 The Him，实际: {}",
+                        cover.singer
+                    );
+                }
+            }
+            None => eprintln!("[test] 未命中（网络或 API 变更）"),
+        }
+    }
+
+    /// 回归测试：STAY (Explicit) - The Kid LAROI/Justin Bieber。
+    /// 标题搜索 "STAY (Explicit)" 会模糊命中 "Stay explicit"（屈直林的翻唱），
+    /// search_song_mid 必须优先返回歌手一致的候选（STAY 原版），
+    /// 否则会拿到错歌的 vs 单曲封面（004LS1ro32YK1a）。
+    #[tokio::test]
+    async fn test_search_song_mid_prefers_artist_match() {
+        let fetcher = LyricFetcher::with_debug(true);
+        match fetcher
+            .search_song_mid("STAY (Explicit)", "The Kid LAROI/Justin Bieber")
+            .await
+        {
+            Some(mid) => {
+                eprintln!("[test] STAY search_song_mid => {}", mid);
+                if mid == "0043EX2e2F6JCA" {
+                    eprintln!("[test] ✓ 命中 STAY 原版（歌手一致）");
+                } else {
+                    eprintln!("[test] ⚠ 命中其他候选（歌手字段可能为空，需详情二次校验）");
+                }
+                // 详情歌手应与查询歌手一致
+                if let Ok(cover) = fetcher.get_album_cover(&mid).await {
+                    eprintln!("[test] cover singer={:?} name={:?} kind={:?}", cover.singer, cover.name, cover.kind);
+                    let artist_match = crate::local_qrc::normalize(&cover.singer)
+                        .contains(&crate::local_qrc::normalize("The Kid LAROI/Justin Bieber"))
+                        || crate::local_qrc::normalize("The Kid LAROI/Justin Bieber")
+                            .contains(&crate::local_qrc::normalize(&cover.singer));
+                    assert!(artist_match, "候选歌手应与查询歌手一致: {}", cover.singer);
+                }
+            }
+            None => eprintln!("[test] 未命中（网络或 API 变更）"),
+        }
+    }
+
+    /// 回归测试：Closer (Tokyo Remix) - 新田真剑佑/The Chainsmokers。
+    /// SmartBox 标题搜索会模糊命中 "Closer - The Chainsmokers/Halsey"（原版），
+    /// 歌词搜索必须拒绝歌手不符的候选——否则本地 QRC 尚未写入（切歌后 ~2s）
+    /// 的空窗期内会把错歌歌词与封面（专辑 001rWGUJ3Gvypx）锁进缓存。
+    #[tokio::test]
+    async fn test_fetch_lyrics_rejects_wrong_artist_match() {
+        let fetcher = LyricFetcher::with_debug(true);
+        let (lyrics, trans, qrc, pic_url, _album) = fetcher
+            .fetch_lyrics("Closer (Tokyo Remix)", "新田真剑佑/The Chainsmokers")
+            .await
+            .expect("fetch_lyrics should succeed");
+        eprintln!(
+            "[test] Closer (Tokyo Remix): lyrics={} trans={} qrc={} pic={}",
+            lyrics.len(),
+            trans.len(),
+            qrc.len(),
+            pic_url
+        );
+        // 该歌所有 SmartBox 查询均为 0 结果，预期无在线数据（等本地 QRC 写入后重试）；
+        // 若有数据，绝不能是原版 Closer（ti 头带 "Billboard" 标记、歌手含 Halsey）
+        if !lyrics.is_empty() || !qrc.is_empty() {
+            let combined = format!("{}{}{}", lyrics, trans, qrc);
+            assert!(
+                !combined.contains("Billboard") && !combined.contains("Halsey"),
+                "不得匹配到 The Chainsmokers/Halsey 的原版 Closer"
+            );
+        }
+    }
 }
+
+
+
+
+

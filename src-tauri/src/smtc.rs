@@ -269,6 +269,12 @@ struct SmtcReaderInner {
     last_reported_playing: bool,
     /// 最后一帧播放状态的对外位置与发出时刻（淡出起点锚）
     last_playing_emitted: Option<(u64, i64)>,
+    /// SMTC 缩略图读取是否在途（去重：同一时刻只允许一次读取）
+    thumbnail_loading: bool,
+    /// 上次缩略图读取尝试时刻（Windows 纪元毫秒），限频防止每帧重试
+    last_thumbnail_attempt_ms: i64,
+    /// 缩略图连续失败次数（切歌时重置；达到上限后放弃，防止无限重试刷屏）
+    thumbnail_fail_count: u32,
 }
 
 static SMTC_READER: OnceLock<Mutex<SmtcReaderInner>> = OnceLock::new();
@@ -381,9 +387,22 @@ fn is_qqmusic_session(session: &GlobalSystemMediaTransportControlsSession) -> bo
 }
 
 // Helper to read thumbnail from IRandomAccessStreamReference and convert to base64 data URL
+/// 清洗 SMTC 缩略图的 ContentType：QQ 音乐可能返回多类型串
+/// "image/jpeg,image/jpe,image/jpg"（逗号拼接），直接拼进 data URI
+/// 后浏览器无法解析 → 封面加载不出。取第一个合法 image/ 类型，否则回退 jpeg。
+fn clean_thumbnail_content_type(raw: &str) -> String {
+    for part in raw.split([',', ';']) {
+        let t = part.trim();
+        if t.starts_with("image/") && !t.ends_with('/') {
+            return t.to_string();
+        }
+    }
+    "image/jpeg".to_string()
+}
+
 async fn read_thumbnail_base64(thumbnail_ref: IRandomAccessStreamReference) -> Result<String> {
     let stream = thumbnail_ref.OpenReadAsync()?.await?;
-    let content_type = stream.ContentType()?.to_string();
+    let content_type = clean_thumbnail_content_type(&stream.ContentType()?.to_string());
     let size = stream.Size()? as u32;
     if size == 0 {
         return Ok(String::new());
@@ -399,32 +418,13 @@ async fn read_thumbnail_base64(thumbnail_ref: IRandomAccessStreamReference) -> R
 // Function to read media information from a session.
 // Uses LastUpdatedTime to compute drift-corrected playback position,
 // matching the same algorithm Windows uses for its volume flyout progress bar.
-async fn read_session_info(session: &GlobalSystemMediaTransportControlsSession, fetch_thumbnail: bool, prev_timeline_state: &mut Option<TimelineState>) -> Result<SongInfo> {
+async fn read_session_info(session: &GlobalSystemMediaTransportControlsSession, prev_timeline_state: &mut Option<TimelineState>) -> Result<SongInfo> {
     let media_properties = session.TryGetMediaPropertiesAsync()?.await.context("Failed to get media properties")?;
     let timeline_properties = session.GetTimelineProperties()?;
 
     let title = media_properties.Title()?.to_string();
     let artist = media_properties.Artist()?.to_string();
     let album = media_properties.AlbumTitle()?.to_string();
-
-    let album_pic_url = String::new();
-    if fetch_thumbnail {
-        if let Ok(thumbnail_ref) = media_properties.Thumbnail() {
-            tokio::task::spawn_local(async move {
-                match read_thumbnail_base64(thumbnail_ref).await {
-                    Ok(base64_img) => {
-                        if let Some(reader_mutex) = SMTC_READER.get() {
-                            let mut r = reader_mutex.lock().await;
-                            r.last_thumbnail_base64 = base64_img;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[SMTC] Failed to read thumbnail: {:?}", e);
-                    }
-                }
-            });
-        }
-    }
 
     if title.is_empty() {
         anyhow::bail!("empty title");
@@ -481,9 +481,78 @@ async fn read_session_info(session: &GlobalSystemMediaTransportControlsSession, 
         total_time_ms,
         progress_percent: progress as f32,
         is_playing,
-        album_pic_url,
+        album_pic_url: String::new(),
+        album_pic_hd_url: String::new(),
         server_ts,
     })
+}
+
+/// 缩略图补读的最小间隔（QQ 切歌后缩略图要延迟几百 ms 才就绪，避免高频轮询）
+const THUMBNAIL_RETRY_INTERVAL_MS: i64 = 500;
+
+/// 缩略图补读的最大尝试次数（500ms 限频 × 10 ≈ 5s 后放弃，等切歌重置）。
+/// QQ 切歌后缩略图通常 1~2s 内就绪；但部分歌曲/环境读取恒失败
+/// （返回 0x00000000 的伪错误），无限重试只会每 500ms 刷一条错误日志。
+const THUMBNAIL_MAX_ATTEMPTS: u32 = 10;
+
+/// 尝试读取 SMTC 缩略图（异步，成功后写入全局缓存）。
+///
+/// QQ 切歌瞬间 SMTC 尚未准备好缩略图，首次读取常失败；若只在切歌帧读一次，
+/// 该歌整段播放都拿不到即时封面（解析本地/在线封面期间前端无图可显示）。
+/// 这里在「缩略图为空且无读取在途」时补读，成功即停；失败按 500ms 限频重试
+/// （每首歌最多 THUMBNAIL_MAX_ATTEMPTS 次，切歌时重置），
+/// 错误日志每首歌只报一次，避免刷屏。读取结果作为即时封面，
+/// 后续被更高清的本地/在线解析结果覆盖。
+fn maybe_fetch_thumbnail(
+    session: &GlobalSystemMediaTransportControlsSession,
+    reader: &mut SmtcReaderInner,
+    now_windows_ms: i64,
+) {
+    if reader.thumbnail_loading || !reader.last_thumbnail_base64.is_empty() {
+        return;
+    }
+    if reader.thumbnail_fail_count >= THUMBNAIL_MAX_ATTEMPTS {
+        return; // 已达上限，放弃本首歌（切歌后由主循环重置）
+    }
+    if now_windows_ms - reader.last_thumbnail_attempt_ms < THUMBNAIL_RETRY_INTERVAL_MS {
+        return;
+    }
+    reader.thumbnail_loading = true;
+    reader.last_thumbnail_attempt_ms = now_windows_ms;
+
+    let session = session.clone();
+    tokio::task::spawn_local(async move {
+        let result: Result<String> = (async {
+            let props = session
+                .TryGetMediaPropertiesAsync()?
+                .await
+                .context("get media properties for thumbnail")?;
+            let thumbnail_ref = props.Thumbnail()?;
+            let img = read_thumbnail_base64(thumbnail_ref).await?;
+            if img.is_empty() {
+                anyhow::bail!("thumbnail stream empty");
+            }
+            Ok(img)
+        })
+        .await;
+        if let Some(reader_mutex) = SMTC_READER.get() {
+            let mut r = reader_mutex.lock().await;
+            r.thumbnail_loading = false;
+            match result {
+                Ok(base64_img) => {
+                    r.thumbnail_fail_count = 0;
+                    r.last_thumbnail_base64 = base64_img;
+                }
+                Err(e) => {
+                    r.thumbnail_fail_count += 1;
+                    // 每首歌只报一次，避免 500ms 限频重试刷屏
+                    if r.thumbnail_fail_count == 1 {
+                        eprintln!("[SMTC] Failed to read thumbnail: {:?}", e);
+                    }
+                }
+            }
+        }
+    });
 }
 
 // Function to get current media info from Windows SMTC using cached session.
@@ -759,6 +828,9 @@ async fn get_current_media_info_inner() -> Result<Option<SongInfo>> {
                 resume_freeze_floor: None,
                 last_reported_playing: false,
                 last_playing_emitted: None,
+                thumbnail_loading: false,
+                last_thumbnail_attempt_ms: 0,
+                thumbnail_fail_count: 0,
             };
             let _ = SMTC_READER.set(Mutex::new(inner));
             SMTC_READER.get().unwrap()
@@ -771,15 +843,22 @@ async fn get_current_media_info_inner() -> Result<Option<SongInfo>> {
     // Deref 访问字段会被当作借用整个 guard）
     let reader = &mut *reader;
 
-    // 1. Try reading from the cached session first (do NOT fetch thumbnail initially to save CPU)
-    if let Some(session) = &reader.current_session {
-        if let Ok(mut info) = read_session_info(session, false, &mut reader.prev_timeline_state).await {
+    // 1. Try reading from the cached session first
+    // 先克隆会话（COM 引用计数句柄，开销可忽略），避免其借用与
+    // maybe_fetch_thumbnail 的 &mut reader 冲突
+    let cached_session = reader.current_session.clone();
+    if let Some(session) = &cached_session {
+        if let Ok(mut info) = read_session_info(session, &mut reader.prev_timeline_state).await {
             let song_key = format!("{}|{}", info.title, info.artist);
             if let Some(last_key) = &reader.last_song_key {
                 if song_key == *last_key {
                     // Cache hit: same song and session is valid.
                     // Populate with the cached thumbnail base64 and return immediately.
                     info.album_pic_url = reader.last_thumbnail_base64.clone();
+                    // 切歌瞬间缩略图常未就绪，首次读取失败则整歌缺失；
+                    // 命中路径上为空时补读（限频 + 在途去重）
+                    let now = chrono::Utc::now().timestamp_millis() + WINDOWS_EPOCH_OFFSET_MS;
+                    maybe_fetch_thumbnail(session, reader, now);
                     return Ok(Some(info));
                 }
             }
@@ -788,6 +867,7 @@ async fn get_current_media_info_inner() -> Result<Option<SongInfo>> {
         reader.current_session = None;
         reader.last_song_key = None;
         reader.last_thumbnail_base64 = String::new();
+        reader.thumbnail_fail_count = 0;
         reader.event_guard = None;
     }
 
@@ -810,11 +890,15 @@ async fn get_current_media_info_inner() -> Result<Option<SongInfo>> {
     if let Some(session) = qqmusic_session {
         qqmusic_found = true;
         // Cache miss: must fetch thumbnail here exactly once
-        if let Ok(info) = read_session_info(&session, true, &mut reader.prev_timeline_state).await {
+        if let Ok(info) = read_session_info(&session, &mut reader.prev_timeline_state).await {
             reader.last_song_key = Some(format!("{}|{}", info.title, info.artist));
-            reader.last_thumbnail_base64 = info.album_pic_url.clone();
+            reader.last_thumbnail_base64 = String::new();
+            reader.thumbnail_fail_count = 0;
             reader.event_guard = register_session_events(&session);
             reader.current_session = Some(session);
+            let now = chrono::Utc::now().timestamp_millis() + WINDOWS_EPOCH_OFFSET_MS;
+            let session_ref = reader.current_session.as_ref().unwrap().clone();
+            maybe_fetch_thumbnail(&session_ref, reader, now);
             return Ok(Some(info));
         }
     }
@@ -827,11 +911,15 @@ async fn get_current_media_info_inner() -> Result<Option<SongInfo>> {
     // 3. Fallback: try default current session
     if let Ok(session) = reader.manager.GetCurrentSession() {
         // Cache miss: must fetch thumbnail here exactly once
-        if let Ok(info) = read_session_info(&session, true, &mut reader.prev_timeline_state).await {
+        if let Ok(info) = read_session_info(&session, &mut reader.prev_timeline_state).await {
             reader.last_song_key = Some(format!("{}|{}", info.title, info.artist));
-            reader.last_thumbnail_base64 = info.album_pic_url.clone();
+            reader.last_thumbnail_base64 = String::new();
+            reader.thumbnail_fail_count = 0;
             reader.event_guard = register_session_events(&session);
             reader.current_session = Some(session);
+            let now = chrono::Utc::now().timestamp_millis() + WINDOWS_EPOCH_OFFSET_MS;
+            let session_ref = reader.current_session.as_ref().unwrap().clone();
+            maybe_fetch_thumbnail(&session_ref, reader, now);
             return Ok(Some(info));
         }
     }
@@ -981,6 +1069,19 @@ mod tests {
     fn stale_snapshot_beyond_1500ms_falls_back_to_raw() {
         let ts = ms_to_100ns(NOW - 2_000);
         assert_eq!(correct(10_000, 200_000, true, ts, NOW, None), 10_000);
+    }
+
+    /// 回归测试：QQ 音乐的 SMTC 缩略图 ContentType 返回多类型串
+    /// "image/jpeg,image/jpe,image/jpg"，直接拼进 data URI 浏览器无法解析
+    /// （封面加载不出）——必须清洗为单个合法类型。
+    #[test]
+    fn thumbnail_content_type_is_sanitized() {
+        assert_eq!(clean_thumbnail_content_type("image/jpeg,image/jpe,image/jpg"), "image/jpeg");
+        assert_eq!(clean_thumbnail_content_type("image/png"), "image/png");
+        assert_eq!(clean_thumbnail_content_type("image/jpeg; charset=utf-8"), "image/jpeg");
+        assert_eq!(clean_thumbnail_content_type("application/octet-stream"), "image/jpeg");
+        assert_eq!(clean_thumbnail_content_type(""), "image/jpeg");
+        assert_eq!(clean_thumbnail_content_type("text/plain,image/webp"), "image/webp");
     }
 
     #[test]

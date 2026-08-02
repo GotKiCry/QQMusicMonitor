@@ -534,7 +534,7 @@ mod tests {
         // 2. 从在线 API 获取 QRC 原始 hex 字符串
         let rt = tokio::runtime::Runtime::new().unwrap();
         let fetcher = crate::lyrics::LyricFetcher::with_debug(true);
-        let (lyrics, _trans, qrc_hex, _pic_url) = match rt.block_on(fetcher.fetch_lyrics(song_title, song_artist)) {
+        let (lyrics, _trans, qrc_hex, _pic_url, _album) = match rt.block_on(fetcher.fetch_lyrics(song_title, song_artist)) {
             Ok(r) => r,
             Err(e) => { eprintln!("[test] 在线获取失败: {}", e); return; }
         };

@@ -31,7 +31,9 @@ pub struct SongInfo {
     pub total_time_ms: u64,       // 总时长（毫秒）
     pub progress_percent: f32,    // 进度百分比
     pub is_playing: bool,         // 当前是否正在播放
-    pub album_pic_url: String,    // 专辑封面图片地址
+    pub album_pic_url: String,    // 专辑封面图片地址（data URI / 在线 URL / SMTC 缩略图）
+    pub album_pic_hd_url: String, // 高清封面地址：当 album_pic_url 是低清本地图(150x150)时，
+                                  // 此字段携带 800x800 在线 URL，前端预加载完成后平滑升级
     pub server_ts: u64,           // 后端采样时的绝对时间戳（毫秒）
 }
 

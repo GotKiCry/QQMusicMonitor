@@ -1,5 +1,17 @@
 use std::path::{Path, PathBuf};
 
+/// 本地文件匹配最低接受分数。
+///
+/// 分数构成：标题完全一致 +100 / 标题子串 +60；歌手完全一致 +50 / 歌手子串 +30。
+/// 只有「标题完全一致」（≥100）或「标题子串 + 歌手完全一致」（≥110）才接受，
+/// 拒绝「标题子串 + 歌手零分」（60）的弱匹配。
+///
+/// 背景：QQ 音乐在歌曲开始播放后才写入歌词缓存文件（滞后数秒）。若程序在
+/// 窗口期内扫描目录，会把"张杰 - 这，就是爱"错误匹配到同目录下的
+/// "蔡依林 - 就是爱"（标题"就是爱"是"这 就是爱"的子串，歌手完全不匹配），
+/// 且错误匹配会被内存 LyricsCache 以 Ready 状态锁死，永远显示错歌歌词。
+const MIN_ACCEPT_SCORE: u32 = 100;
+
 /// 探测 QQ 音乐缓存根目录（如 `D:\QQMusicCache`）。
 /// 歌词在 `QQMusicLyricNew` 子目录，封面图在 `QQMusicPicture` 子目录。
 pub fn auto_detect_cache_root() -> Option<PathBuf> {
@@ -95,6 +107,12 @@ pub fn find_qrc_file(cache_dir: &Path, title: &str, artist: &str) -> Option<Path
             score += 30;
         }
 
+        // 弱匹配拒绝：标题仅子串命中且歌手零分（60 分）会匹配到错歌，
+        // 例如"这，就是爱"命中"就是爱"的本地文件。低于阈值的候选一律跳过。
+        if score < MIN_ACCEPT_SCORE {
+            continue;
+        }
+
         if score > best_score {
             best_score = score;
             best_match = Some(path);
@@ -171,6 +189,11 @@ pub fn find_lrc_file(cache_dir: &Path, title: &str, artist: &str) -> Option<Path
             score += 30;
         }
 
+        // 弱匹配拒绝：与 find_qrc_file 相同的阈值，防止子串标题 + 歌手零分匹配错歌
+        if score < MIN_ACCEPT_SCORE {
+            continue;
+        }
+
         if score > best_score {
             best_score = score;
             best_match = Some(path);
@@ -227,7 +250,8 @@ pub fn parse_lyric_filename(file_name: &str) -> (String, String, String) {
 
 /// 在 QQ 音乐本地缓存目录中查找专辑封面图。
 ///
-/// 本地封面文件名格式：`T002R{W}x{H}M000{album_mid}_{seq}.jpg`
+/// 本地封面文件名格式：`T002R{W}x{H}M000{album_mid}_{seq}.jpg`（专辑封面）
+/// 或 `T062R{W}x{H}M000{mid}_{seq}.jpg`（无专辑歌曲的单曲封面，vs 字段 mid）。
 /// 优先返回 `R500x500`（本地最高清），回退 `R150x150`。
 ///
 /// @param picture_dir - `QQMusicPicture` 目录路径
@@ -239,8 +263,14 @@ pub fn find_album_pic(picture_dir: &Path, album_mid: &str) -> Option<PathBuf> {
     }
 
     let entries = std::fs::read_dir(picture_dir).ok()?;
-    let prefix_500 = format!("T002R500x500M000{}", album_mid);
-    let prefix_150 = format!("T002R150x150M000{}", album_mid);
+    let prefixes_500 = [
+        format!("T002R500x500M000{}", album_mid),
+        format!("T062R500x500M000{}", album_mid),
+    ];
+    let prefixes_150 = [
+        format!("T002R150x150M000{}", album_mid),
+        format!("T062R150x150M000{}", album_mid),
+    ];
 
     let mut pic_500: Option<PathBuf> = None;
     let mut pic_150: Option<PathBuf> = None;
@@ -250,9 +280,12 @@ pub fn find_album_pic(picture_dir: &Path, album_mid: &str) -> Option<PathBuf> {
             Some(n) => n.to_string(),
             None => continue,
         };
-        if file_name.starts_with(&prefix_500) && file_name.ends_with(".jpg") {
+        if !file_name.ends_with(".jpg") {
+            continue;
+        }
+        if pic_500.is_none() && prefixes_500.iter().any(|p| file_name.starts_with(p)) {
             pic_500 = Some(entry.path());
-        } else if file_name.starts_with(&prefix_150) && file_name.ends_with(".jpg") {
+        } else if pic_150.is_none() && prefixes_150.iter().any(|p| file_name.starts_with(p)) {
             pic_150 = Some(entry.path());
         }
     }
@@ -322,5 +355,111 @@ mod tests {
         assert_eq!(a, "TYSM");
         assert_eq!(t, "Normal No More");
         assert_eq!(al, "");
+    }
+
+    /// 回归测试：'张杰 - 这，就是爱' 不得匹配到 '蔡依林 - 就是爱'。
+    ///
+    /// 两者的标题 normalize 后呈子串关系（"这 就是爱".contains("就是爱")），
+    /// 歌手完全不匹配。旧逻辑接受该 60 分弱匹配，导致在 QQ 音乐尚未写入
+    /// 正确歌词缓存文件（滞后数秒）的窗口期内，把错歌歌词锁进内存缓存。
+    /// 临时歌词目录：每次调用分配唯一目录名，避免并行测试互相冲突
+    fn temp_lyric_dir(files: &[&str]) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "qqmusic_monitor_test_{}_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst),
+            files.len()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn qrc_substring_title_with_wrong_artist_is_rejected() {
+        let dir = temp_lyric_dir(&["蔡依林 - 就是爱 - 256 - 城堡_qm.qrc"]);
+        assert_eq!(
+            find_qrc_file(&dir, "这，就是爱", "张杰"),
+            None,
+            "歌手零分 + 标题子串的弱匹配必须被拒绝"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn qrc_exact_title_preferred_over_substring_wrong_artist() {
+        let dir = temp_lyric_dir(&[
+            "蔡依林 - 就是爱 - 256 - 城堡_qm.qrc",
+            "张杰 - 这，就是爱 - 292 - 听！我们的歌_qm.qrc",
+        ]);
+        let matched = find_qrc_file(&dir, "这，就是爱", "张杰");
+        assert!(matched.is_some());
+        let name = matched.unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("张杰"), "应命中正确文件，实际: {}", name);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lrc_substring_title_with_wrong_artist_is_rejected() {
+        let dir = temp_lyric_dir(&["蔡依林 - 就是爱 - 256 - 城堡_qm.lrc"]);
+        assert_eq!(
+            find_lrc_file(&dir, "这，就是爱", "张杰"),
+            None,
+            "LRC 同样拒绝歌手零分的子串弱匹配"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn partial_title_with_exact_artist_still_matches() {
+        // 合法场景：标题子串 + 歌手完全一致（110 分）仍应命中
+        let dir = temp_lyric_dir(&["Selena Gomez - Sober (feat_ J Balvin) - 200 - Revive_qm.qrc"]);
+        let matched = find_qrc_file(&dir, "Sober", "Selena Gomez");
+        assert!(matched.is_some(), "标题子串 + 歌手一致的合法匹配不应被拒绝");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn punctuation_folded_exact_title_matches() {
+        // normalize 标点折叠后标题完全一致：仍应命中（如 Kaiju No. vs No_）
+        let dir = temp_lyric_dir(&["OneRepublic - Nobody (from Kaiju No_ 8) - 153 - Nobody_qm.qrc"]);
+        let matched = find_qrc_file(&dir, "Nobody (from Kaiju No. 8)", "OneRepublic");
+        assert!(matched.is_some(), "标点折叠后的完全一致匹配不应被拒绝");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 无专辑歌曲的单曲封面：本地文件名以 T062 前缀存在时也应命中
+    #[test]
+    fn find_album_pic_matches_single_cover_t062() {
+        let dir = std::env::temp_dir().join(format!("qqmusic_monitor_pic_t062_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("T062R500x500M000002PE0rX0FxNck.jpg"), b"x").unwrap();
+        std::fs::write(dir.join("T062R150x150M000002PE0rX0FxNck_1.jpg"), b"x").unwrap();
+
+        let matched = find_album_pic(&dir, "002PE0rX0FxNck");
+        let name = matched.expect("T062 单曲封面应被找到").file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("T062R500x500"), "应优先 R500x500，实际: {}", name);
+
+        // 专辑封面路径仍正常工作
+        assert!(find_album_pic(&dir, "002JsVIJ31j7qR").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 仅 150x150 时回退返回 150（调用方应附带高清升级地址）
+    #[test]
+    fn find_album_pic_falls_back_to_150_only() {
+        let dir = std::env::temp_dir().join(format!("qqmusic_monitor_pic_150_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("T002R150x150M000001rWGUJ3Gvypx_2.jpg"), b"x").unwrap();
+
+        let matched = find_album_pic(&dir, "001rWGUJ3Gvypx")
+            .expect("仅有 150x150 时应回退返回它（低清，由调用方附加高清地址）");
+        let name = matched.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.contains("R150x150"), "应返回 150x150 文件，实际: {}", name);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
