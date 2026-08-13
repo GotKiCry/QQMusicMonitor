@@ -12,10 +12,10 @@
  */
 
 import { $, bindElements } from './utils/dom.js';
-import { loadFrontendConfig } from './config/frontend-config.js';
+import { loadFrontendConfig, hydrateFrontendConfig } from './config/frontend-config.js';
 import { fetchBackendConfig, getDefaultBackendConfig } from './config/backend-config.js';
 import { connect, disconnect, updateConnectionUI, sendCommand } from './connection/ws.js';
-import { listenSongInfo, isTauri, mediaControl } from './connection/tauri-bridge.js';
+import { listenSongInfo, isTauri, mediaControl, windowControl, isWindowMaximized, onWindowResized, startWindowDragging } from './connection/tauri-bridge.js';
 import {
     animFrame, songInfo, setAnimFrame, setLastSyncMs,
     setIsIntentionalClose
@@ -37,7 +37,6 @@ const els = bindElements({
     timeCurrent: 'time-current',
     timeTotal: 'time-total',
     albumArt: 'album-art',
-    albumBlurBg: 'album-blur-bg',
     // 歌词区
     lyricsContainer: 'lyrics-container',
     lyricsViewport: 'lyrics-viewport',
@@ -45,6 +44,13 @@ const els = bindElements({
     statusDot: 'status-dot',
     statusText: 'status-text',
     btnSettings: 'btn-settings',
+    topHeader: 'top-header',
+    // 窗口控制
+    windowControls: 'window-controls',
+    btnWinMin: 'btn-win-min',
+    btnWinMax: 'btn-win-max',
+    btnWinClose: 'btn-win-close',
+    iconWinState: 'icon-win-state',
     // 设置抽屉
     settingsOverlay: 'settings-overlay',
     btnSettingsClose: 'btn-settings-close',
@@ -57,16 +63,20 @@ const els = bindElements({
     valInterval: 'val-interval',
     cfgPort: 'cfg-port',
     btnApplyPort: 'btn-apply-port',
-    chkOutTxt: 'chk-out-txt',
-    chkOutJson: 'chk-out-json',
-    chkOutLyric: 'chk-out-lyric',
     // 前端设置
     cfgFontSize: 'cfg-font-size',
     valFontSize: 'val-font-size',
     cfgFontWeight: 'cfg-font-weight',
     valFontWeight: 'val-font-weight',
     toggleTrans: 'toggle-trans',
+    toggleLyricBar: 'toggle-lyric-bar',
     toggleDebug: 'toggle-debug',
+    btnLyricSideLeft: 'btn-lyric-side-left',
+    btnLyricSideRight: 'btn-lyric-side-right',
+    cfgLyricBarGap: 'cfg-lyric-bar-gap',
+    valLyricBarGap: 'val-lyric-bar-gap',
+    themeDotCustom: 'theme-dot-custom',
+    customColor: 'custom-color',
     // 调试
     debugPanel: 'debug-panel',
     debugInfo: 'debug-info',
@@ -95,6 +105,49 @@ function triggerMediaControl(action) {
 els.btnPrev.addEventListener('click', () => triggerMediaControl('previous'));
 els.btnNext.addEventListener('click', () => triggerMediaControl('next'));
 els.btnPlayPause.addEventListener('click', () => triggerMediaControl('play_pause'));
+
+/* ============================================================
+ * 窗口控制按钮（无边框窗口：最小化 / 最大化 / 关闭）
+ * ============================================================ */
+
+/** 单一 SVG 图标：按最大化状态替换内部形状（不同时存在两套图标） */
+const WIN_ICON_MAX =
+    '<rect x="5" y="5" width="14" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.8"/>';
+const WIN_ICON_RESTORE =
+    '<path d="M8 8V5.5A1.5 1.5 0 0 1 9.5 4h9A1.5 1.5 0 0 1 20 5.5v9a1.5 1.5 0 0 1-1.5 1.5H16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>' +
+    '<rect x="4" y="8" width="12" height="12" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.8"/>';
+
+/** 根据最大化状态切换图标 */
+function updateMaximizeIcon(maximized) {
+    els.iconWinState.innerHTML = maximized ? WIN_ICON_RESTORE : WIN_ICON_MAX;
+    els.btnWinMax.title = maximized ? '还原' : '最大化';
+}
+
+function wireUpWindowControls() {
+    if (!isTauri()) {
+        // 浏览器调试环境：隐藏窗口控制按钮组
+        els.windowControls.style.display = 'none';
+        return;
+    }
+
+    els.btnWinMin.addEventListener('click', () => windowControl('minimize'));
+    els.btnWinMax.addEventListener('click', () => windowControl('maximize'));
+    els.btnWinClose.addEventListener('click', () => windowControl('close'));
+
+    isWindowMaximized().then(updateMaximizeIcon);
+    onWindowResized(updateMaximizeIcon);
+
+    // 自定义标题栏拖动：顶栏空白区域可拖动窗口，按钮保持可点击；双击切换最大化
+    els.topHeader.addEventListener('mousedown', (event) => {
+        if (event.buttons !== 1) return;
+        if (event.target.closest('button, input, select, a, label')) return;
+        if (event.detail === 2) {
+            windowControl('maximize');
+        } else {
+            startWindowDragging();
+        }
+    });
+}
 
 /**
  * 根据播放状态切换播放/暂停图标
@@ -177,6 +230,9 @@ wireUpSettings({
     onFrontConfigChange
 });
 
+// 2.5 窗口控制（无边框窗口）
+wireUpWindowControls();
+
 // 3. 加载后端配置并启动数据源
 if (isTauri()) {
     // Tauri 环境：优先用 event 监听（主路径）
@@ -209,3 +265,30 @@ window.addEventListener('beforeunload', () => {
     setIsIntentionalClose(true);
     disconnect();
 });
+
+/**
+ * 恢复状态栏歌词窗口（按偏好：开关/位置/边距）。
+ * 歌词条边距与位置在窗口创建后按序 invoke，位置函数读取的是
+ * 静态偏好值，创建完成前先存值也能正确生效。
+ */
+function restoreLyricBar(cfg) {
+    if (!isTauri() || !cfg.lyricBar) return;
+    window.__TAURI__.core.invoke('set_lyric_bar_enabled', { enabled: true }).catch((e) => {
+        console.error('Failed to restore lyric bar:', e);
+    });
+    window.__TAURI__.core.invoke('set_lyric_bar_side', { side: cfg.lyricBarSide }).catch(() => {});
+    window.__TAURI__.core.invoke('set_lyric_bar_gap', { gap: cfg.lyricBarGap || 0 }).catch(() => {});
+}
+
+// 5. 水合后端持久化的前端偏好（跨 origin 权威值），随后恢复歌词条。
+// dev server 端口漂移 / dev 与 exe 的 origin 不同会导致 localStorage 读不到，
+// 以后端文件为准；浏览器调试环境直接按 localStorage 恢复。
+if (isTauri()) {
+    hydrateFrontendConfig().then((cfg) => {
+        if (cfg) {
+            Object.assign(frontConfig, cfg);
+            syncConfigToUI(els, frontConfig, backConfig);
+        }
+        restoreLyricBar(frontConfig);
+    });
+}

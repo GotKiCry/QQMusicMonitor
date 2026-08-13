@@ -51,12 +51,7 @@ let displayedUrl = '';
 const ONLINE_ART_MAX_WAIT_MS = 3000;
 
 function applyArtUrl(els, url) {
-    const bg = `url("${url}")`;
     setBgImage(els.albumArt, url);
-    if (els.albumBlurBg.style.backgroundImage !== bg) {
-        setBgImage(els.albumBlurBg, url);
-    }
-    els.albumBlurBg.classList.add('active');
 }
 
 /**
@@ -144,6 +139,4 @@ export function resetAlbumArt(els) {
     }
     if (artLoadTimer) { clearTimeout(artLoadTimer); artLoadTimer = null; }
     setBgImage(els.albumArt, '');
-    setBgImage(els.albumBlurBg, '');
-    els.albumBlurBg.classList.remove('active');
 }

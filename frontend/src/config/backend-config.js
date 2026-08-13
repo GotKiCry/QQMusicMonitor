@@ -1,5 +1,5 @@
 /**
- * 后端（Rust 侧）运行时配置：端口、偏移、轮询间隔、文件输出开关。
+ * 后端（Rust 侧）运行时配置：端口、偏移、轮询间隔。
  * 通过 Tauri invoke 与后端同步，并落盘到 config.toml。
  */
 
@@ -8,9 +8,6 @@
  * @property {number} port
  * @property {number} offsetMs
  * @property {number} intervalMs
- * @property {boolean} outputTxt
- * @property {boolean} outputJson
- * @property {boolean} outputLyric
  */
 
 /** @returns {BackendConfig} */
@@ -18,10 +15,7 @@ export function getDefaultBackendConfig() {
     return {
         port: 3000,
         offsetMs: 200,
-        intervalMs: 50,
-        outputTxt: false,
-        outputJson: true,
-        outputLyric: true
+        intervalMs: 50
     };
 }
 
@@ -36,10 +30,7 @@ export async function fetchBackendConfig() {
             return {
                 port: cfg.server_port,
                 offsetMs: cfg.smtc_offset_ms,
-                intervalMs: cfg.update_interval_ms,
-                outputTxt: cfg.output_txt,
-                outputJson: cfg.output_json,
-                outputLyric: cfg.output_lyric
+                intervalMs: cfg.update_interval_ms
             };
         } catch (e) {
             console.error('Failed to get app config:', e);
@@ -59,10 +50,7 @@ export async function saveBackendConfig(cfg) {
             newCfg: {
                 server_port: cfg.port,
                 smtc_offset_ms: cfg.offsetMs,
-                update_interval_ms: cfg.intervalMs,
-                output_txt: cfg.outputTxt,
-                output_json: cfg.outputJson,
-                output_lyric: cfg.outputLyric
+                update_interval_ms: cfg.intervalMs
             }
         });
     } catch (e) {

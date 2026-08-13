@@ -46,17 +46,17 @@ GUI 界面采用极光午夜设计风格，左侧黑胶唱机组件随播放状�
    git clone https://github.com/GotKiCry/QQMusicMonitor.git
    cd QQMusicMonitor
    ```
-2. 安装 Tauri CLI：
+2. 安装 Tauri CLI（项目通过 npm 安装，无需 `cargo install`）：
    ```bash
    npm install
    ```
 3. 开发模式运行（启动 GUI 窗口 + 后端监控 + WebSocket 服务，热重载）：
    ```bash
-   cargo tauri dev
+   npm run tauri dev
    ```
 4. 构建可执行文件：
    ```bash
-   cargo tauri build
+   npm run tauri build
    ```
 
 GUI 窗口启动后自动连接后端；浏览器/外部场景可读取 `http://127.0.0.1:3000/api/current` 或连接 `ws://127.0.0.1:3000/ws`。
@@ -64,13 +64,13 @@ GUI 窗口启动后自动连接后端；浏览器/外部场景可读取 `http://
 ## 常用运行参数
 
 ```bash
-cargo run --release -- --debug          # 调试模式（详细 QRC 解析日志）
-cargo run --release -- --port 8080      # 自定义 WebSocket 服务端口
-cargo run --release -- --interval 200   # 自定义 SMTC 轮询间隔（毫秒）
-cargo run --release -- --offset 150     # 自定义 SMTC 滞后补偿（毫秒）
-cargo run --release -- --offset=-100    # 使用负偏移让歌词稍晚显示
-cargo run --release -- --no-server      # 禁用 WebSocket 服务
-cargo run --release -- --help           # 完整参数列表
+npm run tauri dev -- --debug          # 调试模式（详细 QRC 解析日志）
+npm run tauri dev -- --port 8080      # 自定义 WebSocket 服务端口
+npm run tauri dev -- --interval 200   # 自定义 SMTC 轮询间隔（毫秒）
+npm run tauri dev -- --offset 150     # 自定义 SMTC 滞后补偿（毫秒）
+npm run tauri dev -- --offset=-100    # 使用负偏移让歌词稍晚显示
+npm run tauri dev -- --no-server      # 禁用 WebSocket 服务
+npm run tauri dev -- --help           # 完整参数列表
 ```
 
 ## 技术实现
@@ -101,7 +101,7 @@ cargo run --release -- --help           # 完整参数列表
 调试模式可查看歌词来源、解密过程与同步延迟：
 
 ```bash
-cargo tauri dev -- --debug
+npm run tauri dev -- --debug
 ```
 
 前端调试面板（设置 → 开发者选项）可实时查看完整 `SongInfo` JSON 与同步耗时。

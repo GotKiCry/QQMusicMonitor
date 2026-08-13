@@ -1,29 +1,7 @@
-# QQMusic Monitor 配置文件
-
 [settings]
-# 更新间隔（毫秒）
 update_interval_ms = 100
-
-# SMTC 滞后补偿量（毫秒，可为负数）。蓝牙耳机建议 200-300；若歌词偏早可使用负值。
-smtc_offset_ms = 200
-
-# 最大重试次数
+smtc_offset_ms = 0
 max_retries = 3
-
-# 输出文件设置
-output_txt = false
-output_json = true
-txt_filename = "now_playing.txt"
-json_filename = "now_playing.json"
-
-# 歌词输出设置
-output_lyric = true
-lyric_filename = "current_lyric.txt"
-
-# 调试模式
 debug_mode = false
-
-# 服务端设置
 enable_server = true
 server_port = 3000
-

@@ -4,17 +4,6 @@
  * ============================================================ */
 
 @media (max-width: 768px) {
-    .app-card {
-        height: 100vh;
-        max-height: none;
-        border-radius: 0;
-        border: none;
-    }
-
-    body {
-        padding: 0;
-    }
-
     .dashboard-body {
         grid-template-columns: 1fr;
         grid-template-rows: auto 1fr;

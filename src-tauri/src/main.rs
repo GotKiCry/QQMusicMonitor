@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::OnceLock;
 use tokio::sync::RwLock;
 
@@ -8,6 +8,22 @@ static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
 static CACHED_CACHE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
 static LATEST_SONG_INFO: OnceLock<RwLock<Arc<SongInfo>>> = OnceLock::new();
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 窗口是否可见（后台托盘模式时为 false）。
+/// 隐藏期间跳过 GUI 事件推送，并在无同步服务时降低 SMTC 轮询频率以释放资源。
+static GUI_VISIBLE: AtomicBool = AtomicBool::new(true);
+
+/// 状态栏歌词（悬浮歌词条窗口）是否启用。
+/// 启用时即使主窗口隐藏到托盘，GUI 事件推送与轮询频率也保持不变。
+static LYRIC_BAR_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 歌词条位置偏好：0 = 右侧（通知区左侧），1 = 左侧（开始按钮右侧）
+static LYRIC_BAR_SIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// 歌词条边距偏好（逻辑像素）：距任务栏屏幕边缘的距离（左=距左缘，右=距通知区左缘）
+static LYRIC_BAR_GAP: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 /// 全局调试开关（main 启动时按配置设置，供非异步路径打印诊断）
 fn debug_mode_enabled() -> bool {
@@ -19,9 +35,6 @@ pub struct FrontConfig {
     pub server_port: u16,
     pub smtc_offset_ms: i64,
     pub update_interval_ms: u64,
-    pub output_txt: bool,
-    pub output_json: bool,
-    pub output_lyric: bool,
 }
 
 #[tauri::command]
@@ -36,9 +49,6 @@ async fn get_app_config() -> Result<FrontConfig, String> {
         server_port: settings.server_port,
         smtc_offset_ms: settings.smtc_offset_ms,
         update_interval_ms: settings.update_interval_ms,
-        output_txt: settings.output_txt,
-        output_json: settings.output_json,
-        output_lyric: settings.output_lyric,
     })
 }
 
@@ -53,9 +63,6 @@ async fn save_app_config(new_cfg: FrontConfig) -> Result<(), String> {
         guard.settings.server_port = new_cfg.server_port;
         guard.settings.smtc_offset_ms = new_cfg.smtc_offset_ms;
         guard.settings.update_interval_ms = new_cfg.update_interval_ms;
-        guard.settings.output_txt = new_cfg.output_txt;
-        guard.settings.output_json = new_cfg.output_json;
-        guard.settings.output_lyric = new_cfg.output_lyric;
     }
     
     // 2. Write config.toml
@@ -87,12 +94,711 @@ async fn media_previous() -> Result<(), String> {
     smtc::try_skip_previous().await.map_err(|e| format!("{}", e))
 }
 
-use std::fs::File;
-use std::io::Write;
+#[tauri::command]
+// 前端将窗口隐藏到托盘前调用：标记后台模式，后端据此降频/停止 GUI 推送。
+async fn window_hidden() {
+    GUI_VISIBLE.store(false, Ordering::SeqCst);
+}
+
+/// 状态栏歌词窗口兜底尺寸（拿不到任务栏位置时使用）
+const LYRIC_BAR_FALLBACK_WIDTH: f64 = 800.0;
+const LYRIC_BAR_FALLBACK_HEIGHT: f64 = 48.0;
+const LYRIC_BAR_BOTTOM_OFFSET: f64 = 0.0;
+
+/// 歌词条窗口句柄（WinEvent 回调置顶用）
+static LYRIC_BAR_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// 获取 Windows 任务栏矩形（物理像素）。
+/// 通过 SHAppBarMessage(ABM_GETTASKBARPOS) 查询，任务栏不在屏幕底部时返回 None。
+fn taskbar_rect() -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::UI::Shell::{ABM_GETTASKBARPOS, APPBARDATA, SHAppBarMessage};
+    unsafe {
+        let mut abd = APPBARDATA::default();
+        abd.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
+        if SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) == 0 {
+            return None;
+        }
+        let rc = abd.rc;
+        Some((rc.left, rc.top, rc.right, rc.bottom))
+    }
+}
+
+/// 状态栏歌词窗口定位：嵌入任务栏右侧空白区（时钟左侧），与任务栏同高。
+/// 返回 (x, y, width, height) 逻辑坐标；任务栏不可用时回退到屏幕底部悬浮。
+fn lyric_bar_geometry(monitor: &tauri::Monitor) -> (f64, f64, f64, f64) {
+    let scale = monitor.scale_factor();
+    if let Some((l, t, r, b)) = taskbar_rect() {
+        let tb_w = (r - l) as f64 / scale;
+        let tb_h = (b - t) as f64 / scale;
+        let x = l as f64 / scale + tb_w * 0.55;
+        let y = t as f64 / scale;
+        let w = tb_w * 0.4;
+        let h = tb_h;
+        return (x, y, w, h);
+    }
+    let logical = monitor.size().to_logical::<f64>(scale);
+    (
+        (logical.width - LYRIC_BAR_FALLBACK_WIDTH) / 2.0,
+        (logical.height - LYRIC_BAR_FALLBACK_HEIGHT - LYRIC_BAR_BOTTOM_OFFSET).max(0.0),
+        LYRIC_BAR_FALLBACK_WIDTH,
+        LYRIC_BAR_FALLBACK_HEIGHT,
+    )
+}
+
+/// 歌词条逻辑尺寸（与前端 CSS 布局匹配）：最大宽度、高度、最小收缩宽度
+const LYRIC_BAR_W: f64 = 520.0;
+const LYRIC_BAR_H: f64 = 48.0;
+const LYRIC_BAR_MIN_W: f64 = 180.0;
+
+/// 找到主任务栏窗口（Shell_TrayWnd）
+fn find_taskbar() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    unsafe {
+        FindWindowW(windows::core::w!("Shell_TrayWnd"), None)
+            .ok()
+            .filter(|h| !h.0.is_null())
+    }
+}
+
+/// 任务栏子窗口中已知的系统控件类名（枚举第三方插件时排除）
+const KNOWN_TASKBAR_CHILD_CLASSES: &[&str] = &[
+    "ReBarWindow32",
+    "MSTaskSwWClass",
+    "MSTaskListWClass",
+    "TrayNotifyWnd",
+    "TrayClockWClass",
+    "Start",
+    "Windows.UI.Composition.DesktopWindowContentBridge",
+];
+
+/// 检测嵌入任务栏的第三方插件窗口（如 TrafficMonitor 等），
+/// 返回它们相对任务栏左上角的矩形（物理像素）。
+/// 用于歌词条定位时避让，防止与其他插件挤在一起。
+///
+/// 过滤规则：
+///  - 排除歌词条自身及其所有后代窗口（WebView2 会创建多个子窗口，
+///    类名不在系统白名单内，之前被误判为插件导致自激振荡）
+///  - 排除父链含 TrayNotifyWnd 的后代（通知区内部控件：托盘按钮/时钟/
+///    隐藏图标弹窗宿主，歌词条右侧锚点本身贴着通知区左缘，永不进入）
+///  - 排除高度远超任务栏的窗口（D3D 合成中间窗口等，其矩形可能是
+///    陈旧/失真的巨大区域）
+///
+/// 注意：TrafficMonitor 的任务栏窗口是 `#32770` 对话框类（标题
+/// TrafficMonitorTaskbarWindow），父窗口是它自建的宿主窗口而非
+/// TrayNotifyWnd，因此会正常落入插件列表参与避让。
+fn detect_taskbar_plugins(
+    taskbar: windows::Win32::Foundation::HWND,
+    bar_hwnd: windows::Win32::Foundation::HWND,
+) -> Vec<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumChildWindows, FindWindowExW, GetClassNameW, GetParent, GetWindowRect,
+        IsWindowVisible,
+    };
+    use windows::core::BOOL;
+
+    struct PluginList {
+        tb_left: i32,
+        tb_height: i32,
+        bar_hwnd: windows::Win32::Foundation::HWND,
+        tray_hwnd: windows::Win32::Foundation::HWND,
+        rects: Vec<RECT>,
+    }
+
+    /// 沿父窗口链向上检查 hwnd 是否为 ancestor 的后代窗口。
+    /// 注意不能用 GA_ROOT：嵌入任务栏后歌词条的顶层祖先是 Shell_TrayWnd 本身。
+    unsafe fn is_descendant_of(
+        hwnd: windows::Win32::Foundation::HWND,
+        ancestor: windows::Win32::Foundation::HWND,
+    ) -> bool {
+        if ancestor.0.is_null() {
+            return false;
+        }
+        let mut cur = GetParent(hwnd).ok();
+        while let Some(p) = cur {
+            if p == ancestor {
+                return true;
+            }
+            cur = GetParent(p).ok();
+        }
+        false
+    }
+
+    unsafe extern "system" fn enum_proc(
+        hwnd: windows::Win32::Foundation::HWND,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let list = &mut *(lparam.0 as *mut PluginList);
+        if IsWindowVisible(hwnd).as_bool() {
+            // 排除歌词条自身及其后代（WebView2 会创建多个子窗口，
+            // 类名不在系统白名单内，之前被误判为插件导致自激振荡）
+            if hwnd == list.bar_hwnd || is_descendant_of(hwnd, list.bar_hwnd) {
+                return BOOL(1);
+            }
+            // 排除通知区内部控件（父链含 TrayNotifyWnd）
+            if is_descendant_of(hwnd, list.tray_hwnd) {
+                return BOOL(1);
+            }
+            let mut buf = [0u16; 256];
+            let len = GetClassNameW(hwnd, &mut buf);
+            let name = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+            if !KNOWN_TASKBAR_CHILD_CLASSES.contains(&name.as_str()) {
+                let mut rc = RECT::default();
+                if GetWindowRect(hwnd, &mut rc).is_ok() {
+                    let w = rc.right - rc.left;
+                    let h = rc.bottom - rc.top;
+                    // 过滤过小窗口（图标级）与远高于任务栏的窗口（D3D 合成
+                    // 中间窗口等），只关注占据任务栏条状区域的真实插件
+                    if w >= 20 && h >= 10 && h <= list.tb_height * 2 {
+                        rc.left -= list.tb_left;
+                        rc.right -= list.tb_left;
+                        list.rects.push(rc);
+                    }
+                }
+            }
+        }
+        BOOL(1)
+    }
+
+    unsafe {
+        let mut tb_rect = RECT::default();
+        if GetWindowRect(taskbar, &mut tb_rect).is_err() {
+            return Vec::new();
+        }
+        let tray_hwnd = FindWindowExW(Some(taskbar), None, windows::core::w!("TrayNotifyWnd"), None)
+            .ok()
+            .unwrap_or(windows::Win32::Foundation::HWND(std::ptr::null_mut()));
+        let mut list = PluginList {
+            tb_left: tb_rect.left,
+            tb_height: tb_rect.bottom - tb_rect.top,
+            bar_hwnd,
+            tray_hwnd,
+            rects: Vec::new(),
+        };
+        let _ = EnumChildWindows(
+            Some(taskbar),
+            Some(enum_proc),
+            LPARAM(&mut list as *mut PluginList as isize),
+        );
+        list.rects
+    }
+}
+
+/// 通知区（TrayNotifyWnd）的屏幕矩形；找不到时返回 None
+fn tray_rect_of(taskbar: windows::Win32::Foundation::HWND) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowRect};
+
+    unsafe {
+        let tray = FindWindowExW(Some(taskbar), None, windows::core::w!("TrayNotifyWnd"), None)
+            .ok()
+            .filter(|h| !h.0.is_null())?;
+        let mut rc = RECT::default();
+        GetWindowRect(tray, &mut rc).ok()?;
+        Some(rc)
+    }
+}
+
+/// 任务列表（MSTaskSwWClass）的屏幕矩形。
+/// 该类窗口在 Win10/11 上都嵌套在 ReBarWindow32 之下，FindWindowExW 只搜
+/// 直接子窗口找不到，需用 EnumChildWindows 递归查找。
+fn tasklist_rect_of(
+    taskbar: windows::Win32::Foundation::HWND,
+) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW, GetWindowRect};
+    use windows::core::BOOL;
+
+    struct Ctx {
+        class: String,
+        found: Option<RECT>,
+    }
+
+    unsafe extern "system" fn enum_proc(
+        hwnd: windows::Win32::Foundation::HWND,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut Ctx);
+        let mut buf = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut buf);
+        let name = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+        if name == ctx.class {
+            let mut rc = RECT::default();
+            if GetWindowRect(hwnd, &mut rc).is_ok() {
+                ctx.found = Some(rc);
+                return BOOL(0); // stop enumeration
+            }
+        }
+        BOOL(1)
+    }
+
+    unsafe {
+        let mut ctx = Ctx {
+            class: "MSTaskSwWClass".to_string(),
+            found: None,
+        };
+        let _ = EnumChildWindows(
+            Some(taskbar),
+            Some(enum_proc),
+            LPARAM(&mut ctx as *mut Ctx as isize),
+        );
+        ctx.found
+    }
+}
+
+/// 计算歌词条在任务栏内的位置并应用（支持左右偏好与插件避让）。
+/// 返回是否成功。
+fn position_lyric_bar_in_taskbar(
+    bar_hwnd: windows::Win32::Foundation::HWND,
+    scale: f64,
+) -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowExW, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW, HWND_TOP,
+    };
+
+    unsafe {
+        let Some(taskbar) = find_taskbar() else {
+            return false;
+        };
+        let mut tb_rect = RECT::default();
+        if GetWindowRect(taskbar, &mut tb_rect).is_err() {
+            return false;
+        }
+        let tb_w = tb_rect.right - tb_rect.left;
+        let tb_h = tb_rect.bottom - tb_rect.top;
+
+        let max_w = (LYRIC_BAR_W * scale) as i32;
+        let min_w = (LYRIC_BAR_MIN_W * scale) as i32;
+        // 高度贴合任务栏：小任务栏（如 40px）时收缩到任务栏高度，
+        // 避免子窗口上下溢出被父窗口裁剪。前端 CSS 按窗口高度自适应隐藏翻译行。
+        let bar_h = ((LYRIC_BAR_H * scale) as i32).min(tb_h);
+        // 与第三方插件/任务栏边缘的间距（系统控件锚点使用贴边，见下）
+        let gap = (20.0 * scale) as i32;
+
+        let side_left = LYRIC_BAR_SIDE.load(Ordering::SeqCst) == 1;
+
+        // —— 右锚：通知区左缘（贴着通知区显示；找不到时回退距任务栏右缘 gap） ——
+        let mut right_anchor = tb_w - gap;
+        if let Some(tray_rect) = tray_rect_of(taskbar) {
+            right_anchor = tray_rect.left - tb_rect.left;
+        }
+
+        // —— 左锚：开始按钮右缘（贴着开始按钮显示） ——
+        // Win11 的 Start 类窗口是隐藏占位窗口（实测右缘可达任务栏宽度的 40%），
+        // 检测到异常值（>200 物理像素）时回退真实开始按钮的典型宽度（48 逻辑像素）
+        let mut left_anchor = gap;
+        if let Some(start) =
+            FindWindowExW(Some(taskbar), None, windows::core::w!("Start"), None)
+                .ok()
+                .filter(|h| !h.0.is_null())
+        {
+            let mut start_rect = RECT::default();
+            if GetWindowRect(start, &mut start_rect).is_ok() {
+                let start_right = start_rect.right - tb_rect.left;
+                left_anchor = if start_right <= (200.0 * scale) as i32 {
+                    start_right
+                } else {
+                    (48.0 * scale) as i32
+                };
+            }
+        }
+
+        // —— 任务列表（MSTaskSwWClass）矩形：用于判定左对齐/居中与避让 ——
+        let tasklist = tasklist_rect_of(taskbar).map(|rc| {
+            (
+                rc.left - tb_rect.left,
+                rc.right - tb_rect.left,
+            )
+        });
+
+        // Win10 左对齐任务栏：搜索框位于开始按钮与任务列表之间，把左锚
+        // 移到任务列表左缘（搜索框右侧），避免盖住搜索框。居中任务栏的
+        // 任务列表起点远离左缘（≥400 物理像素），不参与。
+        if let Some((tl, _)) = tasklist {
+            if tl < (400.0 * scale) as i32 {
+                left_anchor = left_anchor.max(tl);
+            }
+        }
+
+        // —— 宽度与位置 ——
+        // 用户可调边距（逻辑 px → 物理 px）：左侧 = 距任务栏左缘
+        // （0 = 贴左缘，可覆盖开始按钮——歌词条鼠标穿透不影响点击）；
+        // 右侧 = 距通知区左缘（0 = 贴通知区）
+        let user_gap = (LYRIC_BAR_GAP.load(Ordering::SeqCst) as f64 * scale) as i32;
+        let mut bar_w = max_w;
+        let mut x = if side_left {
+            user_gap
+        } else {
+            // 右侧：贴着通知区左缘。可用区左界 = max(左锚, 任务列表右缘 + gap)，
+            // 空间不足时收缩宽度，避免盖住居中的任务按钮
+            let mut zone_left = left_anchor;
+            if let Some((_, tr)) = tasklist {
+                zone_left = zone_left.max(tr + gap);
+            }
+            let available = (right_anchor - zone_left).max(0);
+            if available < max_w {
+                bar_w = available.max(min_w);
+            }
+            (right_anchor - bar_w - user_gap).max(zone_left)
+        };
+
+        // 左侧 + 居中任务栏：宽度收窄到任务列表左缘前，不盖任务按钮
+        if side_left {
+            if let Some((tl, _)) = tasklist {
+                if tl >= (400.0 * scale) as i32 {
+                    let limit = tl - gap - x;
+                    if limit > 0 && limit < bar_w {
+                        bar_w = limit.max(min_w);
+                    }
+                }
+            }
+        }
+
+        // —— 避让其他任务栏插件（TrafficMonitor 等嵌入窗口） ——
+        for p in detect_taskbar_plugins(taskbar, bar_hwnd) {
+            let p_w = p.right - p.left;
+            if p_w < 20 {
+                continue;
+            }
+            let overlaps = p.left < x + bar_w && p.right > x;
+            if overlaps {
+                if side_left {
+                    x = p.right + gap;
+                } else {
+                    x = (p.left - bar_w - gap).max(left_anchor);
+                }
+            }
+        }
+
+        // 收进任务栏范围内，右侧不越过通知区
+        x = x.max(0);
+        if x + bar_w > tb_w - gap {
+            bar_w = (tb_w - gap - x).max(min_w);
+        }
+        if !side_left && x + bar_w > right_anchor {
+            bar_w = (right_anchor - x).max(min_w);
+            x = right_anchor - bar_w;
+        }
+
+        let y = ((tb_h - bar_h) / 2).max(0);
+        // HWND_TOP：保持在任务栏其他子窗口之上（后续新建的插件窗口可能抢占），
+        // 配合 watchdog 每 5s 的布局自愈保证歌词条始终可见。
+        let _ = SetWindowPos(
+            bar_hwnd,
+            Some(HWND_TOP),
+            x,
+            y,
+            bar_w,
+            bar_h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        true
+    }
+}
+
+/// 把歌词条窗口嵌入任务栏（参照 TrafficMonitor 的做法）：
+/// SetParent 使其成为任务栏的子窗口——子窗口永远渲染在任务栏内容
+/// 之上，任务栏被点击/置顶都不会盖住它。返回是否成功嵌入。
+///
+/// 注意：windows-rs 0.62 的 SetParent 包装把「旧父为 NULL」（顶层窗口
+/// 首次嵌入的合法成功结果）误判为 Err，因此不能依赖其返回值；
+/// 跨进程子窗口（无 WS_CHILD 风格位）的 GetParent/IsChild 亦不可靠，
+/// 统一用 GetAncestor(GA_PARENT) 验证嵌入结果。
+fn embed_lyric_bar_into_taskbar(
+    bar_hwnd: windows::Win32::Foundation::HWND,
+    scale: f64,
+) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, SetParent, GA_PARENT};
+
+    unsafe {
+        let Some(taskbar) = find_taskbar() else {
+            return false;
+        };
+        // 成为任务栏的子窗口（忽略包装层返回值，见上方注释）
+        let _ = SetParent(bar_hwnd, Some(taskbar));
+        if GetAncestor(bar_hwnd, GA_PARENT) != taskbar {
+            return false;
+        }
+        position_lyric_bar_in_taskbar(bar_hwnd, scale)
+    }
+}
+
+/// 创建歌词条窗口并尝试嵌入任务栏；嵌入失败则回退为屏幕底部悬浮。
+fn create_lyric_bar(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    let monitor = app
+        .primary_monitor()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "未找到显示器".to_string())?;
+    let scale = monitor.scale_factor();
+
+    let win = WebviewWindowBuilder::new(
+        app,
+        "lyric-bar",
+        WebviewUrl::App("lyric-bar.html".into()),
+    )
+    .title("QQMusic Monitor - 状态栏歌词")
+    .inner_size(LYRIC_BAR_W, LYRIC_BAR_H)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .maximizable(false)
+    .minimizable(false)
+    .shadow(false)
+    .visible(false)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    let _ = win.set_ignore_cursor_events(true);
+    // tauri 返回的 HWND 来自 windows 0.61，转为项目使用的 0.62 指针类型
+    let hwnd_raw = win.hwnd().map_err(|e| e.to_string())?;
+    LYRIC_BAR_HWND.store(hwnd_raw.0 as isize, Ordering::SeqCst);
+    let hwnd = windows::Win32::Foundation::HWND(hwnd_raw.0);
+
+    let embedded = embed_lyric_bar_into_taskbar(hwnd, scale);
+    if !embedded {
+        let (x, y, w, h) = lyric_bar_geometry(&monitor);
+        let _ = win.set_position(tauri::Position::Logical((x, y).into()));
+        let _ = win.set_size(tauri::Size::Logical((w, h).into()));
+    }
+
+    let _ = win.show();
+    let _ = win.set_ignore_cursor_events(true);
+    Ok(())
+}
+
+/// 当前主显示器缩放比例（查询失败时按 1.0 处理）
+fn current_monitor_scale(app: &tauri::AppHandle) -> f64 {
+    app.primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.scale_factor())
+        .unwrap_or(1.0)
+}
+
+/// 歌词条自愈守护：
+/// - explorer 重启会销毁其子窗口（歌词条窗口被一并销毁），检测到句柄
+///   失效后重建窗口并重新嵌入
+/// - 父窗口句柄变化（任务栏重建）时重新 SetParent 嵌入
+/// - 任务栏矩形或缩放比例变化（托盘图标增减/分辨率/DPI/任务栏移动）时
+///   重新定位，保证歌词条始终避让通知区与其他插件
+fn spawn_lyric_bar_watchdog(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let mut last_tb_rect: Option<(i32, i32, i32, i32)> = None;
+        let mut last_tray_rect: Option<(i32, i32, i32, i32)> = None;
+        let mut last_tasklist_rect: Option<(i32, i32, i32, i32)> = None;
+        let mut last_plugins: Option<Vec<(i32, i32, i32, i32)>> = None;
+        let mut last_scale: f64 = 0.0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if !LYRIC_BAR_ENABLED.load(Ordering::SeqCst) {
+                last_tb_rect = None;
+                continue;
+            }
+            let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
+            if raw == 0 {
+                continue;
+            }
+            unsafe {
+                use windows::Win32::Foundation::{HWND, RECT};
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    GetAncestor, GetWindowRect, IsWindow, GA_PARENT,
+                };
+                use tauri::Manager;
+                let bar = HWND(raw as *mut core::ffi::c_void);
+                if IsWindow(Some(bar)).as_bool() {
+                    if let Some(taskbar) = find_taskbar() {
+                        // GetParent/IsChild 对跨进程子窗口（无 WS_CHILD 风格位）
+                        // 不可靠，用 GetAncestor(GA_PARENT) 判断嵌入状态
+                        let embedded = GetAncestor(bar, GA_PARENT) == taskbar;
+                        if !embedded {
+                            // 任务栏重建（explorer 重启）或嵌入丢失：重新嵌入
+                            let scale = current_monitor_scale(&app);
+                            embed_lyric_bar_into_taskbar(bar, scale);
+                        }
+                        // 布局变化检测：任务栏/通知区/任务列表矩形、第三方插件
+                        // （TrafficMonitor 等，用户拖动后自动避让）或缩放比例变化
+                        // 时重新定位
+                        let mut rc = RECT::default();
+                        let tb_now = GetWindowRect(taskbar, &mut rc)
+                            .ok()
+                            .map(|_| (rc.left, rc.top, rc.right, rc.bottom));
+                        let tray_now = tray_rect_of(taskbar)
+                            .map(|r| (r.left, r.top, r.right, r.bottom));
+                        let tasklist_now = tasklist_rect_of(taskbar)
+                            .map(|r| (r.left, r.top, r.right, r.bottom));
+                        let mut plugins_now = detect_taskbar_plugins(taskbar, bar)
+                            .iter()
+                            .map(|r| (r.left, r.top, r.right, r.bottom))
+                            .collect::<Vec<_>>();
+                        // 排序后比较，避免枚举顺序抖动造成误判
+                        plugins_now.sort_unstable();
+                        let scale = current_monitor_scale(&app);
+                        let layout_changed = tb_now != last_tb_rect
+                            || tray_now != last_tray_rect
+                            || tasklist_now != last_tasklist_rect
+                            || Some(plugins_now.clone()) != last_plugins
+                            || (scale - last_scale).abs() > f64::EPSILON;
+                        if layout_changed {
+                            position_lyric_bar_in_taskbar(bar, scale);
+                            last_tb_rect = tb_now;
+                            last_tray_rect = tray_now;
+                            last_tasklist_rect = tasklist_now;
+                            last_plugins = Some(plugins_now);
+                            last_scale = scale;
+                        }
+                    }
+                } else {
+                    // 窗口已被外部销毁：重建
+                    if let Some(win) = app.get_webview_window("lyric-bar") {
+                        let _ = win.destroy();
+                    }
+                    let _ = create_lyric_bar(&app);
+                    last_tb_rect = None;
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+// 查询任务栏是否为浅色主题（DWM 沉浸式暗色模式），供歌词条选择文字配色。
+// 默认按深色处理：查询失败时保持白字（深色任务栏）的现状。
+fn get_taskbar_light_theme() -> bool {
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+
+    unsafe {
+        let Some(taskbar) = find_taskbar() else {
+            return false;
+        };
+        let mut dark_mode = BOOL(0);
+        if DwmGetWindowAttribute(
+            taskbar,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &mut dark_mode as *mut BOOL as *mut core::ffi::c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        )
+        .is_ok()
+        {
+            return !dark_mode.as_bool();
+        }
+    }
+    false
+}
+
+#[tauri::command]
+// 状态栏歌词位置偏好：'left' 任务栏左侧（开始按钮右侧），'right' 通知区左侧。
+// 歌词条存在时立即重新定位（含插件避让检测）。
+async fn set_lyric_bar_side(app: tauri::AppHandle, side: String) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+
+    let v = if side == "left" { 1u8 } else { 0u8 };
+    LYRIC_BAR_SIDE.store(v, Ordering::SeqCst);
+
+    let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
+    if raw != 0 {
+        let bar = HWND(raw as *mut core::ffi::c_void);
+        let scale = app
+            .primary_monitor()
+            .ok()
+            .flatten()
+            .map(|m| m.scale_factor())
+            .unwrap_or(1.0);
+        position_lyric_bar_in_taskbar(bar, scale);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+// 状态栏歌词边距偏好（逻辑像素）：距任务栏边缘的距离
+// （左侧 = 距任务栏左缘，右侧 = 距通知区左缘）。歌词条存在时立即重定位。
+async fn set_lyric_bar_gap(app: tauri::AppHandle, gap: u32) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+
+    LYRIC_BAR_GAP.store(gap.min(500), Ordering::SeqCst);
+
+    let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
+    if raw != 0 {
+        let bar = HWND(raw as *mut core::ffi::c_void);
+        let scale = app
+            .primary_monitor()
+            .ok()
+            .flatten()
+            .map(|m| m.scale_factor())
+            .unwrap_or(1.0);
+        position_lyric_bar_in_taskbar(bar, scale);
+    }
+    Ok(())
+}
+
+/// 前端偏好文件路径：跨 origin 持久化。
+/// dev 模式下前端跑在 http://127.0.0.1:1430（被占用时 CLI 会换随机端口），
+/// 直接运行 exe 时跑在 tauri://localhost——localStorage 按 origin 隔离，
+/// 端口/协议一变配置就"丢失"。存到后端文件后与 origin 无关。
+fn frontend_prefs_path() -> std::path::PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    base.join("qqmusic-monitor").join("frontend-prefs.json")
+}
+
+#[tauri::command]
+// 读取前端偏好 JSON（不存在时返回 null）
+async fn get_frontend_prefs() -> Result<Option<String>, String> {
+    match tokio::fs::read_to_string(frontend_prefs_path()).await {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Failed to read frontend prefs: {}", e)),
+    }
+}
+
+#[tauri::command]
+// 保存前端偏好 JSON（自动创建目录）
+async fn save_frontend_prefs(json: String) -> Result<(), String> {
+    let path = frontend_prefs_path();
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| format!("Failed to create prefs dir: {}", e))?;
+    }
+    tokio::fs::write(&path, json)
+        .await
+        .map_err(|e| format!("Failed to write frontend prefs: {}", e))
+}
+
+#[tauri::command]
+// 状态栏歌词开关：开启时创建歌词窗口并通过 SetParent 嵌入任务栏
+// （显示在通知区域左侧，任务栏自身交互不会盖住它），关闭时销毁。
+// 歌词条复用 song-info / playback-progress 事件。
+async fn set_lyric_bar_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri::Manager;
+
+    LYRIC_BAR_ENABLED.store(enabled, Ordering::SeqCst);
+
+    if enabled {
+        static WATCHDOG_RUNNING: AtomicBool = AtomicBool::new(false);
+        if !WATCHDOG_RUNNING.swap(true, Ordering::SeqCst) {
+            spawn_lyric_bar_watchdog(app.clone());
+        }
+        if app.get_webview_window("lyric-bar").is_none() {
+            create_lyric_bar(&app)?;
+        }
+    } else if let Some(win) = app.get_webview_window("lyric-bar") {
+        LYRIC_BAR_HWND.store(0, Ordering::SeqCst);
+        let _ = win.destroy();
+    }
+
+    Ok(())
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use widestring::U16String;
 
 mod cli;
 mod config;
@@ -304,7 +1010,6 @@ mod synchronization_tests {
 /// 每条含歌词文本 + QRC 逐字数据，按平均 8KB/条估算，128 条约 1MB 内存。
 const LYRICS_CACHE_MAX_ENTRIES: usize = 128;
 const LYRICS_RETRY_DELAY_MS: u64 = 30_000;
-const FILE_OUTPUT_MIN_INTERVAL_MS: u64 = 100;
 
 #[derive(Clone, Copy)]
 enum LyricsFetchState {
@@ -814,8 +1519,6 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
     let mut last_gui_snapshot: Option<SongInfo> = None;
     let mut stale_song_total: Option<u64> = None;
     let mut last_logged_lyric_key = String::new();
-    let mut last_json_write_at: Option<tokio::time::Instant> = None;
-    let mut last_written_lyric: Option<String> = None;
 
     // 主循环
     while running.load(Ordering::SeqCst) {
@@ -1380,98 +2083,35 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 
         // Tauri 主通道只在静态内容变化时发送完整快照；普通轮询仅发送
         // 数十字节的进度事件，前端仍按原轮询频率接收并进行 60fps 插值。
+        //
+        // 后台托盘模式（GUI_VISIBLE=false 且状态栏歌词未启用）：跳过 GUI
+        // 事件推送，省去 IPC 与序列化开销。歌词条启用时保持推送（其窗口
+        // 独立于主窗口显示）。API（watch 通道/HTTP）不受影响，仍每轮发送。
         if let Some(ref handle) = app_handle {
             use tauri::Emitter;
-            let static_changed = last_gui_snapshot
-                .as_ref()
-                .map(|previous| !same_gui_payload(previous, current_song_info.as_ref()))
-                .unwrap_or(true);
+            let gui_needed = GUI_VISIBLE.load(Ordering::SeqCst)
+                || LYRIC_BAR_ENABLED.load(Ordering::SeqCst);
+            if gui_needed {
+                let static_changed = last_gui_snapshot
+                    .as_ref()
+                    .map(|previous| !same_gui_payload(previous, current_song_info.as_ref()))
+                    .unwrap_or(true);
 
-            if static_changed {
-                if handle.emit("song-info", current_song_info.as_ref()).is_ok() {
-                    last_gui_snapshot = Some(current_song_info.as_ref().clone());
+                if static_changed {
+                    if handle.emit("song-info", current_song_info.as_ref()).is_ok() {
+                        last_gui_snapshot = Some(current_song_info.as_ref().clone());
+                    }
+                } else {
+                    let progress = PlaybackProgress::from(current_song_info.as_ref());
+                    let _ = handle.emit("playback-progress", progress);
                 }
-            } else {
-                let progress = PlaybackProgress::from(current_song_info.as_ref());
-                let _ = handle.emit("playback-progress", progress);
+            } else if last_gui_snapshot.is_some() {
+                // 后台期间不更新快照；恢复可见后第一轮强制发全量
+                last_gui_snapshot = None;
             }
         }
 
         // 写入文件
-        if config.settings.output_txt && song_changed {
-            if let Err(e) = write_info_to_txt(&current_song_info, &config.settings.txt_filename) {
-                if config.settings.debug_mode && !args.quiet {
-                    eprintln!("Error writing to txt file: {}", e);
-                }
-            }
-        }
-
-        if config.settings.output_json {
-            let json_due = song_changed
-                || last_json_write_at
-                    .map(|last_write| {
-                        last_write.elapsed()
-                            >= Duration::from_millis(FILE_OUTPUT_MIN_INTERVAL_MS)
-                    })
-                    .unwrap_or(true);
-
-            if json_due {
-                match write_info_to_json(&current_song_info, &config.settings.json_filename) {
-                    Ok(()) => last_json_write_at = Some(tokio::time::Instant::now()),
-                    Err(e) => {
-                        if config.settings.debug_mode && !args.quiet {
-                            eprintln!("Error writing to json file: {}", e);
-                        }
-                    }
-                }
-            }
-        } else {
-            last_json_write_at = None;
-        }
-
-        if config.settings.output_lyric {
-            let precise_time_ms = display_time_ms;
-            let mut filtered_lyrics = String::new();
-
-            if !current_song_info.qrc_data.is_empty() {
-                let (qrc_line, trans_line) = get_current_qrc_line(&current_song_info.qrc_data, &current_song_info.trans, precise_time_ms);
-                if let Some(line) = qrc_line {
-                    if trans_line.is_empty() {
-                        filtered_lyrics = line.content.clone();
-                    } else {
-                        filtered_lyrics = format!("{}\n{}", line.content, trans_line);
-                    }
-                }
-            }
-
-            if filtered_lyrics.is_empty() {
-                filtered_lyrics = filter_lyrics(&current_song_info.lyrics, &current_song_info.trans, current_song_info.current_time);
-            }
-
-            let display_lyric = if filtered_lyrics.trim().is_empty() {
-                if current_song_info.is_valid() && current_song_info.title != "No music playing" {
-                    "...\n\n".to_string()
-                } else {
-                    String::new()
-                }
-            } else {
-                filtered_lyrics
-            };
-
-            if last_written_lyric.as_deref() != Some(display_lyric.as_str()) {
-                match write_info_to_lyric_txt(&display_lyric, &config.settings.lyric_filename) {
-                    Ok(()) => last_written_lyric = Some(display_lyric),
-                    Err(e) => {
-                        if config.settings.debug_mode && !args.quiet {
-                            eprintln!("Error writing lyric to txt file: {}", e);
-                        }
-                    }
-                }
-            }
-        } else {
-            last_written_lyric = None;
-        }
-
         last_song_state = Some(LastSongState::from(current_song_info.as_ref()));
 
             Ok(())
@@ -1484,12 +2124,19 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
             tokio::time::sleep(Duration::from_secs(2)).await;
         } else {
             let elapsed = loop_start.elapsed();
-            // 固定按 update_interval_ms 轮询，不再随窗口可见性降频。
-            // 本程序的核心职责是实时向外提供数据（WebSocket/HTTP/文件），
-            // 窗口最小化/隐藏时若把轮询降到 2s，所有消费方（如壁纸应用）
-            // 的歌词/进度更新会滞后 ~2s——而 SMTC 事件通知已让空闲期的
-            // 实际唤醒次数很低，降频省下的 CPU 与体验损失不成比例。
-            let current_interval = Duration::from_millis(config.settings.update_interval_ms);
+            // 后台省电：主窗口隐藏、状态栏歌词未启用且同步服务关闭时降频
+            // 轮询（无任何实时消费方）。歌词条或同步服务（WebSocket/HTTP
+            // API）启用时绝不降频；SMTC 状态变化事件仍会在降频期间立即
+            // 唤醒处理。
+            let backend_interval = config.settings.update_interval_ms;
+            let current_interval = if !GUI_VISIBLE.load(Ordering::SeqCst)
+                && !LYRIC_BAR_ENABLED.load(Ordering::SeqCst)
+                && !config.settings.enable_server
+            {
+                Duration::from_millis(backend_interval.max(1000))
+            } else {
+                Duration::from_millis(backend_interval)
+            };
             if elapsed < current_interval {
                 // 除周期 tick 外，SMTC 事件（暂停/恢复/seek/切歌）随时
                 // 唤醒主循环做下一轮，把状态切换延迟从轮询周期压到 ~10ms 级
@@ -1510,30 +2157,6 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 fn apply_cli_overrides(mut config: Config, args: &Cli) -> Config {
     if args.debug {
         config.settings.debug_mode = true;
-    }
-    
-    if args.no_txt {
-        config.settings.output_txt = false;
-    }
-    
-    if args.no_json {
-        config.settings.output_json = false;
-    }
-
-    if args.no_lyric {
-        config.settings.output_lyric = false;
-    }
-    
-    if args.txt_file != "now_playing.txt" {
-        config.settings.txt_filename = args.txt_file.clone();
-    }
-    
-    if args.json_file != "now_playing.json" {
-        config.settings.json_filename = args.json_file.clone();
-    }
-    
-    if args.lyric_file != "current_lyric.txt" {
-        config.settings.lyric_filename = args.lyric_file.clone();
     }
     
     // CLI --interval 如果指定，则覆盖配置文件
@@ -1560,64 +2183,6 @@ fn apply_cli_overrides(mut config: Config, args: &Cli) -> Config {
 
     
     config
-}
-
-/// 将歌曲信息写入文本文件 (UTF-16 LE)
-fn write_info_to_txt(info: &SongInfo, filename: &str) -> Result<()> {
-    let mut file = File::create(filename)?;
-    let u16_string = U16String::from_str(&info.title);
-    let bytes: Vec<u8> = u16_string.into_vec().into_iter().flat_map(|c| c.to_le_bytes().to_vec()).collect();
-    let mut final_bytes = vec![0xFF, 0xFE]; 
-    final_bytes.extend(bytes);
-    file.write_all(&final_bytes)?;
-    Ok(())
-}
-
-/// 过滤并提取当前进度的歌词
-/// 注意：这里的实现比较简化，SMTC不提供精确的歌词行时间戳，
-/// 且从网络下载的LRC是整个文件。
-/// 根据当前时间获取对应的 QRC 行和翻译
-fn get_current_qrc_line<'a>(qrc_data: &'a [QrcLine], trans: &'a str, current_time_ms: u64) -> (Option<&'a QrcLine>, String) {
-    let mut current_line: Option<&QrcLine> = None;
-    let mut max_start_time = 0;
-
-    for line in qrc_data {
-        // 如果当前时间已经超过这行的开始时间
-        if current_time_ms >= line.start_time_ms && line.start_time_ms >= max_start_time {
-            max_start_time = line.start_time_ms;
-            current_line = Some(line);
-        }
-    }
-
-    let mut current_trans = String::new();
-    if let Some(line) = current_line {
-        // 尝试从翻译中找出对应时间戳的行（最近邻匹配）
-        if !trans.is_empty() {
-            let line_time_sec = line.start_time_ms as f64 / 1000.0;
-            let mut best_diff = f64::MAX;
-            for trans_line in trans.lines() {
-                if let Some(start_bracket) = trans_line.find('[') {
-                    if let Some(end_bracket) = trans_line.find(']') {
-                        let text = trans_line[end_bracket+1..].trim();
-                        // Skip empty lines and "//" placeholders
-                        if text.is_empty() || text == "//" {
-                            continue;
-                        }
-                        let time_str = &trans_line[start_bracket+1..end_bracket];
-                        if let Ok(time_val) = parse_lrc_time(time_str) {
-                            let diff = (time_val - line_time_sec).abs();
-                            if diff < 0.1 && diff < best_diff {
-                                best_diff = diff;
-                                current_trans = text.to_string();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    (current_line, current_trans)
 }
 
 /// 在字符索引处拆分字符串（支持中文字符）
@@ -1710,77 +2275,6 @@ fn render_qrc_line(line: &QrcLine, current_time_ms: u64, debug: bool) -> String 
     result
 }
 
-/// 过滤并提取当前进度的歌词（支持双语）
-fn filter_lyrics(lyrics: &str, trans: &str, current_time_sec: u64) -> String {
-    let mut current_lyric = String::new();
-    let mut current_trans = String::new();
-    let mut max_time = -1.0;
-
-    // 查找原文
-    for line in lyrics.lines() {
-        if let Some(start_bracket) = line.find('[') {
-            if let Some(end_bracket) = line.find(']') {
-                let time_str = &line[start_bracket+1..end_bracket];
-                if let Ok(time_val) = parse_lrc_time(time_str) {
-                    if time_val <= current_time_sec as f64 && time_val > max_time {
-                        max_time = time_val;
-                        current_lyric = line[end_bracket+1..].trim().to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    // 如果有翻译，查找对应的翻译行
-    if !trans.is_empty() && max_time >= 0.0 {
-        for line in trans.lines() {
-            if let Some(start_bracket) = line.find('[') {
-                if let Some(end_bracket) = line.find(']') {
-                    let time_str = &line[start_bracket+1..end_bracket];
-                    if let Ok(time_val) = parse_lrc_time(time_str) {
-                        let text = line[end_bracket+1..].trim();
-                        // Skip empty lines and "//" placeholders
-                        if text.is_empty() || text == "//" {
-                            continue;
-                        }
-                        if (time_val - max_time).abs() < 0.1 {
-                            current_trans = text.to_string();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // 如果没有带时间轴的原文，则退而求其次显示第一行
-    if max_time == -1.0 && !lyrics.is_empty() {
-        for line in lyrics.lines() {
-            if !line.trim().is_empty() && !line.starts_with("[") {
-                 current_lyric = line.trim().to_string();
-                 break;
-            }
-        }
-    }
-
-    if current_trans.is_empty() {
-        current_lyric
-    } else {
-        format!("{}\n{}", current_lyric, current_trans)
-    }
-}
-
-fn parse_lrc_time(time_str: &str) -> Result<f64, ()> {
-    // mm:ss.xx or mm:ss
-    let parts: Vec<&str> = time_str.split(':').collect();
-    if parts.len() == 2 {
-        let min: f64 = parts[0].parse().map_err(|_| ())?;
-        let sec: f64 = parts[1].parse().map_err(|_| ())?;
-        return Ok(min * 60.0 + sec);
-    }
-    Err(())
-}
-
 /// 渲染内容并补空格到指定可见宽度
 /// 解决 Stylize 的 ANSI 转义码被 `{:<w}` 计入宽度的问题
 fn pad_line(text: &str, styled: String, width: usize) -> String {
@@ -1813,24 +2307,32 @@ fn pad_styled(styled: &str, width: usize) -> String {
     }
 }
 
-/// 将歌曲信息完整写入JSON文件
-fn write_info_to_json(info: &SongInfo, filename: &str) -> Result<()> {
-    let mut file = File::create(filename)?;
-    let json_string = serde_json::to_string_pretty(info)?;
-    file.write_all(json_string.as_bytes())?;
-    Ok(())
-}
-
-/// 单独将当前歌词写入文本文件 (UTF-16 LE)
-fn write_info_to_lyric_txt(lyric: &str, filename: &str) -> Result<()> {
-    let mut file = File::create(filename)?;
-    let u16_string = U16String::from_str(lyric);
-    let bytes: Vec<u8> = u16_string.into_vec().into_iter().flat_map(|c| c.to_le_bytes().to_vec()).collect();
-    // 添加 UTF-16 LE BOM 方便 Windows Notepad 和 OBS 等识别
-    let mut final_bytes = vec![0xFF, 0xFE]; 
-    final_bytes.extend(bytes);
-    file.write_all(&final_bytes)?;
-    Ok(())
+/// 渲染内容并补空格到指定可见宽度
+/// 解决 Stylize 的 ANSI 转义码被 `{:<w}` 计入宽度的问题
+/// 恢复并聚焦主窗口（托盘单击 / 菜单"显示"共用）。
+///
+/// Windows 前台焦点锁：从托盘回调中 set_focus 常被系统拒绝
+/// （后台进程抢前台限制），因此立即恢复一次，再延迟重试聚焦，
+/// 确保窗口真正获得键盘焦点。
+fn show_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    // 恢复前台模式：主循环立即恢复全量 GUI 推送与正常轮询频率
+    GUI_VISIBLE.store(true, Ordering::SeqCst);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        use tauri::Manager;
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        if let Some(w) = handle.get_webview_window("main") {
+            let _ = w.show();
+            let _ = w.unminimize();
+            let _ = w.set_focus();
+        }
+    });
 }
 
 #[tokio::main]
@@ -1868,8 +2370,48 @@ async fn main() -> Result<()> {
 
     // 启动 Tauri 窗口
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_app_config, save_app_config, get_current_song_info, media_toggle_play_pause, media_next, media_previous])
+        .invoke_handler(tauri::generate_handler![get_app_config, save_app_config, get_current_song_info, media_toggle_play_pause, media_next, media_previous, window_hidden, set_lyric_bar_enabled, set_lyric_bar_side, set_lyric_bar_gap, get_taskbar_light_theme, get_frontend_prefs, save_frontend_prefs])
         .setup(move |app| {
+            // —— 系统托盘（后台模式）——
+            // 窗口最小化/隐藏到托盘后，托盘小图标保留在任务栏通知区域，
+            // 单击托盘图标或菜单"显示"恢复窗口，"退出"结束整个应用。
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+            use tauri::Manager;
+
+            let show_item = MenuItem::with_id(app, "show", "显示 QQMusic Monitor", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().expect("missing default window icon").clone())
+                .tooltip("QQMusic Monitor")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => show_main_window(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    // 左键单击恢复窗口；右键交给系统弹出菜单
+                    if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
+            // 主窗口关闭 = 退出整个应用（同时销毁歌词条，避免其阻止进程退出）
+            if let Some(main_win) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
+                main_win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        handle.exit(0);
+                    }
+                });
+            }
+
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()

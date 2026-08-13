@@ -48,3 +48,72 @@ export function mediaControl(action) {
                : 'media_previous';
     window.__TAURI__.core.invoke(cmd);
 }
+
+/**
+ * 获取 Tauri 当前窗口对象（懒加载）。
+ * @returns {Promise<any> | null} 非 Tauri 环境返回 null
+ */
+export function getAppWindow() {
+    if (!window.__TAURI__) return null;
+    return window.__TAURI__.window.getCurrentWindow();
+}
+
+/**
+ * 窗口控制命令。
+ * @param {'minimize' | 'maximize' | 'close'} action
+ *
+ * minimize 为后台模式：隐藏窗口（从任务栏移除），保留系统托盘小图标，
+ * 单击托盘图标或托盘菜单"显示"可恢复窗口。
+ */
+export function windowControl(action) {
+    const appWindow = getAppWindow();
+    if (!appWindow) return;
+    if (action === 'minimize') {
+        // 先通知后端进入后台省电模式（停 GUI 推送；API 开启时不影响），再隐藏窗口
+        window.__TAURI__.core.invoke('window_hidden').catch(() => {});
+        appWindow.hide();
+    }
+    else if (action === 'maximize') appWindow.toggleMaximize();
+    else if (action === 'close') appWindow.close();
+}
+
+/**
+ * 查询窗口是否最大化。
+ * @returns {Promise<boolean>}
+ */
+export async function isWindowMaximized() {
+    const appWindow = getAppWindow();
+    if (!appWindow) return false;
+    try {
+        return await appWindow.isMaximized();
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * 订阅窗口尺寸变化（用于最大化/还原图标切换）。
+ * @param {(maximized: boolean) => void} callback
+ */
+export async function onWindowResized(callback) {
+    const appWindow = getAppWindow();
+    if (!appWindow) return;
+    try {
+        await appWindow.onResized(() => {
+            appWindow.isMaximized().then(callback).catch(() => {});
+        });
+    } catch {
+        /* 权限不足时忽略 */
+    }
+}
+
+/**
+ * 开始拖动窗口（自定义标题栏）。
+ * @returns {boolean} 是否已发起拖动
+ */
+export function startWindowDragging() {
+    const appWindow = getAppWindow();
+    if (!appWindow) return false;
+    appWindow.startDragging();
+    return true;
+}

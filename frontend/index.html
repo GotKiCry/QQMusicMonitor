@@ -16,19 +16,10 @@
     <link rel="stylesheet" href="css/responsive.css">
 </head>
 <body data-theme="aurora-cyan">
-    <!-- Animated Glowing Background Orbs -->
-    <div class="aurora-bg">
-        <div class="blob blob-1"></div>
-        <div class="blob blob-2"></div>
-        <div class="blob blob-3"></div>
-    </div>
-    <!-- Ambient Blur Album Cover Background -->
-    <div class="album-blur-bg" id="album-blur-bg"></div>
-
     <!-- Main Desktop Container -->
     <div class="app-card">
         <!-- Top Status Bar -->
-        <header class="top-header">
+        <header class="top-header" id="top-header">
             <div class="system-status">
                 <span class="status-indicator" id="status-dot"></span>
                 <span class="status-label" id="status-text">OFFLINE</span>
@@ -54,11 +45,30 @@
                 </button>
             </div>
             <div class="header-title">QQ MUSIC MONITOR</div>
-            <button class="settings-trigger-btn" id="btn-settings" title="偏好设置">
-                <svg viewBox="0 0 24 24" class="svg-icon">
-                    <path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/>
-                </svg>
-            </button>
+            <div class="header-actions">
+                <button class="settings-trigger-btn" id="btn-settings" title="偏好设置">
+                    <svg viewBox="0 0 24 24" class="svg-icon">
+                        <path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/>
+                    </svg>
+                </button>
+                <div class="window-controls" id="window-controls">
+                    <button class="win-btn" id="btn-win-min" title="最小化到托盘">
+                        <svg viewBox="0 0 24 24" class="svg-icon win-icon">
+                            <path d="M5.5 12h13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+                    <button class="win-btn" id="btn-win-max" title="最大化">
+                        <svg viewBox="0 0 24 24" class="svg-icon win-icon" id="icon-win-state">
+                            <rect x="5" y="5" width="14" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.8"/>
+                        </svg>
+                    </button>
+                    <button class="win-btn win-btn-close" id="btn-win-close" title="关闭">
+                        <svg viewBox="0 0 24 24" class="svg-icon win-icon">
+                            <path d="M6.5 6.5l11 11M17.5 6.5l-11 11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
         </header>
 
         <!-- Two Column Main Body -->
@@ -142,41 +152,36 @@
                     </div>
                 </fieldset>
 
-                <!-- Group 2: OBS File Exports -->
+                <!-- Group 2: Status Bar Lyric -->
                 <fieldset class="setting-group">
-                    <legend>OBS 文件输出设置</legend>
-                    
+                    <legend>状态栏歌词</legend>
+
                     <div class="setting-item flex-row">
                         <div>
-                            <span class="setting-title">输出 now_playing.txt</span>
-                            <p class="helper-text">在根目录写入 UTF-16 LE 纯文本歌名</p>
+                            <span class="setting-title">状态栏歌词</span>
+                            <p class="helper-text">在系统任务栏显示当前歌词（鼠标穿透）</p>
                         </div>
                         <label class="switch">
-                            <input type="checkbox" id="chk-out-txt">
+                            <input type="checkbox" id="toggle-lyric-bar">
                             <span class="switch-slider"></span>
                         </label>
                     </div>
 
-                    <div class="setting-item flex-row">
-                        <div>
-                            <span class="setting-title">输出 now_playing.json</span>
-                            <p class="helper-text">写入包含完整歌曲播放状态的 JSON 文件</p>
+                    <div class="setting-item">
+                        <span class="setting-title">歌词显示位置</span>
+                        <div class="seg-control">
+                            <button class="seg-btn" id="btn-lyric-side-left" title="显示在任务栏左侧（开始按钮右侧）">左侧</button>
+                            <button class="seg-btn" id="btn-lyric-side-right" title="显示在任务栏右侧（通知区左侧）">右侧</button>
                         </div>
-                        <label class="switch">
-                            <input type="checkbox" id="chk-out-json">
-                            <span class="switch-slider"></span>
-                        </label>
                     </div>
 
-                    <div class="setting-item flex-row">
-                        <div>
-                            <span class="setting-title">输出 current_lyric.txt</span>
-                            <p class="helper-text">单独输出当前正在唱的一行歌词文件</p>
+                    <div class="setting-item">
+                        <div class="setting-info">
+                            <label for="cfg-lyric-bar-gap">歌词条边距</label>
+                            <span class="badge" id="val-lyric-bar-gap">0px</span>
                         </div>
-                        <label class="switch">
-                            <input type="checkbox" id="chk-out-lyric">
-                            <span class="switch-slider"></span>
-                        </label>
+                        <input type="range" id="cfg-lyric-bar-gap" min="0" max="200" step="1" value="0">
+                        <p class="helper-text">歌词条与任务栏边缘的距离：左侧 = 距左缘（0 为贴边），右侧 = 距通知区左缘</p>
                     </div>
                 </fieldset>
 
@@ -218,7 +223,14 @@
                             <button class="theme-dot dot-purple" data-theme="aurora-purple" title="罗兰紫"></button>
                             <button class="theme-dot dot-emerald" data-theme="aurora-emerald" title="翡翠绿"></button>
                             <button class="theme-dot dot-sunset" data-theme="aurora-sunset" title="落日橙"></button>
+                            <button class="theme-dot theme-dot-auto" data-theme="auto" title="自动（专辑封面取色）"></button>
+                            <div class="theme-dot-wrap">
+                                <button class="theme-dot theme-dot-custom" id="theme-dot-custom" title="自定义颜色（取色盘）"></button>
+                                <!-- 0 尺寸隐藏输入：不渲染任何表面（无方块），仅作取色器锚点，由按钮点击驱动 -->
+                                <input type="color" id="custom-color" class="hidden-color-input" value="#14b8a6">
+                            </div>
                         </div>
+                        <p class="helper-text">自动主题随专辑封面变色，切换歌曲时实时更新。</p>
                     </div>
                 </fieldset>
 

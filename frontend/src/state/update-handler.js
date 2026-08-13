@@ -17,6 +17,7 @@ import {
 import { parseTranslation } from '../lyrics/translation.js';
 import { buildLyricsArea, showLoadingPlaceholder } from '../lyrics/builder.js';
 import { preloadAlbumArt, resetAlbumArt } from '../utils/dom.js';
+import { extractAlbumColor, paintCustomTheme, AUTO_COLOR_KEY } from '../config/theme.js';
 
 /** 切歌后已收到几次非切歌更新（用于延迟歌词构建直到进度稳定） */
 let postChangeCount = 0;
@@ -26,6 +27,9 @@ let serverBehindCount = 0;
 
 /** 死区内允许的最大连续落后采样数：超出则判定为系统性偏差，snap 收敛 */
 const SERVER_BEHIND_SNAP_SAMPLES = 5;
+
+/** 自动主题取色请求序号：只允许最新一次请求的结果落地 */
+let autoColorSeq = 0;
 
 /**
  * @param {Object} els - DOM 元素集合
@@ -215,6 +219,28 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
         preloadAlbumArt(els, data.album_pic_url, data.album_pic_hd_url);
     } else if (!data.title || data.title === 'No music playing' || data.title === 'ERROR') {
         resetAlbumArt(els);
+    }
+
+    // —— 自动主题（专辑取色）——
+    // 主窗口负责提取封面主色并发布到 localStorage（歌词条窗口经
+    // storage 事件跟随），序号保证切歌竞态下只有最新结果落地。
+    if (cfg.theme === 'auto') {
+        const seq = ++autoColorSeq;
+        if (data.album_pic_url) {
+            extractAlbumColor(data.album_pic_url).then((hex) => {
+                if (seq !== autoColorSeq || cfg.theme !== 'auto') return;
+                try {
+                    if (hex) localStorage.setItem(AUTO_COLOR_KEY, hex);
+                    else localStorage.removeItem(AUTO_COLOR_KEY);
+                } catch {}
+                paintCustomTheme(hex);
+            });
+        } else {
+            try {
+                localStorage.removeItem(AUTO_COLOR_KEY);
+            } catch {}
+            paintCustomTheme(null);
+        }
     }
 
     // —— 播放状态动画 ——

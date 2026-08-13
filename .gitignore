@@ -58,3 +58,8 @@ node_modules/
 
 # Reasonix Agent 文件夹
 .reasonix/
+
+# 测试与截图临时产物
+tmp/
+.playwright-mcp/
+

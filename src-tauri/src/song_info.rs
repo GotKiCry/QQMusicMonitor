@@ -11,7 +11,7 @@ pub struct QrcLine {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct QrcWord {
     pub content: String,
-    pub start_time_ms: u64, // Relative to line start
+    pub start_time_ms: u64, // Absolute time relative to song start (XML and QRC-text parsers both output absolute values)
     pub duration_ms: u64,
 }
 

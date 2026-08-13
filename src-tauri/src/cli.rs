@@ -4,7 +4,7 @@ use clap::Parser;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "QQMusic Reader")]
 #[command(version = "1.0")]
-#[command(about = "实时读取QQ音乐播放信息并输出到文件", long_about = None)]
+#[command(about = "实时读取QQ音乐播放信息并通过窗口/同步服务展示", long_about = None)]
 #[command(disable_version_flag = true)]
 #[command(disable_help_flag = true)]
 pub struct Cli {
@@ -16,33 +16,9 @@ pub struct Cli {
     #[arg(short, long)]
     pub debug: bool,
 
-    /// 禁用文本文件输出
-    #[arg(long)]
-    pub no_txt: bool,
-
-    /// 禁用JSON文件输出
-    #[arg(long)]
-    pub no_json: bool,
-
-    /// 禁用单独的歌词文件输出
-    #[arg(long)]
-    pub no_lyric: bool,
-
     /// 禁用本地同步服务
     #[arg(long)]
     pub no_server: bool,
-
-    /// 自定义文本输出文件名
-    #[arg(long, default_value = "now_playing.txt")]
-    pub txt_file: String,
-
-    /// 自定义JSON输出文件名
-    #[arg(long, default_value = "now_playing.json")]
-    pub json_file: String,
-
-    /// 自定义单独歌词输出文件名
-    #[arg(long, default_value = "current_lyric.txt")]
-    pub lyric_file: String,
 
     /// 更新间隔（毫秒），不指定则使用配置文件
     #[arg(short, long)]
@@ -96,13 +72,7 @@ impl Cli {
         println!("选项:");
         println!("  -c, --config <文件>     配置文件路径 (默认: config.toml)");
         println!("  -d, --debug             启用调试模式");
-        println!("      --no-txt            禁用文本文件输出");
-        println!("      --no-json           禁用JSON文件输出");
-        println!("      --no-lyric          禁用单独歌词文件输出");
         println!("      --no-server         禁用本地同步服务");
-        println!("      --txt-file <文件>   自定义文本输出文件名 (默认: now_playing.txt)");
-        println!("      --json-file <文件>  自定义JSON输出文件名 (默认: now_playing.json)");
-        println!("      --lyric-file <文件> 自定义单独歌词输出文件名 (默认: current_lyric.txt)");
         println!("  -i, --interval <毫秒>   更新间隔 (不指定则使用配置文件)");
         println!("  -o, --offset <毫秒>     SMTC 滞后补偿量 (不指定则使用配置文件)");
         println!("      --port <端口>       自定义同步服务端口 (默认: 3000)");
@@ -114,7 +84,6 @@ impl Cli {
         println!();
         println!("示例:");
         println!("  qqmusic-reader -d --interval 1000");
-        println!("  qqmusic-reader --no-json --txt-file music_info.txt");
         println!("  qqmusic-reader -c custom_config.toml");
     }
 }

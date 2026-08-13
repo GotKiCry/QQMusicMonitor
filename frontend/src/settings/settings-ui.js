@@ -7,6 +7,41 @@
 
 import { fetchBackendConfig, saveBackendConfig } from '../config/backend-config.js';
 import { saveFrontendConfig } from '../config/frontend-config.js';
+import { paintCustomTheme, presetThemeColor, loadAutoColor } from '../config/theme.js';
+
+/** Tauri 环境：向后端同步状态栏歌词窗口开关 */
+function syncLyricBarToBackend(enabled) {
+    if (window.__TAURI__) {
+        window.__TAURI__.core.invoke('set_lyric_bar_enabled', { enabled }).catch((e) => {
+            console.error('Failed to toggle lyric bar:', e);
+        });
+    }
+}
+
+/** 主题变化时广播给其他窗口（状态栏歌词条等）实时同步 */
+function notifyThemeChanged() {
+    if (window.__TAURI__) {
+        window.__TAURI__.event.emit('theme-changed').catch(() => {});
+    }
+}
+
+/** 设置歌词条位置偏好并通知后端重新定位 */
+function setLyricBarSide(els, front, side) {
+    front.lyricBarSide = side;
+    saveFrontendConfig(front);
+    markLyricSide(els, front);
+    if (window.__TAURI__ && front.lyricBar) {
+        window.__TAURI__.core.invoke('set_lyric_bar_side', { side }).catch((e) => {
+            console.error('Failed to set lyric bar side:', e);
+        });
+    }
+}
+
+/** 高亮当前歌词条位置按钮 */
+function markLyricSide(els, front) {
+    els.btnLyricSideLeft.classList.toggle('active', front.lyricBarSide === 'left');
+    els.btnLyricSideRight.classList.toggle('active', front.lyricBarSide === 'right');
+}
 
 /**
  * @param {Object} deps
@@ -79,20 +114,6 @@ export function wireUpSettings({ els, configs, onFrontConfigChange }) {
         alert('同步端口已保存到 config.toml，请重启程序以启用新的服务端口。');
     });
 
-    // —— OBS 文件输出 ——
-    els.chkOutTxt.addEventListener('change', () => {
-        back.outputTxt = els.chkOutTxt.checked;
-        saveBackendConfig(back);
-    });
-    els.chkOutJson.addEventListener('change', () => {
-        back.outputJson = els.chkOutJson.checked;
-        saveBackendConfig(back);
-    });
-    els.chkOutLyric.addEventListener('change', () => {
-        back.outputLyric = els.chkOutLyric.checked;
-        saveBackendConfig(back);
-    });
-
     // —— 前端外观：字号 ——
     els.cfgFontSize.addEventListener('input', () => {
         const val = parseInt(els.cfgFontSize.value, 10);
@@ -129,16 +150,84 @@ export function wireUpSettings({ els, configs, onFrontConfigChange }) {
         els.debugPanel.hidden = !front.debug;
     });
 
+    // —— 状态栏歌词 ——
+    els.toggleLyricBar.addEventListener('change', () => {
+        front.lyricBar = els.toggleLyricBar.checked;
+        saveFrontendConfig(front);
+        syncLyricBarToBackend(front.lyricBar);
+    });
+
+    // —— 歌词条位置（左/右） ——
+    els.btnLyricSideLeft.addEventListener('click', () => setLyricBarSide(els, front, 'left'));
+    els.btnLyricSideRight.addEventListener('click', () => setLyricBarSide(els, front, 'right'));
+
+    // —— 歌词条边距（距任务栏边缘；左侧=距左缘，右侧=距通知区左缘） ——
+    els.cfgLyricBarGap.addEventListener('input', () => {
+        els.valLyricBarGap.textContent = `${parseInt(els.cfgLyricBarGap.value, 10)}px`;
+    });
+    els.cfgLyricBarGap.addEventListener('change', () => {
+        front.lyricBarGap = parseInt(els.cfgLyricBarGap.value, 10);
+        saveFrontendConfig(front);
+        if (window.__TAURI__ && front.lyricBar) {
+            window.__TAURI__.core.invoke('set_lyric_bar_gap', { gap: front.lyricBarGap }).catch((e) => {
+                console.error('Failed to set lyric bar gap:', e);
+            });
+        }
+    });
+
     // —— 主题选择 ——
-    document.querySelectorAll('.theme-dot').forEach((dot) => {
+    document.querySelectorAll('.theme-dot[data-theme]').forEach((dot) => {
         dot.addEventListener('click', () => {
             const theme = dot.getAttribute('data-theme') || 'aurora-cyan';
-            front.theme = theme;
-            document.body.setAttribute('data-theme', theme);
-            saveFrontendConfig(front);
-            document.querySelectorAll('.theme-dot').forEach((d) => d.classList.remove('active'));
-            dot.classList.add('active');
+            applyTheme(els, front, theme);
         });
+    });
+
+    // —— 自定义取色盘 ——
+    // 取色按钮驱动 0 尺寸隐藏输入打开原生取色器
+    els.themeDotCustom.addEventListener('click', () => {
+        els.customColor.click();
+    });
+    els.customColor.addEventListener('input', () => {
+        const hex = els.customColor.value;
+        front.theme = 'custom';
+        front.customColor = hex;
+        document.body.setAttribute('data-theme', 'custom');
+        paintCustomTheme(hex);
+        saveFrontendConfig(front);
+        markActiveTheme('custom');
+        notifyThemeChanged();
+    });
+}
+
+/** 应用主题：预设主题名 / 'auto'（专辑取色）/ 'custom'（配合 customColor 使用） */
+function applyTheme(els, front, theme) {
+    front.theme = theme;
+    document.body.setAttribute('data-theme', theme);
+    if (theme === 'auto') {
+        // 自动主题：应用最近一次专辑取色结果（无则回落默认 token）
+        paintCustomTheme(loadAutoColor());
+        els.customColor.value = presetThemeColor(theme);
+    } else {
+        paintCustomTheme(null); // 清除变量覆盖，回落到 token 定义
+        if (theme === 'custom') {
+            paintCustomTheme(front.customColor || els.customColor.value);
+        } else {
+            // 取色盘随主题显示一个参考色，方便接着微调
+            els.customColor.value = presetThemeColor(theme);
+        }
+    }
+    saveFrontendConfig(front);
+    markActiveTheme(theme);
+    notifyThemeChanged();
+}
+
+/** 高亮当前激活的主题圆点 */
+function markActiveTheme(theme) {
+    document.querySelectorAll('.theme-dot').forEach((d) => {
+        d.classList.toggle('active', theme === 'custom'
+            ? d.id === 'theme-dot-custom'
+            : d.getAttribute('data-theme') === theme);
     });
 }
 
@@ -155,26 +244,33 @@ export function syncConfigToUI(els, front, back) {
     els.cfgInterval.value = String(back.intervalMs);
     els.valInterval.textContent = `${back.intervalMs}ms`;
     els.cfgPort.value = String(back.port);
-    els.chkOutTxt.checked = back.outputTxt;
-    els.chkOutJson.checked = back.outputJson;
-    els.chkOutLyric.checked = back.outputLyric;
 
     // 前端
     document.documentElement.style.setProperty('--lyric-font-size', `${front.fontSize}px`);
     document.documentElement.style.setProperty('--lyric-font-weight', `${front.fontWeight}`);
     document.body.setAttribute('data-theme', front.theme);
+    if (front.theme === 'auto') {
+        paintCustomTheme(loadAutoColor());
+        els.customColor.value = presetThemeColor(front.theme);
+    } else if (front.theme === 'custom') {
+        paintCustomTheme(front.customColor || els.customColor.value);
+        els.customColor.value = front.customColor || els.customColor.value;
+    } else {
+        paintCustomTheme(null);
+        els.customColor.value = presetThemeColor(front.theme);
+    }
     els.cfgFontSize.value = String(front.fontSize);
     els.valFontSize.textContent = `${front.fontSize}px`;
     els.cfgFontWeight.value = String(front.fontWeight);
     els.valFontWeight.textContent = String(front.fontWeight);
     els.toggleTrans.checked = front.showTranslation;
+    els.toggleLyricBar.checked = front.lyricBar;
     els.toggleDebug.checked = front.debug;
+    els.cfgLyricBarGap.value = String(front.lyricBarGap || 0);
+    els.valLyricBarGap.textContent = `${front.lyricBarGap || 0}px`;
     els.debugPanel.hidden = !front.debug;
+    markLyricSide(els, front);
 
     // 主题点
-    document.querySelectorAll('.theme-dot').forEach((dot) => {
-        const theme = dot.getAttribute('data-theme');
-        if (theme === front.theme) dot.classList.add('active');
-        else dot.classList.remove('active');
-    });
+    markActiveTheme(front.theme);
 }

@@ -329,6 +329,93 @@ input[type="range"]::-webkit-slider-thumb:hover {
 .dot-emerald { background-color: #10b981; }
 .dot-sunset { background-color: #f97316; }
 
+/* —— 自动主题（专辑封面取色）：SVG 圆环图案 —— */
+/* WebView2 对 20px 小尺寸 conic/radial 渐变中心会细分出多边形方块瑕疵，
+   改用 SVG data URI 矢量绘制（几何渲染，不经过渐变细分器） */
+/* —— 自动主题（专辑封面取色）：白色粗描边圆环 + 中央彩色小圆点 —— */
+/* 白环=动态变化，中心圆点=当前 --theme-primary（主题主色 / 专辑取色结果），
+   由 paintAutoDot() 在主题切换时动态重写 SVG；CSS 中的 #14b8a6 仅作
+   页面初始化前（即 JS 跑起来之前）的瞬态占位，避免和落日橙主题撞色。
+   SVG 纯色矢量绘制，规避 WebView2 小尺寸 conic/radial 渐变中心细分出方块的渲染瑕疵 */
+.theme-dot-auto {
+    border-radius: 50%;
+    overflow: hidden;
+    padding: 0;
+    -webkit-appearance: none;
+    appearance: none;
+    background-color: #0a0e17;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2020%2020%27%3E%3Ccircle%20cx%3D%2710%27%20cy%3D%2710%27%20r%3D%278.5%27%20fill%3D%27none%27%20stroke%3D%27%23ffffff%27%20stroke-width%3D%273%27%2F%3E%3Ccircle%20cx%3D%2710%27%20cy%3D%2710%27%20r%3D%272.8%27%20fill%3D%27%2314b8a6%27%2F%3E%3C%2Fsvg%3E");
+    background-size: cover;
+    background-position: center;
+}
+/* —— 分段选择（歌词条左右位置） —— */
+.seg-control {
+    display: inline-flex;
+    margin-top: 6px;
+    padding: 3px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border-glass);
+    gap: 2px;
+}
+
+.seg-btn {
+    border: none;
+    background: transparent;
+    color: var(--text-sub);
+    font-family: var(--font-body);
+    font-size: 0.78rem;
+    padding: 5px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: var(--transition-base);
+}
+
+.seg-btn:hover {
+    color: var(--text-main);
+}
+
+.seg-btn.active {
+    background: var(--theme-gradient);
+    color: #ffffff;
+}
+
+/* —— 自定义取色盘圆点 —— */
+/* 按钮 + 0 尺寸隐藏输入：WebView2 下小尺寸伪元素/原生取色控件
+   会渲染出方块瑕疵，这里不渲染任何输入表面，方块无从出现 */
+.theme-dot-wrap {
+    position: relative;
+    width: 20px;
+    height: 20px;
+    flex: 0 0 auto;
+}
+
+/* —— 自定义调色盘圆点：完整色相环 —— */
+/* conic-gradient 360° 彩虹（红→橙→黄→绿→青→蓝→紫→红，最高饱和亮度），
+   无描边，与 auto 圆点的白色描边形成对比；0 尺寸隐藏输入无渲染表面 */
+.theme-dot-custom {
+    position: relative;
+    overflow: hidden;
+    border-radius: 50%;
+    padding: 0;
+    -webkit-appearance: none;
+    appearance: none;
+    background: conic-gradient(from 135deg, #ff0000, #ff8000, #ffff00, #00ff00, #00ffff, #0000ff, #7f00ff, #ff0000);
+}
+.hidden-color-input {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 0;
+    height: 0;
+    padding: 0;
+    margin: 0;
+    border: none;
+    opacity: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+
 /* —— 开发者调试控制区 —— */
 .debug-panel {
     background-color: rgba(0, 0, 0, 0.25);
