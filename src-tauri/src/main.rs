@@ -1,3 +1,5 @@
+// Hide the console window in release builds; keep it in debug builds for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(dead_code)]
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};

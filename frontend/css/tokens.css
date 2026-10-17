@@ -31,10 +31,11 @@
     --color-warning: #f59e0b;
     --color-error: #ef4444;
 
-    /* 字体排版 */
-    --font-heading: 'Outfit', 'Inter', -apple-system, sans-serif;
-    --font-body: 'Inter', -apple-system, sans-serif;
-    --font-mono: 'JetBrains Mono', monospace;
+    /* 字体排版：界面以中文为主，Inter/Outfit 无中文字形且外网加载会阻塞首屏；
+       统一使用系统字体栈（与状态栏歌词一致） */
+    --font-heading: 'Segoe UI Variable Display', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', system-ui, sans-serif;
+    --font-body: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', system-ui, sans-serif;
+    --font-mono: 'Cascadia Mono', 'Consolas', 'Courier New', monospace;
 
     /* 动态过渡 */
     --transition-base: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
