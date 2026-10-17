@@ -22,6 +22,7 @@ export const STORAGE_KEY = 'qqmusic-monitor-front-prefs';
  * @property {boolean} lyricBar
  * @property {'left'|'right'} lyricBarSide
  * @property {number} lyricBarGap
+ * @property {'auto'|'dark'|'light'} taskbarTheme - 状态栏歌词任务栏配色策略
  * @property {boolean} debug
  */
 
@@ -36,6 +37,7 @@ export function getDefaultFrontendConfig() {
         lyricBar: false,
         lyricBarSide: 'right',
         lyricBarGap: 0,
+        taskbarTheme: 'auto',
         debug: false
     };
 }
@@ -55,6 +57,9 @@ function normalizePrefs(p) {
         lyricBarGap: Number.isInteger(p.lyricBarGap)
             ? Math.min(500, Math.max(0, p.lyricBarGap))
             : base.lyricBarGap,
+        taskbarTheme: ['auto', 'dark', 'light'].includes(p.taskbarTheme)
+            ? p.taskbarTheme
+            : base.taskbarTheme,
         debug: typeof p.debug === 'boolean' ? p.debug : base.debug
     };
 }

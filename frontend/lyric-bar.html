@@ -4,9 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>状态栏歌词</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+    <!-- 歌词内容以中文为主：Inter/Outfit 无中文覆盖，且外网加载失败会引起
+         字体闪烁；直接使用系统字体栈（见 lyric-bar.css body 定义） -->
     <link rel="stylesheet" href="css/tokens.css">
     <link rel="stylesheet" href="css/lyric-bar.css">
 </head>

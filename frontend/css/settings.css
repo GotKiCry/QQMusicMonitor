@@ -26,7 +26,7 @@
 .settings-drawer.open {
     opacity: 1;
     pointer-events: auto;
-    background-color: rgba(2, 4, 8, 0.45);
+    background-color: var(--drawer-mask);
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
 }
@@ -36,7 +36,7 @@
     max-width: 420px;
     background: var(--surface-glass-solid);
     border-left: 1px solid var(--border-glass);
-    box-shadow: -10px 0 40px rgba(0, 0, 0, 0.6);
+    box-shadow: -10px 0 40px var(--shadow-drawer);
     height: 100%;
     display: flex;
     flex-direction: column;
@@ -62,7 +62,7 @@
     font-size: 1.1rem;
     font-weight: 700;
     letter-spacing: 0.05em;
-    color: var(--theme-primary);
+    color: var(--theme-ink, var(--theme-primary));
 }
 
 .drawer-close {
@@ -98,7 +98,7 @@
     border: 1px solid var(--border-glass);
     border-radius: 14px;
     padding: 18px 16px;
-    background-color: rgba(0, 0, 0, 0.15);
+    background-color: var(--surface-inset);
     display: flex;
     flex-direction: column;
     gap: 18px;
@@ -108,7 +108,7 @@
     font-size: 0.72rem;
     font-weight: 700;
     letter-spacing: 0.1em;
-    color: var(--theme-primary);
+    color: var(--theme-ink, var(--theme-primary));
     padding: 0 8px;
     text-transform: uppercase;
 }
@@ -148,13 +148,13 @@
 }
 
 .badge {
-    background-color: rgba(255, 255, 255, 0.05);
+    background-color: var(--surface-hover);
     border: 1.5px solid var(--border-glass);
     border-radius: 6px;
     padding: 2px 8px;
     font-family: var(--font-mono);
     font-size: 0.75rem;
-    color: var(--theme-primary);
+    color: var(--theme-ink, var(--theme-primary));
     font-weight: 600;
 }
 
@@ -172,7 +172,7 @@
 }
 
 .step-btn {
-    background-color: rgba(255, 255, 255, 0.04);
+    background-color: var(--surface-inset);
     border: 1px solid var(--border-glass);
     border-radius: 6px;
     width: 58px;
@@ -185,15 +185,15 @@
 }
 
 .step-btn:hover {
-    border-color: var(--theme-primary);
-    background-color: rgba(255, 255, 255, 0.08);
+    border-color: var(--theme-ink, var(--theme-primary));
+    background-color: var(--surface-input-hover);
 }
 
 input[type="range"] {
     -webkit-appearance: none;
     appearance: none;
     flex: 1;
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--track-bg);
     height: 5px;
     border-radius: 3px;
     outline: none;
@@ -205,7 +205,7 @@ input[type="range"]::-webkit-slider-thumb {
     width: 14px;
     height: 14px;
     border-radius: 50%;
-    background-color: var(--theme-primary);
+    background-color: var(--theme-ink, var(--theme-primary));
     box-shadow: 0 0 8px var(--theme-primary-glow);
     cursor: pointer;
     transition: transform 0.12s ease;
@@ -222,7 +222,7 @@ input[type="range"]::-webkit-slider-thumb:hover {
 }
 
 .input-inline input[type="number"] {
-    background-color: rgba(0, 0, 0, 0.35);
+    background-color: var(--surface-input);
     border: 1px solid var(--border-glass);
     border-radius: 6px;
     padding: 6px 12px;
@@ -239,9 +239,9 @@ input[type="range"]::-webkit-slider-thumb:hover {
 }
 
 .solid-btn {
-    background-color: var(--theme-primary);
+    background-color: var(--theme-ink, var(--theme-primary));
     border: none;
-    color: #000;
+    color: var(--theme-on-primary, #000);
     border-radius: 6px;
     padding: 0 16px;
     font-size: 0.8rem;
@@ -286,13 +286,13 @@ input[type="range"]::-webkit-slider-thumb:hover {
     width: 14px;
     left: 3px;
     bottom: 3px;
-    background-color: white;
+    background-color: var(--switch-knob);
     border-radius: 50%;
     transition: var(--transition-base);
 }
 
 .switch input:checked + .switch-slider {
-    background-color: var(--theme-primary);
+    background-color: var(--theme-ink, var(--theme-primary));
 }
 
 .switch input:checked + .switch-slider::before {
@@ -329,24 +329,18 @@ input[type="range"]::-webkit-slider-thumb:hover {
 .dot-emerald { background-color: #10b981; }
 .dot-sunset { background-color: #f97316; }
 
-/* —— 自动主题（专辑封面取色）：SVG 圆环图案 —— */
-/* WebView2 对 20px 小尺寸 conic/radial 渐变中心会细分出多边形方块瑕疵，
-   改用 SVG data URI 矢量绘制（几何渲染，不经过渐变细分器） */
-/* —— 自动主题（专辑封面取色）：白色粗描边圆环 + 中央彩色小圆点 —— */
-/* 白环=动态变化，中心圆点=当前 --theme-primary（主题主色 / 专辑取色结果），
-   由 paintAutoDot() 在主题切换时动态重写 SVG；CSS 中的 #14b8a6 仅作
-   页面初始化前（即 JS 跑起来之前）的瞬态占位，避免和落日橙主题撞色。
-   SVG 纯色矢量绘制，规避 WebView2 小尺寸 conic/radial 渐变中心细分出方块的渲染瑕疵 */
+/* —— 自动主题（专辑封面取色）：白描边 + 当前主题色实心圆 —— */
+/* 20px 小尺寸下 URL 内嵌 SVG + cover 缩放的渲染不可控（曾出现环粗/点小/被 box 裁切），
+   改为纯 CSS：2px 白描边 + 背景直接消费 --theme-primary——实时跟随
+   主题切换/封面取色，无需 paintAutoDot 重写；与其余纯色圆点风格统一 */
 .theme-dot-auto {
     border-radius: 50%;
     overflow: hidden;
     padding: 0;
     -webkit-appearance: none;
     appearance: none;
-    background-color: #0a0e17;
-    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2020%2020%27%3E%3Ccircle%20cx%3D%2710%27%20cy%3D%2710%27%20r%3D%278.5%27%20fill%3D%27none%27%20stroke%3D%27%23ffffff%27%20stroke-width%3D%273%27%2F%3E%3Ccircle%20cx%3D%2710%27%20cy%3D%2710%27%20r%3D%272.8%27%20fill%3D%27%2314b8a6%27%2F%3E%3C%2Fsvg%3E");
-    background-size: cover;
-    background-position: center;
+    border: 2px solid var(--dot-ring);
+    background: var(--theme-primary, #14b8a6);
 }
 /* —— 分段选择（歌词条左右位置） —— */
 .seg-control {
@@ -354,7 +348,7 @@ input[type="range"]::-webkit-slider-thumb:hover {
     margin-top: 6px;
     padding: 3px;
     border-radius: 10px;
-    background: rgba(0, 0, 0, 0.3);
+    background: var(--surface-seg);
     border: 1px solid var(--border-glass);
     gap: 2px;
 }
@@ -376,8 +370,8 @@ input[type="range"]::-webkit-slider-thumb:hover {
 }
 
 .seg-btn.active {
-    background: var(--theme-gradient);
-    color: #ffffff;
+    background: var(--theme-ink, var(--theme-primary));
+    color: var(--theme-on-primary, #ffffff);
 }
 
 /* —— 自定义取色盘圆点 —— */
@@ -391,7 +385,9 @@ input[type="range"]::-webkit-slider-thumb:hover {
 }
 
 /* —— 自定义调色盘圆点：完整色相环 —— */
-/* conic-gradient 360° 彩虹（红→橙→黄→绿→青→蓝→紫→红，最高饱和亮度），
+/* 24 段 SVG 矢量色相环（每段 15°，红→橙→黄→绿→青→蓝→紫→红）。
+   WebView2 对 20px 小尺寸 conic/radial 渐变中心会细分出多边形方块瑕疵
+   （与 auto 圆点同理），改用 SVG 矢量渲染，20px 下分段平滑不可辨；
    无描边，与 auto 圆点的白色描边形成对比；0 尺寸隐藏输入无渲染表面 */
 .theme-dot-custom {
     position: relative;
@@ -400,7 +396,7 @@ input[type="range"]::-webkit-slider-thumb:hover {
     padding: 0;
     -webkit-appearance: none;
     appearance: none;
-    background: conic-gradient(from 135deg, #ff0000, #ff8000, #ffff00, #00ff00, #00ffff, #0000ff, #7f00ff, #ff0000);
+    background: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyMCAyMCI+PHBhdGggZD0iTTEwIDEwIEwzLjYzNjAgMTYuMzY0MCBBOSA5IDAgMCAxIDIuMjA1OCAxNC41MDAwIFoiIGZpbGw9IiNmZjAwMDAiLz48cGF0aCBkPSJNMTAgMTAgTDIuMjA1OCAxNC41MDAwIEE5IDkgMCAwIDEgMS4zMDY3IDEyLjMyOTQgWiIgZmlsbD0iI2ZmNDAwMCIvPjxwYXRoIGQ9Ik0xMCAxMCBMMS4zMDY3IDEyLjMyOTQgQTkgOSAwIDAgMSAxLjAwMDAgMTAuMDAwMCBaIiBmaWxsPSIjZmY4MDAwIi8+PHBhdGggZD0iTTEwIDEwIEwxLjAwMDAgMTAuMDAwMCBBOSA5IDAgMCAxIDEuMzA2NyA3LjY3MDYgWiIgZmlsbD0iI2ZmYmYwMCIvPjxwYXRoIGQ9Ik0xMCAxMCBMMS4zMDY3IDcuNjcwNiBBOSA5IDAgMCAxIDIuMjA1OCA1LjUwMDAgWiIgZmlsbD0iI2ZmZmYwMCIvPjxwYXRoIGQ9Ik0xMCAxMCBMMi4yMDU4IDUuNTAwMCBBOSA5IDAgMCAxIDMuNjM2MCAzLjYzNjAgWiIgZmlsbD0iI2JmZmYwMCIvPjxwYXRoIGQ9Ik0xMCAxMCBMMy42MzYwIDMuNjM2MCBBOSA5IDAgMCAxIDUuNTAwMCAyLjIwNTggWiIgZmlsbD0iIzgwZmYwMCIvPjxwYXRoIGQ9Ik0xMCAxMCBMNS41MDAwIDIuMjA1OCBBOSA5IDAgMCAxIDcuNjcwNiAxLjMwNjcgWiIgZmlsbD0iIzQwZmYwMCIvPjxwYXRoIGQ9Ik0xMCAxMCBMNy42NzA2IDEuMzA2NyBBOSA5IDAgMCAxIDEwLjAwMDAgMS4wMDAwIFoiIGZpbGw9IiMwMGZmMDAiLz48cGF0aCBkPSJNMTAgMTAgTDEwLjAwMDAgMS4wMDAwIEE5IDkgMCAwIDEgMTIuMzI5NCAxLjMwNjcgWiIgZmlsbD0iIzAwZmY0MCIvPjxwYXRoIGQ9Ik0xMCAxMCBMMTIuMzI5NCAxLjMwNjcgQTkgOSAwIDAgMSAxNC41MDAwIDIuMjA1OCBaIiBmaWxsPSIjMDBmZjgwIi8+PHBhdGggZD0iTTEwIDEwIEwxNC41MDAwIDIuMjA1OCBBOSA5IDAgMCAxIDE2LjM2NDAgMy42MzYwIFoiIGZpbGw9IiMwMGZmYmYiLz48cGF0aCBkPSJNMTAgMTAgTDE2LjM2NDAgMy42MzYwIEE5IDkgMCAwIDEgMTcuNzk0MiA1LjUwMDAgWiIgZmlsbD0iIzAwZmZmZiIvPjxwYXRoIGQ9Ik0xMCAxMCBMMTcuNzk0MiA1LjUwMDAgQTkgOSAwIDAgMSAxOC42OTMzIDcuNjcwNiBaIiBmaWxsPSIjMDBiZmZmIi8+PHBhdGggZD0iTTEwIDEwIEwxOC42OTMzIDcuNjcwNiBBOSA5IDAgMCAxIDE5LjAwMDAgMTAuMDAwMCBaIiBmaWxsPSIjMDA4MGZmIi8+PHBhdGggZD0iTTEwIDEwIEwxOS4wMDAwIDEwLjAwMDAgQTkgOSAwIDAgMSAxOC42OTMzIDEyLjMyOTQgWiIgZmlsbD0iIzAwNDBmZiIvPjxwYXRoIGQ9Ik0xMCAxMCBMMTguNjkzMyAxMi4zMjk0IEE5IDkgMCAwIDEgMTcuNzk0MiAxNC41MDAwIFoiIGZpbGw9IiMwMDAwZmYiLz48cGF0aCBkPSJNMTAgMTAgTDE3Ljc5NDIgMTQuNTAwMCBBOSA5IDAgMCAxIDE2LjM2NDAgMTYuMzY0MCBaIiBmaWxsPSIjNDAwMGZmIi8+PHBhdGggZD0iTTEwIDEwIEwxNi4zNjQwIDE2LjM2NDAgQTkgOSAwIDAgMSAxNC41MDAwIDE3Ljc5NDIgWiIgZmlsbD0iIzgwMDBmZiIvPjxwYXRoIGQ9Ik0xMCAxMCBMMTQuNTAwMCAxNy43OTQyIEE5IDkgMCAwIDEgMTIuMzI5NCAxOC42OTMzIFoiIGZpbGw9IiNiZjAwZmYiLz48cGF0aCBkPSJNMTAgMTAgTDEyLjMyOTQgMTguNjkzMyBBOSA5IDAgMCAxIDEwLjAwMDAgMTkuMDAwMCBaIiBmaWxsPSIjZmYwMGZmIi8+PHBhdGggZD0iTTEwIDEwIEwxMC4wMDAwIDE5LjAwMDAgQTkgOSAwIDAgMSA3LjY3MDYgMTguNjkzMyBaIiBmaWxsPSIjZmYwMGJmIi8+PHBhdGggZD0iTTEwIDEwIEw3LjY3MDYgMTguNjkzMyBBOSA5IDAgMCAxIDUuNTAwMCAxNy43OTQyIFoiIGZpbGw9IiNmZjAwODAiLz48cGF0aCBkPSJNMTAgMTAgTDUuNTAwMCAxNy43OTQyIEE5IDkgMCAwIDEgMy42MzYwIDE2LjM2NDAgWiIgZmlsbD0iI2ZmMDA0MCIvPjwvc3ZnPg==") center / cover no-repeat;
 }
 .hidden-color-input {
     position: absolute;
@@ -418,7 +414,7 @@ input[type="range"]::-webkit-slider-thumb:hover {
 
 /* —— 开发者调试控制区 —— */
 .debug-panel {
-    background-color: rgba(0, 0, 0, 0.25);
+    background-color: var(--debug-panel-bg);
     border: 1px solid var(--border-glass);
     border-radius: 10px;
     padding: 12px;
@@ -434,14 +430,14 @@ input[type="range"]::-webkit-slider-thumb:hover {
 
 .debug-details summary {
     font-size: 0.72rem;
-    color: var(--theme-primary);
+    color: var(--theme-ink, var(--theme-primary));
     cursor: pointer;
     margin-top: 6px;
     user-select: none;
 }
 
 .debug-details pre {
-    background-color: rgba(0, 0, 0, 0.45);
+    background-color: var(--debug-pre-bg);
     border-radius: 6px;
     padding: 8px;
     color: var(--color-success);

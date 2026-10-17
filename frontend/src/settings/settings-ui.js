@@ -7,7 +7,7 @@
 
 import { fetchBackendConfig, saveBackendConfig } from '../config/backend-config.js';
 import { saveFrontendConfig } from '../config/frontend-config.js';
-import { paintCustomTheme, presetThemeColor, loadAutoColor } from '../config/theme.js';
+import { paintCustomTheme, presetThemeColor, loadAutoPalette } from '../config/theme.js';
 
 /** Tauri 环境：向后端同步状态栏歌词窗口开关 */
 function syncLyricBarToBackend(enabled) {
@@ -41,6 +41,21 @@ function setLyricBarSide(els, front, side) {
 function markLyricSide(els, front) {
     els.btnLyricSideLeft.classList.toggle('active', front.lyricBarSide === 'left');
     els.btnLyricSideRight.classList.toggle('active', front.lyricBarSide === 'right');
+}
+
+/** 高亮当前任务栏配色按钮 */
+function markTaskbarTheme(els, front) {
+    els.btnTaskbarThemeAuto.classList.toggle('active', front.taskbarTheme === 'auto');
+    els.btnTaskbarThemeDark.classList.toggle('active', front.taskbarTheme === 'dark');
+    els.btnTaskbarThemeLight.classList.toggle('active', front.taskbarTheme === 'light');
+}
+
+/** 设置任务栏配色偏好（自动/深色/浅色） */
+function setTaskbarTheme(els, front, theme, changed) {
+    front.taskbarTheme = theme;
+    saveFrontendConfig(front);
+    markTaskbarTheme(els, front);
+    if (typeof changed === 'function') changed();
 }
 
 /**
@@ -161,6 +176,11 @@ export function wireUpSettings({ els, configs, onFrontConfigChange }) {
     els.btnLyricSideLeft.addEventListener('click', () => setLyricBarSide(els, front, 'left'));
     els.btnLyricSideRight.addEventListener('click', () => setLyricBarSide(els, front, 'right'));
 
+    // —— 任务栏配色（自动/深色/浅色） ——
+    els.btnTaskbarThemeAuto.addEventListener('click', () => setTaskbarTheme(els, front, 'auto', onFrontConfigChange));
+    els.btnTaskbarThemeDark.addEventListener('click', () => setTaskbarTheme(els, front, 'dark', onFrontConfigChange));
+    els.btnTaskbarThemeLight.addEventListener('click', () => setTaskbarTheme(els, front, 'light', onFrontConfigChange));
+
     // —— 歌词条边距（距任务栏边缘；左侧=距左缘，右侧=距通知区左缘） ——
     els.cfgLyricBarGap.addEventListener('input', () => {
         els.valLyricBarGap.textContent = `${parseInt(els.cfgLyricBarGap.value, 10)}px`;
@@ -205,8 +225,8 @@ function applyTheme(els, front, theme) {
     front.theme = theme;
     document.body.setAttribute('data-theme', theme);
     if (theme === 'auto') {
-        // 自动主题：应用最近一次专辑取色结果（无则回落默认 token）
-        paintCustomTheme(loadAutoColor());
+        // 自动主题：应用最近一次专辑调色板（含 uiMode，浅色封面会切浅色 UI）
+        paintCustomTheme(loadAutoPalette());
         els.customColor.value = presetThemeColor(theme);
     } else {
         paintCustomTheme(null); // 清除变量覆盖，回落到 token 定义
@@ -250,7 +270,7 @@ export function syncConfigToUI(els, front, back) {
     document.documentElement.style.setProperty('--lyric-font-weight', `${front.fontWeight}`);
     document.body.setAttribute('data-theme', front.theme);
     if (front.theme === 'auto') {
-        paintCustomTheme(loadAutoColor());
+        paintCustomTheme(loadAutoPalette());
         els.customColor.value = presetThemeColor(front.theme);
     } else if (front.theme === 'custom') {
         paintCustomTheme(front.customColor || els.customColor.value);
@@ -270,6 +290,7 @@ export function syncConfigToUI(els, front, back) {
     els.valLyricBarGap.textContent = `${front.lyricBarGap || 0}px`;
     els.debugPanel.hidden = !front.debug;
     markLyricSide(els, front);
+    markTaskbarTheme(els, front);
 
     // 主题点
     markActiveTheme(front.theme);

@@ -12,7 +12,7 @@
  */
 
 import {
-    songInfo, lyricLines, lastActiveIdx, isPlaying,
+    songInfo, lyricLines, lastActiveIdx, clockRunning,
     lastSampleProgress, lastSampleLocalTime,
     setLastActiveIdx, setAnimFrame
 } from '../state/state.js';
@@ -32,11 +32,10 @@ export function startRenderLoop(elTimeCurrent, elTimeTotal, elProgressFill, elLy
         if (!songInfo) return;
 
         // 后端采样已经完成 SMTC 漂移修正和用户偏移补偿；
-        // 前端只负责用本地单调时钟补齐两次采样之间的流逝时间。
-        // elapsed clamp >= 0：pause→play 时 update-handler 会把
-        // lastSampleLocalTime 向未来平移实现原地 hold，负 elapsed 归零。
+        // 显示位置由 state 中的单调播放时钟驱动：clockRunning 为 true 时
+        // 用本地单调时钟补齐两次采样之间的流逝时间，暂停/冻结时停在基线。
         let t;
-        if (isPlaying && lastSampleLocalTime > 0) {
+        if (clockRunning && lastSampleLocalTime > 0) {
             const elapsed = Math.max(0, performance.now() - lastSampleLocalTime);
             t = lastSampleProgress + elapsed;
         } else {
@@ -62,9 +61,12 @@ export function startRenderLoop(elTimeCurrent, elTimeTotal, elProgressFill, elLy
         for (let i = 0; i < lyricLines.length; i++) {
             const line = lyricLines[i];
 
+            // 行高亮驻留：读完当前行后到下一行开始前（句间空隙/间奏/暂停恢复），
+            // 维持本行满格高亮，不熄灯变暗——高亮只在下一行开始时转移
+            const nextStart = i + 1 < lyricLines.length ? lyricLines[i + 1].start : line.end;
             let lineState;
             if (t < line.start) lineState = 'before';
-            else if (t >= line.end) lineState = 'after';
+            else if (t >= nextStart) lineState = 'after';
             else { lineState = 'active'; activeIdx = i; }
 
             if (line.state !== lineState) {

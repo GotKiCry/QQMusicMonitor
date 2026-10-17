@@ -108,6 +108,12 @@ const LYRIC_BAR_BOTTOM_OFFSET: f64 = 0.0;
 /// 歌词条窗口句柄（WinEvent 回调置顶用）
 static LYRIC_BAR_HWND: AtomicIsize = AtomicIsize::new(0);
 
+/// 状态栏歌词条右键菜单：低级鼠标钩子需要的 AppHandle
+static HOOK_APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+/// 低级鼠标钩子句柄（保持安装直到进程退出，系统会回收）
+#[allow(dead_code)]
+static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
+
 /// 获取 Windows 任务栏矩形（物理像素）。
 /// 通过 SHAppBarMessage(ABM_GETTASKBARPOS) 查询，任务栏不在屏幕底部时返回 None。
 fn taskbar_rect() -> Option<(i32, i32, i32, i32)> {
@@ -665,10 +671,168 @@ fn spawn_lyric_bar_watchdog(app: tauri::AppHandle) {
     });
 }
 
+/* ============================================================
+ * 状态栏歌词条右键菜单（低级鼠标钩子）
+ *
+ * 歌词条窗口是鼠标穿透的（ignore_cursor_events），无法直接接收右键。
+ * 用 WH_MOUSE_LL 全局低级鼠标钩子：右键落在歌词条矩形内时吞掉事件
+ * （避免任务栏弹出自己的右键菜单）并弹原生菜单：
+ *   - 隐藏状态栏歌词（写回前端偏好，下次启动不再创建）
+ *   - 退出 QQMusic Monitor
+ * ============================================================ */
+
+/// 安装状态栏歌词条右键菜单钩子（独立线程 + 消息循环）。
+fn spawn_lyric_bar_right_click_hook(app: tauri::AppHandle) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage, MSG, WH_MOUSE_LL,
+    };
+
+    let _ = HOOK_APP.set(app);
+    std::thread::spawn(move || unsafe {
+        match SetWindowsHookExW(WH_MOUSE_LL, Some(lyric_bar_mouse_hook), None, 0) {
+            Ok(hook) => {
+                HOOK_HANDLE.store(hook.0 as isize, Ordering::SeqCst);
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    let _ = DispatchMessageW(&msg);
+                }
+            }
+            Err(err) => eprintln!("[hook] 状态栏歌词右键菜单安装失败: {:?}", err),
+        }
+    });
+}
+
+/// 低级鼠标钩子回调：右键命中歌词条矩形时吞掉事件并弹菜单。
+unsafe extern "system" fn lyric_bar_mouse_hook(
+    n_code: i32,
+    w_param: windows::Win32::Foundation::WPARAM,
+    l_param: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::{HWND, LRESULT, POINT, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GetCursorPos, GetWindowRect, HC_ACTION, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    };
+
+    if n_code == HC_ACTION as i32 {
+        let msg = w_param.0 as u32;
+        if msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP {
+            let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
+            if raw != 0 {
+                let hwnd = HWND(raw as *mut core::ffi::c_void);
+                let mut rc = RECT::default();
+                let mut pt = POINT::default();
+                let hit = GetWindowRect(hwnd, &mut rc).is_ok()
+                    && GetCursorPos(&mut pt).is_ok()
+                    && pt.x >= rc.left
+                    && pt.x <= rc.right
+                    && pt.y >= rc.top
+                    && pt.y <= rc.bottom;
+                if hit {
+                    if msg == WM_RBUTTONUP {
+                        if let Some(app) = HOOK_APP.get() {
+                            let handle = app.clone();
+                            let _ = app.run_on_main_thread(move || show_lyric_bar_menu(&handle));
+                        }
+                    }
+                    // 吞掉右键（DOWN/UP），任务栏不会弹出自己的菜单
+                    return LRESULT(1);
+                }
+            }
+        }
+    }
+    CallNextHookEx(None, n_code, w_param, l_param)
+}
+
+/// 在歌词条位置弹出原生右键菜单（主线程执行）。
+fn show_lyric_bar_menu(app: &tauri::AppHandle) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, TrackPopupMenu, MF_SEPARATOR,
+        MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD,
+    };
+
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return; };
+        let _ = AppendMenuW(menu, MF_STRING, 1, windows::core::w!("隐藏状态栏歌词"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, 2, windows::core::w!("退出 QQMusic Monitor"));
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
+        if raw == 0 {
+            let _ = DestroyMenu(menu);
+            return;
+        }
+        let owner = HWND(raw as *mut core::ffi::c_void);
+        let ret = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, None, owner, None);
+        let _ = DestroyMenu(menu);
+        // TPM_RETURNCMD：返回值即菜单项 id（0 = 取消）
+        let cmd = ret.0 as u32;
+        match cmd {
+            1 => hide_lyric_bar_from_menu(app),
+            2 => app.exit(0),
+            _ => {}
+        }
+    }
+}
+
+/// 右键菜单"隐藏状态栏歌词"：销毁歌词条并持久化偏好（下次启动不再创建）。
+fn hide_lyric_bar_from_menu(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    LYRIC_BAR_ENABLED.store(false, Ordering::SeqCst);
+    if let Some(win) = app.get_webview_window("lyric-bar") {
+        let _ = win.destroy();
+    }
+    LYRIC_BAR_HWND.store(0, Ordering::SeqCst);
+
+    let path = frontend_prefs_path();
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("lyricBar".to_string(), serde_json::Value::Bool(false));
+                if let Ok(text) = serde_json::to_string(&value) {
+                    let _ = std::fs::write(&path, text);
+                }
+            }
+        }
+    }
+}
+
 #[tauri::command]
-// 查询任务栏是否为浅色主题（DWM 沉浸式暗色模式），供歌词条选择文字配色。
-// 默认按深色处理：查询失败时保持白字（深色任务栏）的现状。
+// 查询任务栏是否为浅色主题，供歌词条选择文字配色。
+//
+// 任务栏明暗跟随「Windows 模式」，权威来源是注册表
+// HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\
+//   SystemUsesLightTheme（1=浅色，0=深色）。
+// 不能用 DWMWA_USE_IMMERSIVE_DARK_MODE 判断——它是应用窗口级属性，
+// 对 Shell_TrayWnd 实测恒返回 0（即使系统为深色模式），会把深色
+// 任务栏误报为浅色：歌词条自动配色按「浅色」出深字，表现为
+// 「自动模式没效果」。注册表读取失败时才回退 DWM 属性。
 fn get_taskbar_light_theme() -> bool {
+    use windows::Win32::System::Registry::{
+        HKEY_CURRENT_USER, RegGetValueW, RRF_RT_REG_DWORD,
+    };
+
+    unsafe {
+        let mut value: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            windows::core::w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut core::ffi::c_void),
+            Some(&mut size),
+        );
+        if status.is_ok() {
+            return value != 0;
+        }
+    }
+
+    // 回退：DWM 属性（注册表不可用时的旧行为；默认按深色处理）
     use windows::core::BOOL;
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 
@@ -1629,6 +1793,20 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                 }
                             }
 
+                            // 封面策略（用户 2026-10：远程搜索有法律风险，只能最后手段）：
+                            // SMTC 缩略图是 QQ 音乐客户端主动推给系统的当前封面（零远程
+                            // 请求、与客户端显示一致），本地缓存图同理；两者都存在时
+                            // 跳过一切远程封面解析（专辑搜索 / CDN 图）。
+                            let has_local_art = match LATEST_SONG_INFO.get() {
+                                Some(lock) => {
+                                    let s = lock.read().await;
+                                    s.title == t
+                                        && s.artist == a
+                                        && s.album_pic_url.starts_with("data:image")
+                                }
+                                None => false,
+                            };
+
                             // 2. 在线歌词获取（仅当本地无 QRC 时才请求，作为备用手段）
                             if !has_local_qrc {
                             let mut attempt = 0u32;
@@ -1653,8 +1831,12 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
 
                             match online_result {
                                 Ok((l, trans, q, pic_url, matched_album)) => {
-                                    let (resolved_pic_url, resolved_hd_url) =
-                                        resolve_album_pic_url(&pic_url, &album, &matched_album, &t, &a, &fetcher).await;
+                                    // 已有 SMTC/本地封面 → 不发起远程封面解析（远程仅最后手段）
+                                    let (resolved_pic_url, resolved_hd_url) = if has_local_art {
+                                        (String::new(), String::new())
+                                    } else {
+                                        resolve_album_pic_url(&pic_url, &album, &matched_album, &t, &a, &fetcher).await
+                                    };
                                     let mut entry = LyricsCacheEntry {
                                         lyrics: l,
                                         trans,
@@ -1764,6 +1946,10 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                 //    避免 file:// 在 webview 受限）；否则返回在线 CDN URL
                                 //    （T002 专辑封面 / T062 无专辑歌曲的单曲封面）
                                 let get_pic = async {
+                                    // 已有 SMTC/本地封面 → 不做远程解析（远程仅最后手段）
+                                    if has_local_art {
+                                        return None;
+                                    }
                                     // 从本地缓存条目取文件名解析的专辑名（QQ 音乐索引时的原始名，
                                     // 比 SMTC 报告的 album 更可靠，用作校验与专辑搜索的参照）
                                     let local_album = {
@@ -1927,7 +2113,14 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                             info.qrc_raw = entry.qrc_raw.clone();
                             info.qrc_data = entry.qrc_data.clone();
                             if !entry.album_pic_url.is_empty() {
-                                info.album_pic_url = entry.album_pic_url.clone();
+                                // 已有本地图（SMTC 缩略图 / 本地缓存图，data URI）时，
+                                // 不让在线 CDN 图覆盖它——本地来源优先，远程仅最后手段。
+                                // 但 entry 本身是本地图（data URI）时允许覆盖（可能是更高清版本）。
+                                let info_is_local_art = info.album_pic_url.starts_with("data:image");
+                                let entry_is_local_art = entry.album_pic_url.starts_with("data:image");
+                                if !info_is_local_art || entry_is_local_art {
+                                    info.album_pic_url = entry.album_pic_url.clone();
+                                }
                             }
                             if !entry.album_pic_hd_url.is_empty() {
                                 info.album_pic_hd_url = entry.album_pic_hd_url.clone();
@@ -2400,6 +2593,9 @@ async fn main() -> Result<()> {
                     }
                 })
                 .build(app)?;
+
+            // 状态栏歌词条右键菜单（鼠标穿透窗口无法直接接收右键，用低级鼠标钩子）
+            spawn_lyric_bar_right_click_hook(app.handle().clone());
 
             // 主窗口关闭 = 退出整个应用（同时销毁歌词条，避免其阻止进程退出）
             if let Some(main_win) = app.get_webview_window("main") {

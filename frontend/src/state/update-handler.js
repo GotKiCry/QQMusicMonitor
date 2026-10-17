@@ -5,28 +5,31 @@
  *  - 切歌瞬间无条件清空旧歌词 DOM 并显示加载占位
  *  - 调用 state.resetForSongChange() 重置插值基线，防止旧进度继续推进
  *  - 新歌第一帧若后端 timeline 滞后带了大进度（>5s），强制归零
+ *
+ * 时间推进统一交给共享的单调播放时钟（playback-clock.js）：服务端位置
+ * 只用于限速纠偏，显示位置永不回退、不跳变，与状态栏歌词条共用同一实现。
  */
 
 import {
-    songInfo, isPlaying, lastSampleProgress, lastSampleLocalTime, lastRawTimeMs,
-    lastRenderKey, lastServerPosMs,
-    setSongInfo, setIsPlaying, setLastSampleProgress, setLastSampleLocalTime, setLastRawTimeMs,
-    setTransMap, setLastRenderKey, setLastActiveIdx, setLyricLines,
-    resetForSongChange, setLastServerPosMs
+    songInfo, lastRenderKey,
+    setSongInfo, setIsPlaying, setLastSampleProgress, setLastSampleLocalTime,
+    setClockRunning, setTransMap, setLastRenderKey, setLastActiveIdx, setLyricLines,
+    resetForSongChange
 } from './state.js';
+import { createPlaybackClock } from './playback-clock.js';
 import { parseTranslation } from '../lyrics/translation.js';
 import { buildLyricsArea, showLoadingPlaceholder } from '../lyrics/builder.js';
 import { preloadAlbumArt, resetAlbumArt } from '../utils/dom.js';
-import { extractAlbumColor, paintCustomTheme, AUTO_COLOR_KEY } from '../config/theme.js';
+import { extractAlbumPalette, paintCustomTheme, AUTO_COLOR_KEY, AUTO_PALETTE_KEY } from '../config/theme.js';
 
 /** 切歌后已收到几次非切歌更新（用于延迟歌词构建直到进度稳定） */
 let postChangeCount = 0;
 
-/** 服务端采样持续落后本地估计的采样数（死区收敛用） */
-let serverBehindCount = 0;
+/** 主窗口单调播放时钟：把服务端位置流变成不回退、不跳变的显示位置 */
+const playbackClock = createPlaybackClock();
 
-/** 死区内允许的最大连续落后采样数：超出则判定为系统性偏差，snap 收敛 */
-const SERVER_BEHIND_SNAP_SAMPLES = 5;
+/** 歌曲标识（切歌重置判定维度：歌名+歌手，与后端 SongInfo 一致） */
+const songKeyOf = (data) => `${data.title}|${data.artist}`;
 
 /** 自动主题取色请求序号：只允许最新一次请求的结果落地 */
 let autoColorSeq = 0;
@@ -63,14 +66,8 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
         if (totalMs > 0) rawTimeMs = Math.min(rawTimeMs, totalMs);
     }
 
-    const oldIsPlaying = songInfo ? songInfo.is_playing : false;
-    setIsPlaying(data.is_playing);
+    const songKey = songKeyOf(data);
     setSongInfo(data);
-    // 未加传输补偿的服务端位置：淡出尾音判定的基准（钉住时严格不变，
-    // 不受 transportDelay 抖动影响）。先取上一帧值再更新
-    const prevServerPosMs = lastServerPosMs;
-    const serverPosMs = data.current_time_ms > 0 ? data.current_time_ms : -1;
-    setLastServerPosMs(serverPosMs);
 
     if (isSongChanged) {
         // —— 切歌：彻底清空旧歌词与插值基线 ——
@@ -83,7 +80,6 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
         setLastRenderKey('');
         setLastActiveIdx(-1);
         postChangeCount = 0;
-        serverBehindCount = 0;
 
         // 3) 清空旧专辑封面，避免上一首封面残留（同时作废进行中的预加载）
         resetAlbumArt(els);
@@ -110,100 +106,32 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
             freshProgress = rawTimeMs > 5000 ? 0 : rawTimeMs;
         }
 
-        // 6) 重置插值基线：从这里开始按新歌进度推进
+        // 7) 重置插值基线：以新歌进度重置单调播放时钟（首帧/切歌直接对齐服务端）
         resetForSongChange(freshProgress, performance.now());
+        playbackClock.reset({ songKey, rawMs: freshProgress, isPlaying: data.is_playing });
         rawTimeMs = freshProgress;
     } else {
-        // —— 同首歌的进度同步 ——
-        const localEstimate = isPlaying && lastSampleLocalTime > 0
-            ? lastSampleProgress + Math.max(0, performance.now() - lastSampleLocalTime)
-            : lastSampleProgress;
-
-        if (isPlaying !== oldIsPlaying) {
-            serverBehindCount = 0;
-            setLastRawTimeMs(rawTimeMs);
-            if (!isPlaying) {
-                // play → pause: 后端已把淡出窗口建模完毕——报暂停时携带的
-                // 就是 QQ 提交的「最终位置」（淡出结束点，恢复播放也从这里
-                // 继续），是权威值。本地插值因事件/传输延迟必然略超前或滞后，
-                // 直接 snap 到服务端位置，冻结在真实暂停点。
-                setLastSampleProgress(rawTimeMs);
-                setLastSampleLocalTime(performance.now());
-            } else {
-                // pause → play: 以服务端位置为准，但服务端常略落后于暂停基线
-                // （QQ 注册暂停的时刻早于后端轮询观察到，差距一般 <200ms）。
-                // Math.max 锁存会把虚高基线永久固化（歌词超前）；
-                // 直接 snap 又回退闪灰。改为把本地时间基准向未来平移落后量：
-                // 显示位置原地 hold（render-loop 对负 elapsed clamp 为 0），
-                // 等服务端追平后自然同速前进——不回跳也不累积超前。
-                const behindMs = lastSampleProgress - rawTimeMs;
-                if (behindMs > 0 && behindMs <= 500) {
-                    setLastSampleLocalTime(performance.now() + behindMs);
-                } else {
-                    // 服务端超前（如暂停中 seek 到新位置）或大偏差 → 直接 snap
-                    setLastSampleProgress(rawTimeMs);
-                    setLastSampleLocalTime(performance.now());
-                }
-            }
-        } else if (!isPlaying) {
-            // 暂停期间：服务端位置恒定且权威（QQ 提交值即其自身显示/恢复点），
-            // 直接跟随——同时覆盖暂停中 seek（任意幅度）与切换帧残留的
-            // 本地超调，不会再把淡出提交误判成 seek 而突然前跳。
-            serverBehindCount = 0;
-            setLastSampleProgress(rawTimeMs);
-            setLastSampleLocalTime(performance.now());
-        } else if (totalMs <= 0) {
-            // 切歌后 timeline 归零窗口（新歌 timeline 尚未就绪）：
-            // 服务端 current_time 是占位值（归零+偏移，恒定不变）。
-            // 若按下方"淡出尾音/seek/死区"逻辑处理，会把插值基线反复
-            // 钉回占位值——歌词开头逐字高亮来回跳 = 疯狂闪烁。
-            // 这里让基线随本地时钟自然前进，timeline 就绪后由下方分支对齐。
-            serverBehindCount = 0;
-            setLastSampleProgress(localEstimate);
-            setLastSampleLocalTime(performance.now());
-        } else if (Math.abs(rawTimeMs - localEstimate) > 1000) {
-            // 大跳变（seek 或切歌后 timeline 更新）
-            serverBehindCount = 0;
-            setLastRawTimeMs(rawTimeMs);
-            setLastSampleProgress(rawTimeMs);
-            setLastSampleLocalTime(performance.now());
-        } else if (serverPosMs > 0 && serverPosMs === prevServerPosMs && localEstimate > serverPosMs) {
-            // 淡出尾音：后端在静音确认期间把位置钉在最后有声点（即将冻结）。
-            // 正常播放时后端每帧都在前进，「is_playing=true 且未补偿位置不变」
-            // 只出现在尾音窗口——钉住显示并停止插值蠕升，冻结时刻
-            // （play→pause snap）的回退量压到 ≈0。
-            // 注意：此分支仅当 totalMs > 0（timeline 就绪）时可达，
-            // 归零窗口已由上方 totalMs <= 0 分支接管。
-            serverBehindCount = 0;
-            setLastSampleProgress(serverPosMs);
-            setLastSampleLocalTime(performance.now());
-        } else if (localEstimate - rawTimeMs > 250) {
-            // 播放中的向后移动（>250ms）几乎只会是 seek：立即跟随。
-            // 死区（见下）会把小幅回退 seek 拖慢 ~0.5s；锚点抖动 ±50ms
-            // 不会触达该阈值
-            serverBehindCount = 0;
-            setLastRawTimeMs(rawTimeMs);
-            setLastSampleProgress(rawTimeMs);
-            setLastSampleLocalTime(performance.now());
-        } else if (rawTimeMs >= localEstimate - 50) {
-            // 正常：服务端大致等于或略超前本地估计，snap 到服务端
-            serverBehindCount = 0;
-            setLastRawTimeMs(rawTimeMs);
-            setLastSampleProgress(rawTimeMs);
-            setLastSampleLocalTime(performance.now());
-        } else {
-            // 死区（服务端落后 50~1000ms）：多为传输/快照抖动，立即 snap 会
-            // 造成歌词回跳，先容忍；但持续 5 个采样（~0.5s）未收敛说明是系统
-            // 性偏差——两端同速前进差距永不缩小，必须 snap 回服务端强制收敛。
-            serverBehindCount++;
-            if (serverBehindCount >= SERVER_BEHIND_SNAP_SAMPLES) {
-                serverBehindCount = 0;
-                setLastRawTimeMs(rawTimeMs);
-                setLastSampleProgress(rawTimeMs);
-                setLastSampleLocalTime(performance.now());
-            }
-        }
+        // —— 同首歌的进度采样：交给单调播放时钟做限速纠偏 ——
+        // 播放中按 1× 推进，服务端重锚阶跃只做「单次 ≤ elapsed×20%」的纠偏，
+        // 显示位置永不回退、不跳变；|偏差|>700ms 判 seek 直接对齐；
+        // 暂停且服务端位置停滞时冻结显示；is_playing=false 但位置仍在前进
+        // （WASAPI 门控静音段）与 timeline 归零窗口都继续按 1× 走。
+        playbackClock.update({
+            songKey,
+            rawMs: rawTimeMs,
+            isPlaying: data.is_playing,
+            totalMs
+        });
     }
+
+    // —— 时钟基线同步到 state ——
+    // 渲染循环仍按「基线位置 + 本地单调流逝」公式插值；
+    // running 决定是否推进（暂停/冻结时停在基线）。
+    const b = playbackClock.baseline();
+    setLastSampleProgress(b.progress);
+    setLastSampleLocalTime(b.localTime);
+    setClockRunning(b.running);
+    setIsPlaying(data.is_playing);
 
     // —— 左面板歌曲信息 ——
     els.songTitle.textContent = data.title || '等待播放';
@@ -222,25 +150,25 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
     }
 
     // —— 自动主题（专辑取色）——
-    // 主窗口负责提取封面主色并发布到 localStorage（歌词条窗口经
-    // storage 事件跟随），序号保证切歌竞态下只有最新结果落地。
+    // 主窗口提取调色板并发布到 localStorage（歌词条窗口经 storage 事件跟随），
+    // 序号保证切歌竞态下只有最新结果落地。
+    // 黑白/低饱和封面、取色失败 → 中性银回退（不再继承上一首颜色，
+    // 避免"主题色不是当前歌"的观感）；同一封面 URL 有缓存，重复帧不重复解码。
     if (cfg.theme === 'auto') {
         const seq = ++autoColorSeq;
-        if (data.album_pic_url) {
-            extractAlbumColor(data.album_pic_url).then((hex) => {
+        const artSrc = data.album_pic_hd_url || data.album_pic_url;
+        if (artSrc) {
+            extractAlbumPalette(artSrc).then((palette) => {
                 if (seq !== autoColorSeq || cfg.theme !== 'auto') return;
                 try {
-                    if (hex) localStorage.setItem(AUTO_COLOR_KEY, hex);
-                    else localStorage.removeItem(AUTO_COLOR_KEY);
+                    localStorage.setItem(AUTO_COLOR_KEY, palette.primary);
+                    localStorage.setItem(AUTO_PALETTE_KEY, JSON.stringify(palette));
                 } catch {}
-                paintCustomTheme(hex);
+                paintCustomTheme(palette);
             });
-        } else {
-            try {
-                localStorage.removeItem(AUTO_COLOR_KEY);
-            } catch {}
-            paintCustomTheme(null);
         }
+        // 无封面帧：保持当前主题（切歌瞬间 SMTC 常滞后几帧才补封面；
+        // 直接清主题会广播删除事件、歌词条闪回默认青绿）
     }
 
     // —— 播放状态动画 ——

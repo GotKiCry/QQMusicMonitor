@@ -39,6 +39,24 @@
     /* 动态过渡 */
     --transition-base: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
     --shadow-heavy: 0 25px 60px -15px rgba(0, 0, 0, 0.65);
+
+    /* —— 界面表面/阴影变量（由原硬编码色收敛而来，便于统一调节） —— */
+    --bg-app: linear-gradient(160deg, #101a2c 0%, #0a0e17 100%);
+    --surface-hover: rgba(255, 255, 255, 0.05);
+    --surface-inset: rgba(0, 0, 0, 0.15);
+    --surface-input: rgba(0, 0, 0, 0.35);
+    --surface-input-hover: rgba(255, 255, 255, 0.08);
+    --surface-seg: rgba(0, 0, 0, 0.3);
+    --track-bg: rgba(255, 255, 255, 0.08);
+    --shadow-card: rgba(0, 0, 0, 0.5);
+    --shadow-card-strong: rgba(0, 0, 0, 0.55);
+    --shadow-drawer: rgba(0, 0, 0, 0.6);
+    --drawer-mask: rgba(2, 4, 8, 0.45);
+    --debug-panel-bg: rgba(0, 0, 0, 0.25);
+    --debug-pre-bg: rgba(0, 0, 0, 0.45);
+    --lyric-active-shadow: rgba(0, 0, 0, 0.15);
+    --dot-ring: #ffffff;
+    --switch-knob: #ffffff;
 }
 
 /* Theme: 罗兰紫 */
@@ -70,3 +88,4 @@ body[data-theme="aurora-sunset"] {
     --theme-bar-glow: rgba(249, 115, 22, 0.18);
     --border-focus: rgba(251, 146, 60, 0.4);
 }
+

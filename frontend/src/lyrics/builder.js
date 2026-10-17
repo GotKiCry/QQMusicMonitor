@@ -136,7 +136,7 @@ export function buildLyricsArea(viewport, data, transMap, showTranslation) {
  * @param {HTMLElement} viewport
  */
 export function showLoadingPlaceholder(viewport) {
-    viewport.innerHTML = '<div class="lyric-loading">正在加载歌词...</div>';
+    viewport.innerHTML = '<div class="lyric-loading">正在加载歌词…</div>';
 }
 
 /**

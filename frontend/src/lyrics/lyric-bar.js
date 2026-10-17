@@ -2,14 +2,15 @@
  * 状态栏歌词（嵌入任务栏）入口与渲染逻辑。
  *
  * 独立窗口（lyric-bar.html）加载，复用 Tauri 的 song-info /
- * playback-progress 事件通道；本地 rAF 插值推进时间：
+ * playback-progress 事件通道；本地 rAF 按单调时钟推进时间：
  *  - QRC 逐字歌词：逐字渐变高亮（与主界面一致的扫光效果）
  *  - 无 QRC：整行主题渐变文字（LRC 兜底）
  *  - 歌词宽度超出任务栏可用空间时自动水平往返滚动
  *
- * 时间同步与主窗口同一套策略：server_ts 传输补偿、淡出尾音钉住、
- * play→pause 快照、pause→play 原地 hold、seek 立即跟随、小抖动死区容忍。
- * 行状态区分 pending（前奏）/ active（高亮中）/ done（已唱完，变暗）。
+ * 时间同步：进度帧交给共享单调播放时钟（state/playback-clock.js）做限速纠偏——
+ * 显示位置只按 1× 前进、永不回退/跳变；seek/切歌等大偏差才直接对齐；
+ * 暂停冻结显示；WASAPI 门控误报暂停（位置仍在走）时仍按 1× 前进。
+ * 行状态区分 pending（前奏）/ active（高亮中，行结束后驻留满格）。
  */
 
 import { listenSongInfo } from '../connection/tauri-bridge.js';
@@ -18,8 +19,9 @@ import {
     STORAGE_KEY,
     hydrateFrontendConfig
 } from '../config/frontend-config.js';
-import { applyThemeToDocument, AUTO_COLOR_KEY } from '../config/theme.js';
+import { applyThemeToDocument, AUTO_COLOR_KEY, AUTO_PALETTE_KEY, barTextColors } from '../config/theme.js';
 import { parseTranslation, findTranslation } from './translation.js';
+import { createPlaybackClock } from '../state/playback-clock.js';
 
 const els = {
     line: document.getElementById('lyric-bar-line'),
@@ -32,15 +34,13 @@ let rows = [];
 let transMap = [];
 let showTrans = true;
 
-/** 插值基线（与主窗口 render-loop 一致：服务端权威值 + 本地单调时钟流逝） */
-let baseT = 0;
-let baseTs = 0;
-let playing = false;
+/** 共享单调播放时钟：进度帧只做 ±20% 限速纠偏，显示位置单调不回退、不跳变 */
+const clock = createPlaybackClock();
+/** 当前歌曲指纹（title|artist）：仅在真正切歌时重置时钟基线 */
+let lastSongKey = '';
 let hasSong = false;
-
-/** 淡出尾音 / 死区跟踪（与主窗口 update-handler 同策略） */
-let lastServerPosMs = -1;
-let behindCount = 0;
+/** 滚动动画暂停状态缓存（避免每个进度帧重复写 style） */
+let scrollPaused = null;
 
 /** 当前渲染状态 */
 let currentRowIdx = -1;
@@ -56,9 +56,21 @@ let fallbackMode = null;
 let fallbackText = '';
 let loadingStartedAt = 0;
 
+/** 当前任务栏明暗：auto 模式由 DWM 检测，手动配置直接指定；失败保持上次值 */
+let taskbarLight = false;
+
+/** 最近一次有效歌曲帧的时刻（无效 title 帧抑制用） */
+let lastValidAt = 0;
+
+/** 本窗口是否尚未收到过任何 song-info 帧（首帧判定：切歌防护只对非首帧生效） */
+let isFirstSongFrame = true;
+
+/** 实际显示的内容指纹（'row:idx' / 'fb:kind:text'）：避免每帧重复重建 DOM */
+let displayedContent = '';
+
 const FALLBACK_TEXT = {
     idle: '等待播放',
-    loading: '正在加载歌词...',
+    loading: '正在加载歌词…',
     pure: '♪ 纯音乐，请欣赏'
 };
 
@@ -134,84 +146,20 @@ function computeRawTimeMs(p) {
     return rawT;
 }
 
-/**
- * 同首歌的进度同步状态机（镜像主窗口 update-handler 的策略）：
- *  - 淡出尾音：is_playing=true 但未补偿位置冻结 → 钉住显示，暂停 snap 时零回退
- *  - play→pause：直接 snap 服务端权威最终位置
- *  - pause→play：服务端落后 ≤500ms 时本地时间基准向未来平移原地 hold
- *  - 播放中后退 >250ms：判定 seek 立即跟随
- *  - 死区（落后 50~250ms）：容忍抖动，连续 5 次采样不收敛才 snap
- */
-function syncProgressBaseline({ isPlaying, rawT, serverPosMs }) {
-    const prevPlaying = playing;
-    playing = isPlaying;
-    const localEstimate = prevPlaying && baseTs > 0
-        ? baseT + Math.max(0, performance.now() - baseTs)
-        : baseT;
-
-    if (playing !== prevPlaying) {
-        behindCount = 0;
-        if (!playing) {
-            // play → pause：后端已完成淡出建模，携带的就是真实停止点
-            baseT = rawT;
-            baseTs = performance.now();
-        } else {
-            // pause → play：原地 hold 落后量，等服务端追平后自然同速前进
-            const behindMs = baseT - rawT;
-            if (behindMs > 0 && behindMs <= 500) {
-                baseTs = performance.now() + behindMs;
-            } else {
-                baseT = rawT;
-                baseTs = performance.now();
-            }
-        }
-        setScrollPaused(!playing);
-        lastServerPosMs = serverPosMs;
-        return;
-    }
-
-    if (!playing) {
-        // 暂停稳态：服务端位置恒定且权威，直接跟随（覆盖暂停中 seek）
-        baseT = rawT;
-        baseTs = performance.now();
-        behindCount = 0;
-    } else if (serverPosMs > 0 && serverPosMs === lastServerPosMs && localEstimate >= serverPosMs) {
-        // 淡出尾音：播放标志仍为 true 但位置不再前进（后端在静音确认期钉住）。
-        // 钉住显示并把本地时钟冻结到下一次采样之后：采样间隙（~100ms）内也
-        // 不再插值蠕升，暂停 snap 时高亮零回退。位置一旦恢复前进即退出本分支。
-        baseT = serverPosMs;
-        baseTs = performance.now() + 1500;
-        behindCount = 0;
-    } else if (rawT < localEstimate - 250) {
-        // 播放中后退 >250ms 几乎只会是 seek：立即跟随
-        baseT = rawT;
-        baseTs = performance.now();
-        behindCount = 0;
-    } else if (rawT >= localEstimate - 50) {
-        // 正常：服务端大致等于或略超前本地估计 → snap
-        baseT = rawT;
-        baseTs = performance.now();
-        behindCount = 0;
-    } else {
-        // 死区（服务端落后 50~250ms）：多为快照/传输抖动，立即 snap 会回跳；
-        // 持续 5 个采样未收敛说明是系统性偏差，必须 snap 回服务端强制收敛
-        behindCount++;
-        if (behindCount >= 5) {
-            behindCount = 0;
-            baseT = rawT;
-            baseTs = performance.now();
-        }
-    }
-    lastServerPosMs = serverPosMs;
-}
-
 /** 事件回调：完整 SongInfo → 重建行数据 */
 function onSongInfo(data) {
+    const firstFrame = isFirstSongFrame;
+    isFirstSongFrame = false;
     const hasValidSong = data.title && data.title !== 'No music playing' && data.title !== 'ERROR';
 
     if (!hasValidSong) {
+        // 切歌瞬间 SMTC 会话切换会推几帧无效 title（No music playing / ERROR）：
+        // 150ms（≈1~2 个后端采样周期）内出现过有效帧则忽略本次（滤振荡）；
+        // 超过 150ms 仍无效才确认切占位——抑制窗口太大会让旧歌歌词
+        // 滞留到新歌就绪（切歌第一时间没缓过来），主界面是立即响应的
+        if (performance.now() - lastValidAt < 150) return;
         hasSong = false;
-        playing = false;
+        // 时钟不在此处重置：等下一帧有效 song-info（切歌/恢复）时由 clock 判定对齐
         rows = [];
         transMap = [];
         currentRowIdx = -1;
@@ -220,9 +168,10 @@ function onSongInfo(data) {
         wordEls = [];
         lastShownTrans = '';
         lastRenderKey = '';
-        renderFallback('idle');
+        setFallback('idle');
         return;
     }
+    lastValidAt = performance.now();
 
     const newRows = (data.qrc_data && data.qrc_data.length > 0)
         ? rowsFromQrc(data.qrc_data)
@@ -230,17 +179,39 @@ function onSongInfo(data) {
     const newTransMap = parseTranslation(data.trans);
     const renderKey = `${data.title}|${data.artist}|${data.qrc_data ? data.qrc_data.length : 0}|${(data.lyrics || '').length}|${(data.trans || '').length}`;
 
-    // 进度基线：切歌/首次加载直接 snap 到服务端（含传输补偿）
-    const rawT = computeRawTimeMs(data);
-    baseT = rawT;
-    baseTs = performance.now();
-    playing = !!data.is_playing;
-    lastServerPosMs = data.current_time_ms > 0 ? data.current_time_ms : -1;
-    behindCount = 0;
-    setScrollPaused(!playing);
+    // 真正切歌（首帧 / title|artist 指纹变化）才套「旧歌 timeline 防护」并重置
+    // 时钟：非首帧全量帧带 >5s 大进度/大时长几乎只出现在 SMTC 切歌瞬间——
+    // 新歌刚开头不可能处于 >5s 位置。同歌全量帧（封面升级/歌词-翻译晚到）
+    // 只交给时钟限速纠偏，绝不清零——旧实现对每个非首帧全量帧都套归零，
+    // 播放中途收到快照会把基线打回 0（歌词闪回首行）。
+    const songKey = `${data.title}|${data.artist}`;
+    const songChanged = firstFrame || songKey !== lastSongKey;
+    let rawT = computeRawTimeMs(data);
+    if (songChanged && !firstFrame) {
+        if (data.total_time_ms > 5000) {
+            data.total_time_ms = 0;
+            data.total_time = 0;
+        }
+        rawT = rawT > 5000 ? 0 : rawT;
+    }
+    const totalMs = data.total_time_ms > 0
+        ? data.total_time_ms
+        : (data.total_time || 0) * 1000;
+    if (songChanged) {
+        lastSongKey = songKey;
+        clock.reset({ songKey, rawMs: rawT, isPlaying: !!data.is_playing });
+    } else {
+        clock.update({
+            songKey: lastSongKey,
+            rawMs: rawT,
+            isPlaying: !!data.is_playing,
+            totalMs
+        });
+    }
+    syncScrollPause();
     hasSong = true;
 
-    // 静态内容未变（如仅专辑图升级触发快照）：只校准基线，不重建 DOM，
+    // 静态内容未变（如仅专辑图升级触发快照）：只交给时钟校准，不重建 DOM，
     // 避免滚动动画/高亮被无意义地重置
     if (renderKey !== lastRenderKey) {
         lastRenderKey = renderKey;
@@ -251,45 +222,55 @@ function onSongInfo(data) {
         currentRowStart = 0;
         lastShownTrans = '';
         fallbackMode = null;
+        // 内容指纹跨歌重置：displayedContent 只记 'row:idx'，旧歌与新歌都从
+        // row:0 开始 → 指纹相等 → tick 跳过首行 DOM 重建 → 旧歌第一句驻留
+        // （切歌「首句残留」bug；已缓存歌无 loading 占位缓冲，必现）。
+        wordEls = [];
+        displayedContent = '';
 
         if (rows.length === 0) {
-            // 歌词未就绪或纯音乐：显示占位，绝不残留上一首歌词
+            // 歌词未就绪或纯音乐：设置占位状态（DOM 由 tick 在指纹变化时渲染），
+            // 绝不残留上一首歌词
             const firstPlainLine = (data.lyrics || '')
                 .split('\n')
                 .map((s) => s.replace(/^\s*\[\d{2}:\d{2}[.:]\d{2,3}\]\s*/g, '').trim())
                 .find((s) => s && s !== '//');
             if (firstPlainLine) {
-                renderFallback('plain', firstPlainLine);
+                setFallback('plain', firstPlainLine);
             } else if ((data.lyrics || '').trim()) {
-                renderFallback('pure');
+                setFallback('pure');
             } else {
-                loadingStartedAt = performance.now();
-                renderFallback('loading');
+                setFallback('loading');
             }
         }
     }
 }
 
-/** 事件回调：进度事件 → 同策略校准插值基线 */
+/** 事件回调：进度帧 → 共享单调时钟限速纠偏（不直接 snap 到服务端） */
 function onProgress(progress) {
     if (!hasSong) return;
-    const serverPosMs = progress.current_time_ms > 0 ? progress.current_time_ms : -1;
-    syncProgressBaseline({
+    const totalMs = progress.total_time_ms > 0
+        ? progress.total_time_ms
+        : (progress.total_time || 0) * 1000;
+    clock.update({
+        songKey: lastSongKey,
+        rawMs: computeRawTimeMs(progress),
         isPlaying: !!progress.is_playing,
-        rawT: computeRawTimeMs(progress),
-        serverPosMs
+        totalMs
     });
+    syncScrollPause();
 }
 
-/** 渲染占位内容（等待播放 / 加载中 / 纯音乐 / 无时间戳纯文本） */
-function renderFallback(kind, customText = '') {
+/** 设置占位状态（等待播放 / 加载中 / 纯音乐 / 无时间戳纯文本）；DOM 由 tick 在指纹变化时渲染 */
+function setFallback(kind, customText = '') {
     fallbackMode = kind;
-    const text = customText || FALLBACK_TEXT[kind] || FALLBACK_TEXT.idle;
-    const domUnchanged = text === fallbackText;
-    fallbackText = text;
+    fallbackText = customText || FALLBACK_TEXT[kind] || FALLBACK_TEXT.idle;
+    if (kind === 'loading') loadingStartedAt = performance.now();
+}
 
-    // 状态复位无条件执行：即使占位文案未变（如 A 歌加载→B 歌加载），
-    // 也要清掉上一首歌残留的翻译行/滚动类
+/** 渲染占位 DOM（仅在内容指纹变化时执行一次） */
+function applyFallbackDom() {
+    // 状态复位：清掉上一首歌残留的翻译行/滚动类/行状态
     wordEls = [];
     currentRowIdx = -1;
     currentRowState = '';
@@ -301,12 +282,10 @@ function renderFallback(kind, customText = '') {
     els.inner.style.removeProperty('--scroll-dur');
     scrollOverflow = 0;
 
-    if (domUnchanged) return;
-
     els.inner.innerHTML = '';
     const span = document.createElement('span');
     span.className = 'lyric-bar-text bar-content';
-    span.textContent = text;
+    span.textContent = fallbackText;
     els.inner.appendChild(span);
     applyScrollIfNeeded(true);
 }
@@ -331,6 +310,7 @@ function renderRow(row) {
             const fg = document.createElement('span');
             fg.className = 'word-fg';
             fg.textContent = w.content;
+            fg.style.clipPath = 'inset(0 100% 0 0)';
             wordSpan.appendChild(bg);
             wordSpan.appendChild(fg);
             wrap.appendChild(wordSpan);
@@ -346,7 +326,7 @@ function renderRow(row) {
 
     els.inner.appendChild(wrap);
     applyScrollIfNeeded(true);
-    setScrollPaused(!playing);
+    syncScrollPause();
 }
 
 /**
@@ -364,14 +344,14 @@ function applyRowState(state) {
         for (const w of wordEls) {
             if (w.width !== 100) {
                 w.width = 100;
-                w.el.style.width = '100%';
+                w.el.style.clipPath = 'inset(0 0 0 0)';
             }
         }
     } else if (state === 'pending') {
         for (const w of wordEls) {
             if (w.width !== 0) {
                 w.width = 0;
-                w.el.style.width = '0%';
+                w.el.style.clipPath = 'inset(0 100% 0 0)';
             }
         }
     }
@@ -388,7 +368,8 @@ function updateWordHighlights(t) {
         const quant = Math.round(target * 2) / 2;
         if (quant !== w.width) {
             w.width = quant;
-            w.el.style.width = `${quant}%`;
+            // clip-path 裁剪（inset 右侧切入），比 width 写入不触发布局
+            w.el.style.clipPath = `inset(0 ${(100 - quant).toFixed(1)}% 0 0)`;
         }
     }
 }
@@ -425,6 +406,14 @@ function setScrollPaused(paused) {
     els.inner.style.animationPlayState = paused ? 'paused' : 'running';
 }
 
+/** 按单调时钟 running 状态同步滚动动画（缓存，避免重复写 style） */
+function syncScrollPause() {
+    const paused = !clock.running;
+    if (paused === scrollPaused) return;
+    scrollPaused = paused;
+    setScrollPaused(paused);
+}
+
 function setTransText(text) {
     if (text === lastShownTrans) return;
     lastShownTrans = text;
@@ -438,42 +427,55 @@ function setTransText(text) {
 
 function tick() {
     requestAnimationFrame(tick);
-    if (!hasSong) return;
 
+    // —— 目标内容推导（行 / 占位）——
+    // t 直接取单调时钟的当前显示位置：只按 1× 推进 + 限速纠偏，永不回退，
+    // 目标行因此单调前进，不需要任何换行防抖，指纹变化即重建。
+    let target = '';
+    const t = clock.position();
     if (fallbackMode) {
         // 加载兜底：歌词长时间未到达（如网络失败）时改为纯音乐提示
         if (fallbackMode === 'loading' && performance.now() - loadingStartedAt > 15000) {
-            renderFallback('pure');
+            setFallback('pure');
         }
-        return;
-    }
-    if (rows.length === 0) return;
-
-    const t = playing && baseTs > 0
-        ? baseT + Math.max(0, performance.now() - baseTs)
-        : baseT;
-
-    // 前奏（t 早于首行）：显示首行 pending；行结束（间奏）：当前行 done
-    let idx = rowIdxAt(t);
-    let state = 'active';
-    if (idx < 0) {
-        idx = 0;
-        state = 'pending';
-    } else if (t >= rows[idx].end) {
-        state = 'done';
+        target = 'fb:' + fallbackMode + ':' + fallbackText;
+    } else if (hasSong && rows.length > 0) {
+        // 前奏（t 早于首行）：目标为首行（pending）；
+        // 行结束（间奏/暂停恢复）：维持本行满格高亮直到下一行开始（驻留）
+        let idx = rowIdxAt(t);
+        if (idx < 0) idx = 0;
+        target = 'row:' + idx;
     }
 
-    if (idx !== currentRowIdx) {
-        currentRowIdx = idx;
-        currentRowStart = rows[idx].start;
-        renderRow(rows[idx]);
-        if (showTrans) setTransText(findTranslation(transMap, currentRowStart));
-        applyRowState(state);
-    } else if (state !== currentRowState) {
-        applyRowState(state);
+    // —— 内容切换：目标单调，指纹变化立即重建 DOM ——
+    if (target && target !== displayedContent) {
+        displayedContent = target;
+        if (target.startsWith('row:')) {
+            const idx = parseInt(target.slice(4), 10);
+            currentRowIdx = idx;
+            currentRowStart = rows[idx].start;
+            renderRow(rows[idx]);
+            if (showTrans) setTransText(findTranslation(transMap, currentRowStart));
+            applyRowState(rowStateAt(t, idx));
+        } else {
+            applyFallbackDom();
+        }
     }
 
-    if (wordEls.length > 0 && state === 'active') updateWordHighlights(t);
+    // —— 行状态跟随与逐字高亮（显示行确定后每帧执行）——
+    if (!fallbackMode && displayedContent.startsWith('row:')) {
+        const idx = parseInt(displayedContent.slice(4), 10);
+        if (idx >= 0 && idx < rows.length) {
+            const st = rowStateAt(t, idx);
+            if (st !== currentRowState) applyRowState(st);
+            if (wordEls.length > 0 && st === 'active') updateWordHighlights(t);
+        }
+    }
+}
+
+/** 行状态：前奏（t 早于行开始）为 pending；否则 active（行结束后驻留满格高亮） */
+function rowStateAt(t, idx) {
+    return t < rows[idx].start ? 'pending' : 'active';
 }
 
 /** 重读偏好配置：主题 + 翻译开关 + 字号字重 + 所在侧对齐（跟随主窗口设置） */
@@ -491,10 +493,18 @@ function applyPreferences() {
     // 任务栏高度有限：字号按主窗口偏好 0.6 倍映射并 clamp 到 12~20px
     const barFontSize = Math.min(20, Math.max(12, Math.round((cfg.fontSize || 26) * 0.6)));
     document.documentElement.style.setProperty('--bar-font-size', `${barFontSize}px`);
+    // 字重上限 600（用户 2026-10：去掉描边后 Regular 太细、锯齿感重）：
+    // 雅黑只有 400/700 字面，600 按 CSS 匹配规则落到 Bold；描边/光晕已删，
+    // Bold 的笔画更实，锯齿感明显减轻（若后续觉得糊可回 500 或改极细描边）
     document.documentElement.style.setProperty(
         '--bar-font-weight',
-        String(Math.min(800, Math.max(300, cfg.fontWeight || 700)))
+        String(Math.min(600, Math.max(300, cfg.fontWeight || 700)))
     );
+
+    // 任务栏明暗：手动配置直接生效（无需求 DWM，可靠）
+    if (cfg.taskbarTheme === 'light') taskbarLight = true;
+    else if (cfg.taskbarTheme === 'dark') taskbarLight = false;
+    applyTaskbarAppearance();
 
     // 翻译开关切换立即生效（不等下一行切换）
     if (!showTrans) {
@@ -504,15 +514,57 @@ function applyPreferences() {
     }
 }
 
-/** 查询任务栏明暗主题（DWM 沉浸式模式），浅色时切换深色文字配色 */
+/**
+ * 按任务栏明暗把主题落成歌词文字变量。
+ * 文字基准色取 --theme-ink（auto 调色板输出，主窗口歌词高亮同一个 ink，
+ * 保证"两边同色"）；预设主题没有 --theme-ink 时回退 --theme-primary。
+ * 深色任务栏对 ink 再保色相提亮到 4.5:1，浅色任务栏作向黑适配。
+ */
+function applyTaskbarAppearance() {
+    const cs = getComputedStyle(document.body);
+    const primary = (cs.getPropertyValue('--theme-primary') || '').trim() || '#14b8a6';
+    const ink = (cs.getPropertyValue('--theme-ink') || '').trim() || primary;
+    const gradient = (cs.getPropertyValue('--theme-gradient') || '').trim();
+    const { fg, gradA, gradB, dim } = barTextColors(gradient, taskbarLight, ink);
+    document.documentElement.style.setProperty('--bar-fg-color', fg);
+    // 未唱底字：高亮色的同色系暗色（不再用白色，避免高亮字半透明边缘透白）
+    document.documentElement.style.setProperty('--bar-bg-color', dim);
+    document.documentElement.style.setProperty(
+        '--bar-text-gradient',
+        `linear-gradient(135deg, ${gradA}, ${gradB})`
+    );
+    document.body.classList.toggle('light', taskbarLight);
+}
+
+/**
+ * 查询任务栏明暗主题（DWM 沉浸式模式），浅色时切换深色文字配色。
+ * 手动配置（taskbarTheme: dark/light）直接生效，不查询系统；
+ * auto 模式查询失败时保持上次成功状态，不猜测——避免浅色任务栏上
+ * 白字+白描边彻底不可见（轮询会持续重试直至成功）。
+ */
 async function refreshTaskbarLightMode() {
-    if (!window.__TAURI__) return;
+    const cfg = loadFrontendConfig();
+    if (cfg.taskbarTheme === 'dark') {
+        taskbarLight = false;
+        applyTaskbarAppearance();
+        return;
+    }
+    if (cfg.taskbarTheme === 'light') {
+        taskbarLight = true;
+        applyTaskbarAppearance();
+        return;
+    }
+    if (!window.__TAURI__) {
+        applyTaskbarAppearance();
+        return;
+    }
     try {
         const light = await window.__TAURI__.core.invoke('get_taskbar_light_theme');
-        document.body.classList.toggle('light', !!light);
+        if (typeof light === 'boolean') taskbarLight = light;
     } catch {
-        /* 查询失败保持默认深色配色 */
+        /* 查询失败：保持上次成功状态，下轮轮询重试 */
     }
+    applyTaskbarAppearance();
 }
 
 /** 页面入口 */
@@ -527,7 +579,7 @@ export function initLyricBar() {
     }
     refreshTaskbarLightMode();
     // 系统主题可能随时切换（自动深色/浅色），低频轮询保持配色同步
-    setInterval(refreshTaskbarLightMode, 10000);
+    setInterval(refreshTaskbarLightMode, 2000);
 
     // 主窗口切换主题/字号时实时跟随：
     // 1. Tauri 事件广播（settings 面板发出）
@@ -538,8 +590,15 @@ export function initLyricBar() {
             .catch(() => {});
     }
     window.addEventListener('storage', (e) => {
-        // 偏好变化或专辑自动取色变化（主窗口提取后广播）都重新应用
-        if (e.key === null || e.key === STORAGE_KEY || e.key === AUTO_COLOR_KEY) applyPreferences();
+        // 偏好变化或专辑自动调色板变化（主窗口提取后广播）都重新应用
+        if (
+            e.key === null ||
+            e.key === STORAGE_KEY ||
+            e.key === AUTO_COLOR_KEY ||
+            e.key === AUTO_PALETTE_KEY
+        ) {
+            applyPreferences();
+        }
     });
 
     // 任务栏可用宽度变化（左右位置切换/分辨率/DPI 变化）时自动重测滚动

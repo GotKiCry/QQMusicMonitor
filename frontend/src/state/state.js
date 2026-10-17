@@ -37,6 +37,8 @@ export let lastRawTimeMs = -1;
 export let lastServerPosMs = -1;
 /** 是否正在播放 */
 export let isPlaying = false;
+/** 显示时钟是否在推进（单调播放时钟 running；render-loop 据此决定是否插值） */
+export let clockRunning = false;
 
 // —— 连接状态 ——
 /** @type {WebSocket | null} */
@@ -73,6 +75,8 @@ export function setLastRawTimeMs(v) { lastRawTimeMs = v; }
 export function setLastServerPosMs(v) { lastServerPosMs = v; }
 /** @param {boolean} v */
 export function setIsPlaying(v) { isPlaying = v; }
+/** @param {boolean} v */
+export function setClockRunning(v) { clockRunning = v; }
 /** @param {WebSocket | null} v */
 export function setWs(v) { ws = v; }
 /** @param {number} v */

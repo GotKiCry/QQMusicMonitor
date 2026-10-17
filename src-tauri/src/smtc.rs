@@ -265,6 +265,8 @@ struct SmtcReaderInner {
     /// 恢复点，跳变发生在尚未出声的静默期；先冻结在原位置，把对齐
     /// 跳变推迟到出声/锚定时刻（被音乐起步掩盖）
     resume_freeze_floor: Option<u64>,
+    /// 对外位置单调时钟（发布前平滑 SMTC 重锚阶跃，见 OutputClock）
+    output_clock: Option<OutputClock>,
     /// 上一帧对外的播放状态（识别 播放→暂停 切换帧）
     last_reported_playing: bool,
     /// 最后一帧播放状态的对外位置与发出时刻（淡出起点锚）
@@ -569,6 +571,21 @@ pub async fn get_current_media_info() -> Result<Option<SongInfo>> {
             }
             apply_pause_fade(&mut reader, i);
             apply_resume_hold(&mut reader, i);
+            // 发布前最后一道平滑：把 SMTC 重锚阶跃变成单调、不回退、
+            // 不跳跃的对外位置（主窗口/状态栏/HTTP/WS 全部消费同一份）
+            let out_key = format!("{}|{}", i.title, i.artist);
+            let out_now = chrono::Utc::now().timestamp_millis() + WINDOWS_EPOCH_OFFSET_MS;
+            let smoothed = smooth_output_clock(
+                &mut reader.output_clock,
+                &out_key,
+                i.is_playing,
+                i.current_time_ms,
+                i.total_time_ms,
+                out_now,
+            );
+            set_info_position(i, smoothed, i.is_playing);
+            // 平滑后的位置以此刻为参照，前端据此做传输补偿
+            i.server_ts = chrono::Utc::now().timestamp_millis() as u64;
         }
     }
     Ok(info)
@@ -805,6 +822,156 @@ fn freeze_info_position(info: &mut SongInfo, pos_ms: u64) {
     set_info_position(info, pos_ms, false);
 }
 
+/// 对外位置单调时钟：发布前的最后一道平滑。
+///
+/// 背景：QQ 音乐 SMTC timeline 约每 330ms 才刷新一次，`correct_position`
+/// 每次新快照都以「raw + LastUpdatedTime 外推」重锚。实测每次重锚会产生
+/// ±20~100ms 的位置阶跃（约 2.3 次/秒，均值 0）——直接发布出去后，前端
+/// 逐字高亮会来回 1~2 个字、行边界处整行来回翻转。
+///
+/// 这里把「内部校正位置」变成「单调、不回退、不跳跃的对外位置」：
+///  - 播放中：按 1× 推进，每次观测只做限速纠偏（单次修正 ≤ 流逝 × 20%，
+///    等效瞬时速率 0.8~1.2×），偏差超过 OUT_SEEK_SNAP_MS 才判 seek 直接对齐；
+///  - 暂停 / 恢复 hold（is_playing=false 且观测停滞）：冻结对外位置，
+///    不跟随冻结值的 ±100ms 微调；
+///  - is_playing=false 但观测仍在前进（WASAPI 门控把静音段落判成暂停）：
+///    继续按 1× 前进，避免间奏歌词冻住后跳动；
+///  - 切歌：以新歌观测位置重置；timeline 归零窗口（total=0）先按 1× 走。
+struct OutputClock {
+    song_key: String,
+    /// 上一次发布的对外位置（用 f64 保留限速纠偏的小数部分）
+    out_ms: f64,
+    /// out_ms 对应的 Windows 纪元毫秒
+    out_at_ms: i64,
+    /// 对外位置是否随时间前进
+    running: bool,
+    /// 上一次观测位置（判断观测是否仍在前进）
+    last_obs_ms: u64,
+    /// 上一次观测时刻（Windows 纪元毫秒）
+    last_obs_at_ms: i64,
+    /// 连续「观测在前进」的帧数（is_playing=false 时用于区分
+    /// 「音频门控静音段」与「暂停时一次性冻结值提交」）
+    moving_streak: u8,
+}
+
+/// seek 判定阈值（ms）：对外位置与观测偏差超过它才直接对齐
+const OUT_SEEK_SNAP_MS: f64 = 700.0;
+/// 纠偏速率上限：单次修正 ≤ 流逝 × 0.2（等效瞬时速率 0.8~1.2×）
+const OUT_MAX_RATE_ADJUST: f64 = 0.2;
+/// 单次纠偏下限（ms）：elapsed≈0 时仍保留最小纠偏能力
+const OUT_MIN_ADJUST_MS: f64 = 2.0;
+/// 「观测仍在前进」判定的相对速率阈值（相对墙钟）
+const OUT_MOVING_RATIO: f64 = 0.5;
+/// 「观测仍在前进」判定的最小位移（ms）
+const OUT_MOVING_MIN_MS: f64 = 8.0;
+
+/// 单调时钟单帧推进（纯函数，便于测试）。
+/// 返回本帧应对外发布的位置（ms）。
+fn smooth_output_clock(
+    clock: &mut Option<OutputClock>,
+    song_key: &str,
+    is_playing: bool,
+    obs_ms: u64,
+    total_ms: u64,
+    now_ms: i64,
+) -> u64 {
+    let total = total_ms as f64;
+    let cap = |v: f64| if total > 0.0 { v.min(total) } else { v };
+
+    // 切歌 / 首帧：直接以观测位置重置
+    let same_song = clock
+        .as_ref()
+        .map(|c| c.song_key == song_key)
+        .unwrap_or(false);
+    if !same_song {
+        let pos = cap(obs_ms as f64);
+        *clock = Some(OutputClock {
+            song_key: song_key.to_string(),
+            out_ms: pos,
+            out_at_ms: now_ms,
+            running: is_playing,
+            last_obs_ms: obs_ms,
+            last_obs_at_ms: now_ms,
+            moving_streak: 0,
+        });
+        return pos.round() as u64;
+    }
+
+    let c = clock.as_mut().unwrap();
+    let predicted = if c.running {
+        c.out_ms + (now_ms - c.out_at_ms).max(0) as f64
+    } else {
+        c.out_ms
+    };
+    let diff = obs_ms as f64 - predicted;
+
+    // 1) timeline 归零窗口（切歌后新歌 timeline 尚未就绪）：观测是恒定
+    //    占位值，不能据此纠偏、也不能用「偏差 > 阈值」判 seek——否则窗口
+    //    超过 700ms 时会被打回 0。此处始终按 1× 自然前进，timeline 就绪后
+    //    由后续限速纠偏收敛
+    if total_ms == 0 && is_playing {
+        c.out_ms = predicted;
+        c.out_at_ms = now_ms;
+        c.running = true;
+        c.last_obs_ms = obs_ms;
+        c.last_obs_at_ms = now_ms;
+        c.moving_streak = 0;
+        return c.out_ms.round() as u64;
+    }
+
+    // 2) 明显跳变（seek / timeline 更新 / 恢复时的大偏差）→ 直接对齐
+    if diff.abs() > OUT_SEEK_SNAP_MS {
+        c.out_ms = cap(obs_ms as f64);
+        c.out_at_ms = now_ms;
+        c.running = is_playing;
+        c.last_obs_ms = obs_ms;
+        c.last_obs_at_ms = now_ms;
+        c.moving_streak = 0;
+        return c.out_ms.round() as u64;
+    }
+
+    // 3) 观测是否仍在前进（is_playing 只是播放器「声称」的状态）。
+    //    is_playing=false 时要求连续 2 帧都在前进：暂停瞬间 QQ 会提交一次
+    //    冻结值（一次性位移），单帧不足以证明音乐还在走
+    let obs_dt = now_ms - c.last_obs_at_ms;
+    let obs_advance = obs_ms as i64 - c.last_obs_ms as i64;
+    let obs_advancing = obs_dt > 0
+        && obs_advance > 0
+        && (obs_advance as f64) > (obs_dt as f64 * OUT_MOVING_RATIO).max(OUT_MOVING_MIN_MS);
+    c.moving_streak = if obs_advancing {
+        c.moving_streak.saturating_add(1)
+    } else {
+        0
+    };
+    let moving = is_playing || c.moving_streak >= 2;
+
+    // 4) 暂停 / 恢复 hold：冻结在当前位置，不跟随冻结值微调
+    if !moving {
+        c.out_ms = predicted;
+        c.out_at_ms = now_ms;
+        c.running = false;
+        c.last_obs_ms = obs_ms;
+        c.last_obs_at_ms = now_ms;
+        return c.out_ms.round() as u64;
+    }
+
+    // 5) 播放中：限速纠偏（单次修正有上限，且对外位置绝不回退）
+    let elapsed = if c.running {
+        (now_ms - c.out_at_ms).max(0) as f64
+    } else {
+        0.0
+    };
+    let max_adj = (elapsed * OUT_MAX_RATE_ADJUST).max(OUT_MIN_ADJUST_MS);
+    let adjust = diff.clamp(-max_adj, max_adj);
+    let next = cap((predicted + adjust).max(c.out_ms));
+    c.out_ms = next;
+    c.out_at_ms = now_ms;
+    c.running = true;
+    c.last_obs_ms = obs_ms;
+    c.last_obs_at_ms = now_ms;
+    c.out_ms.round() as u64
+}
+
 async fn get_current_media_info_inner() -> Result<Option<SongInfo>> {
     // Lazily initialize the global SMTC reader
     let reader_mutex = match SMTC_READER.get() {
@@ -826,6 +993,7 @@ async fn get_current_media_info_inner() -> Result<Option<SongInfo>> {
                 resume_hold: None,
                 pause_fade: None,
                 resume_freeze_floor: None,
+                output_clock: None,
                 last_reported_playing: false,
                 last_playing_emitted: None,
                 thumbnail_loading: false,
@@ -1283,5 +1451,173 @@ mod tests {
         assert!(!accept_frozen_refresh(107_284, 112_584, PAUSE_STALE_GRACE_MS));
         // 宽限期后的向后移动 = 用户真实 seek，接受
         assert!(accept_frozen_refresh(60_000, 112_584, PAUSE_STALE_GRACE_MS + 1));
+    }
+
+    // —— smooth_output_clock（对外位置单调时钟）——
+
+    /// 播放中观测带 ±60ms 重锚噪声：对外位置必须单调、单帧不跳变、
+    /// 且不引入累积漂移。
+    #[test]
+    fn output_clock_filters_anchor_jitter_without_backwards_or_drift() {
+        let mut clock: Option<OutputClock> = None;
+        let mut out = Vec::new();
+        let noise = [0i64, 60, -60, 45, -45, 0, 80, -80, 0, 0, 55, -55];
+        let mut truth = 10_000u64;
+        for i in 0..300i64 {
+            let now = 1_000_000 + i * 30;
+            truth += 30;
+            let obs = (truth as i64 + noise[i as usize % noise.len()]).max(0) as u64;
+            out.push(smooth_output_clock(
+                &mut clock, "s|a", true, obs, 200_000, now,
+            ));
+        }
+        // 单调不回退
+        for w in out.windows(2) {
+            assert!(w[1] >= w[0], "对外位置回退: {} -> {}", w[0], w[1]);
+        }
+        // 单帧跳变受限：30ms 流逝最多 20% 纠偏 → 不超过 ~40ms
+        for w in out.windows(2) {
+            assert!(w[1] - w[0] <= 40, "单帧跳变过大: {} -> {}", w[0], w[1]);
+        }
+        // 无累积漂移（|out - truth| 保持在噪声量级）
+        let drift = *out.last().unwrap() as i64 - truth as i64;
+        assert!(drift.abs() <= 120, "累积漂移过大: {}", drift);
+    }
+
+    /// 暂停：冻结对外位置，且不跟随冻结值的 ±100ms 微调。
+    #[test]
+    fn output_clock_freezes_on_pause_and_ignores_fine_adjustment() {
+        let mut clock: Option<OutputClock> = None;
+        let mut now = 1_000_000i64;
+        let mut last = 0u64;
+        for i in 0..100u64 {
+            now += 30;
+            last = smooth_output_clock(&mut clock, "s|a", true, 10_000 + i * 30 + 30, 200_000, now);
+        }
+        // 暂停：观测先微调 +100ms，再回 -100ms
+        let mut pause_obs = last;
+        let mut pause_out = Vec::new();
+        for i in 0..90i64 {
+            now += 30;
+            if i == 20 {
+                pause_obs = last + 100;
+            }
+            if i == 50 {
+                pause_obs = last;
+            }
+            pause_out.push(smooth_output_clock(
+                &mut clock, "s|a", false, pause_obs, 200_000, now,
+            ));
+        }
+        // 首帧可能停在当前预测值，之后必须恒定
+        for w in pause_out[1..].windows(2) {
+            assert_eq!(w[1], w[0], "暂停期间对外位置仍在变: {} -> {}", w[0], w[1]);
+        }
+        assert!((pause_out[0] as i64 - last as i64).abs() <= 100);
+    }
+
+    /// 恢复播放：QQ 从提交点继续（领先冻结值数百 ms）时，对外位置平滑收敛、
+    /// 不回退、不跳变。
+    #[test]
+    fn output_clock_resumes_smoothly_without_backwards_jump() {
+        let mut clock: Option<OutputClock> = None;
+        let mut now = 1_000_000i64;
+        let mut out = Vec::new();
+        for i in 0..100u64 {
+            now += 30;
+            out.push(smooth_output_clock(
+                &mut clock,
+                "s|a",
+                true,
+                10_000 + i * 30 + 30,
+                200_000,
+                now,
+            ));
+        }
+        let frozen_obs = 10_000 + 100 * 30;
+        for _ in 0..60 {
+            now += 30;
+            out.push(smooth_output_clock(
+                &mut clock, "s|a", false, frozen_obs, 200_000, now,
+            ));
+        }
+        // 恢复：观测从冻结值 +250ms 处继续前进
+        let resume_base = frozen_obs + 250;
+        for i in 0..120u64 {
+            now += 30;
+            out.push(smooth_output_clock(
+                &mut clock,
+                "s|a",
+                true,
+                resume_base + i * 30 + 30,
+                200_000,
+                now,
+            ));
+        }
+        for w in out.windows(2) {
+            assert!(w[1] >= w[0], "恢复过程对外位置回退: {} -> {}", w[0], w[1]);
+        }
+        // 恢复 3s 内收敛到观测附近（±120ms）
+        let obs_end = resume_base + 120 * 30;
+        let out_end = *out.last().unwrap();
+        assert!(
+            (out_end as i64 - obs_end as i64).abs() <= 120,
+            "恢复后未收敛: out={} obs={}",
+            out_end,
+            obs_end
+        );
+    }
+
+    /// seek：偏差超过阈值时直接对齐（不等限速收敛）。
+    #[test]
+    fn output_clock_snaps_on_seek() {
+        let mut clock: Option<OutputClock> = None;
+        for i in 0..50u64 {
+            smooth_output_clock(&mut clock, "s|a", true, 5_000 + i * 30, 200_000, 1_000_000 + i as i64 * 30);
+        }
+        let jumped = smooth_output_clock(&mut clock, "s|a", true, 90_000, 200_000, 1_001_500);
+        assert_eq!(jumped, 90_000);
+    }
+
+    /// 切歌：以新歌观测位置重置。
+    #[test]
+    fn output_clock_resets_on_song_change() {
+        let mut clock: Option<OutputClock> = None;
+        for i in 0..50u64 {
+            smooth_output_clock(&mut clock, "a|b", true, 50_000 + i * 30, 200_000, 1_000_000 + i as i64 * 30);
+        }
+        let out = smooth_output_clock(&mut clock, "c|d", true, 1_000, 180_000, 1_002_000);
+        assert_eq!(out, 1_000);
+    }
+
+    /// is_playing=false 但观测仍在前进（WASAPI 门控把静音段落判成暂停）：
+    /// 对外位置必须继续 1× 前进，不能冻结。
+    #[test]
+    fn output_clock_advances_during_audio_gate_pause() {
+        let mut clock: Option<OutputClock> = None;
+        let mut out = Vec::new();
+        for i in 0..100u64 {
+            let now = 1_000_000 + i as i64 * 30;
+            let obs = 10_000 + i * 30;
+            out.push(smooth_output_clock(&mut clock, "s|a", false, obs, 200_000, now));
+        }
+        assert!(
+            out[99] - out[0] >= 2_500,
+            "门控暂停期间歌词被冻结: {} -> {}",
+            out[0],
+            out[99]
+        );
+    }
+
+    /// timeline 归零窗口（total=0、观测为恒定占位值）：先按 1× 前进。
+    #[test]
+    fn output_clock_keeps_advancing_in_timeline_zero_window() {
+        let mut clock: Option<OutputClock> = None;
+        let mut out = Vec::new();
+        for i in 0..100u64 {
+            let now = 1_000_000 + i as i64 * 30;
+            out.push(smooth_output_clock(&mut clock, "s|a", true, 0, 0, now));
+        }
+        assert!(out[99] >= 2_500, "归零窗口位置未前进: {}", out[99]);
     }
 }

@@ -7,6 +7,7 @@
 :root {
     /* 由 lyric-bar.js 按主窗口偏好动态设置（有默认值兜底） */
     --bar-font-size: 16px;
+    /* 字重：雅黑无 SemiBold，600 会匹配 Bold 字面；描边已删，Bold 更实、锯齿更轻 */
     --bar-font-weight: 600;
     --bar-line-height: calc(var(--bar-font-size) * 1.5);
 }
@@ -23,7 +24,8 @@ body {
     height: 100%;
     background: transparent;
     overflow: hidden;
-    font-family: var(--font-body);
+    /* 系统字体栈：歌词全是中文，Inter 等拉丁字体无字形覆盖，纯增负担 */
+    font-family: system-ui, 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
     -webkit-font-smoothing: antialiased;
     user-select: none;
     -webkit-user-select: none;
@@ -54,9 +56,9 @@ body {
     align-items: center;
     justify-content: flex-end; /* 默认右侧：贴着通知区 */
     overflow: hidden;
-    /* 深色描边保证文字在任何壁纸下清晰，轻量主题光晕（小半径低透明度）不压字 */
-    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.95))
-            drop-shadow(0 0 6px var(--theme-bar-glow));
+    /* 不用任何描边/投影：深色任务栏上 1.5px 黑投影会在彩色文字外缘
+       形成明显的"黑色边框"观感（用户 2026-10 反馈）。当前亮色文字
+       对深色背景本身对比足够，去掉后边缘干净。 */
 }
 
 .lyric-bar-body.side-left .lyric-bar-line {
@@ -75,15 +77,16 @@ body {
     transition: opacity 0.35s ease;
 }
 
-/* 行状态：前奏压暗 / 已唱完轻微变暗（状态切换不重建 DOM，平滑过渡） */
-.lyric-bar-inner.pending { opacity: 0.4; }
+/* 行状态：前奏压暗（0.55：任务栏只有一行，太暗会读不到首句）/ 已唱完轻微变暗 */
+.lyric-bar-inner.pending { opacity: 0.55; }
 .lyric-bar-inner.done    { opacity: 0.7; }
 
-/* 每行内容 wrapper：新行重建时触发淡入（inner 常驻，动画不随 innerHTML 重启） */
+/* 每行内容 wrapper：新行重建时触发淡入（inner 常驻，动画不随 innerHTML 重启）。
+   0.2s：换行应与主界面"立即变亮"的节奏近似，过长淡入会显得读词滞后 */
 .bar-content {
     display: inline-block;
     white-space: nowrap;
-    animation: bar-fade 0.35s ease;
+    animation: bar-fade 0.2s ease;
 }
 
 .lyric-bar-inner.scrolling {
@@ -91,6 +94,7 @@ body {
     --scroll-start: 0px;
     --scroll-end: calc(var(--scroll-dist, 0px) * -1);
     animation: lyric-scroll var(--scroll-dur, 8s) linear infinite;
+    will-change: transform;
 }
 
 /* 右侧偏好：内容右对齐，行首偏移 +dist 出现在窗口左缘，
@@ -111,15 +115,15 @@ body {
     to { opacity: 1; transform: translateY(0); }
 }
 
-/* —— 纯文本行：主题渐变文字 —— */
+/* —— 纯文本行：对比度安全渐变（barTextColors 生成，防渐变浅色端在浅色任务栏过淡） —— */
 .lyric-bar-text {
-    background: var(--theme-gradient);
+    background: var(--bar-text-gradient, var(--theme-gradient));
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
 }
 
-/* —— 逐字行：底层灰白字 + 上层渐变剪裁高亮 —— */
+/* —— 逐字行：底层灰白字 + 上层主题色剪裁高亮 —— */
 .word {
     position: relative;
     display: inline-block;
@@ -127,7 +131,10 @@ body {
 }
 
 .word-bg {
-    color: rgba(255, 255, 255, 0.55);
+    /* 未唱底字：由 JS 按高亮色生成同色系暗色（--bar-bg-color）。
+       不再用白色——高亮字走了 background-clip:text，抗锯齿边缘半透明，
+       白色底字会从边缘透出（"红色没盖住白色"）；同色系暗色让边缘过渡自然。 */
+    color: var(--bar-bg-color, rgba(255, 255, 255, 0.72));
     white-space: inherit;
 }
 
@@ -135,49 +142,50 @@ body {
     position: absolute;
     left: 0;
     top: 0;
-    width: 0%;
-    overflow: hidden;
+    width: 100%;
     white-space: inherit;
-    background: var(--theme-gradient);
+    /* 高亮进度用 clip-path 裁剪（原 width 0→100% 每帧触发 reflow，滚动动画下易掉帧）；
+       clip-path: inset(0 100% 0 0) = 完全裁掉（未高亮），JS 按进度更新 */
+    clip-path: inset(0 100% 0 0);
+    /* 单色高亮（barTextColors 按任务栏明暗生成，保证对比度）；
+       原词级独立渐变会让整行出现 N 个亮→暗周期，小字号下斑驳 */
+    background: var(--bar-fg-color, var(--theme-ink, var(--theme-primary)));
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
+    /* 不加同色模糊 text-shadow（0.75px 是高亮字发糊的直接来源）；
+       边缘透白问题改由底字同色系暗化解决（见 .word-bg） */
 }
 
 /* —— 翻译行 —— */
 .lyric-bar-trans {
     max-width: 100%;
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 400;
-    line-height: 13px;
-    color: rgba(255, 255, 255, 0.6);
+    line-height: 14px;
+    color: rgba(255, 255, 255, 0.75);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.85));
 }
 
 /* —— 浅色任务栏：深色文字 + 加强渐变（白底白字不可读） —— */
-.lyric-bar-body.light .lyric-bar-line {
-    filter: drop-shadow(0 1px 2px rgba(255, 255, 255, 0.55))
-            drop-shadow(0 0 6px var(--theme-bar-glow));
+.lyric-bar-body.light .word-fg {
+    background: var(--bar-fg-color, var(--theme-gradient-strong, var(--theme-gradient)));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
 }
 
-.lyric-bar-body.light .word-bg {
-    color: rgba(15, 23, 42, 0.55);
-}
-
-.lyric-bar-body.light .word-fg,
 .lyric-bar-body.light .lyric-bar-text {
-    background: var(--theme-gradient-strong, var(--theme-gradient));
+    background: var(--bar-text-gradient, var(--theme-gradient-strong, var(--theme-gradient)));
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
 }
 
 .lyric-bar-body.light .lyric-bar-trans {
-    color: rgba(15, 23, 42, 0.65);
-    filter: drop-shadow(0 1px 2px rgba(255, 255, 255, 0.5));
+    color: rgba(15, 23, 42, 0.8);
 }
 
 /* —— 短任务栏（≤41px 高，如 40px 小任务栏）：隐藏翻译行，歌词行占满 —— */

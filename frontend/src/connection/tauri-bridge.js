@@ -62,19 +62,20 @@ export function getAppWindow() {
  * 窗口控制命令。
  * @param {'minimize' | 'maximize' | 'close'} action
  *
- * minimize 为后台模式：隐藏窗口（从任务栏移除），保留系统托盘小图标，
- * 单击托盘图标或托盘菜单"显示"可恢复窗口。
+ * minimize / close 均为后台模式：隐藏窗口（从任务栏移除），保留系统托盘
+ * 小图标，单击托盘图标或托盘菜单"显示"可恢复窗口。真正退出程序走托盘
+ * 菜单"退出"或状态栏歌词条右键菜单"退出"（2026-10 用户要求：关闭按钮
+ * 回后台，不再直接结束进程）。
  */
 export function windowControl(action) {
     const appWindow = getAppWindow();
     if (!appWindow) return;
-    if (action === 'minimize') {
+    if (action === 'minimize' || action === 'close') {
         // 先通知后端进入后台省电模式（停 GUI 推送；API 开启时不影响），再隐藏窗口
         window.__TAURI__.core.invoke('window_hidden').catch(() => {});
         appWindow.hide();
     }
     else if (action === 'maximize') appWindow.toggleMaximize();
-    else if (action === 'close') appWindow.close();
 }
 
 /**

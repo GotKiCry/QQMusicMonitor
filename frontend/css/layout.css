@@ -7,7 +7,8 @@
 .app-card {
     width: 100%;
     height: 100vh;
-    background: linear-gradient(160deg, #101a2c 0%, #0a0e17 100%);
+    /* 深色玻璃 / 浅色奶油纸：由 --bg-app 按封面亮度切换（theme.js 内联） */
+    background: var(--bg-app);
     z-index: 10;
     display: flex;
     flex-direction: column;
@@ -98,8 +99,8 @@
 }
 
 .media-btn:hover {
-    color: var(--theme-primary);
-    background-color: rgba(255, 255, 255, 0.05);
+    color: var(--theme-ink, var(--theme-primary));
+    background-color: var(--surface-hover);
 }
 
 .media-btn:active {
@@ -130,8 +131,8 @@
 }
 
 .settings-trigger-btn:hover {
-    color: var(--theme-primary);
-    background-color: rgba(255, 255, 255, 0.05);
+    color: var(--theme-ink, var(--theme-primary));
+    background-color: var(--surface-hover);
 }
 
 /* —— 右侧动作区：设置 + 窗口控制 —— */
@@ -165,8 +166,8 @@
 }
 
 .win-btn:hover {
-    color: var(--theme-primary);
-    background-color: rgba(255, 255, 255, 0.05);
+    color: var(--theme-ink, var(--theme-primary));
+    background-color: var(--surface-hover);
 }
 
 .win-btn:active {
