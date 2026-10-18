@@ -55,6 +55,7 @@ node_modules/
 # Claude Code & Agent 文件夹
 .claude/
 .agent/
+.agents/
 
 # Reasonix Agent 文件夹
 .reasonix/
