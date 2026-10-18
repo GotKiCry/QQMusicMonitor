@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>迷你播放器</title>
+    <!-- 字体用系统栈：中文覆盖 + 避免外网字体阻塞首屏（与主窗口一致，见 tokens.css） -->
+    <link rel="stylesheet" href="css/tokens.css">
+    <link rel="stylesheet" href="css/mini-player.css">
+</head>
+<body class="mini-player-body" data-theme="aurora-cyan">
+    <!-- 卡片悬浮在透明窗口内；外圈留白给投影（下 > 侧 > 上，匹配阴影几何） -->
+    <div class="mp-card mp-enter" id="mp-card">
+        <!-- 专辑封面全幅背景（JS 写入 backgroundImage，无封面时保持纯深色底） -->
+        <div class="mp-art" id="mp-art"></div>
+        <!-- 可读性 scrim：底部压深承载文字与控件，向上渐隐露出封面 -->
+        <div class="mp-scrim"></div>
+
+        <div class="mp-content">
+            <div class="mp-meta">
+                <div class="mp-title" id="mp-title">等待播放</div>
+                <div class="mp-artist" id="mp-artist">QQMusic Monitor</div>
+                <div class="mp-album" id="mp-album"></div>
+            </div>
+
+            <div class="mp-progress">
+                <span class="mp-time" id="mp-time-cur">00:00</span>
+                <div class="mp-track">
+                    <div class="mp-fill" id="mp-fill"></div>
+                </div>
+                <span class="mp-time" id="mp-time-total">00:00</span>
+            </div>
+
+            <div class="mp-controls">
+                <button class="mp-btn" id="mp-prev" title="上一首">
+                    <svg viewBox="0 0 24 24" class="svg-icon">
+                        <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/>
+                    </svg>
+                </button>
+                <button class="mp-btn mp-btn-play" id="mp-play" title="播放/暂停">
+                    <svg viewBox="0 0 24 24" class="svg-icon" id="mp-icon-play">
+                        <path d="M8 5v14l11-7z"/>
+                    </svg>
+                    <svg viewBox="0 0 24 24" class="svg-icon hidden" id="mp-icon-pause">
+                        <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+                    </svg>
+                </button>
+                <button class="mp-btn" id="mp-next" title="下一首">
+                    <svg viewBox="0 0 24 24" class="svg-icon">
+                        <path d="M6 18l8.5-6L6 6v12zM18 6v12h2V6h-2z"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </div>
+    <script type="module" src="src/mini-player.js"></script>
+</body>
+</html>

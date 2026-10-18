@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(dead_code)]
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use tokio::sync::RwLock;
 
@@ -102,6 +102,15 @@ async fn window_hidden() {
     GUI_VISIBLE.store(false, Ordering::SeqCst);
 }
 
+/// 迷你播放器退场动画播完后的前端回执：真正隐藏窗口。
+#[tauri::command]
+async fn hide_mini_player(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window("mini-player") {
+        let _ = win.hide();
+    }
+}
+
 /// 状态栏歌词窗口兜底尺寸（拿不到任务栏位置时使用）
 const LYRIC_BAR_FALLBACK_WIDTH: f64 = 800.0;
 const LYRIC_BAR_FALLBACK_HEIGHT: f64 = 48.0;
@@ -110,11 +119,39 @@ const LYRIC_BAR_BOTTOM_OFFSET: f64 = 0.0;
 /// 歌词条窗口句柄（WinEvent 回调置顶用）
 static LYRIC_BAR_HWND: AtomicIsize = AtomicIsize::new(0);
 
+/// 迷你播放器逻辑尺寸（透明窗口，卡片外圈留白给 CSS 投影）。
+/// 卡片本体 320×332 = 窗口减去 inset 留白（30/24/34）——留白必须覆盖
+/// box-shadow 的最大外扩量（否则阴影被窗口边界裁切成方形暗晕），
+/// 并容纳显隐动画 ±26px 的滑动行程。
+const MINI_PLAYER_W: f64 = 368.0;
+const MINI_PLAYER_H: f64 = 396.0;
+
+/// 迷你播放器最近一次显示时刻（Unix ms）：失焦自动隐藏的防抖基准。
+/// 某些系统上 show+set_focus 会抖一次 Focused(false)，刚显示的一小段
+/// 时间内的失焦事件直接忽略，防止窗口一闪而过。
+static MINI_PLAYER_SHOWN_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 迷你播放器是否放置在歌词条下方（任务栏在屏幕顶部时）。
+/// 显隐动画的滑动方向由此决定：卡片永远从歌词条一侧滑入/滑出。
+static MINI_PLAYER_PLACED_BELOW_BAR: AtomicBool = AtomicBool::new(false);
+
 /// 状态栏歌词条右键菜单：低级鼠标钩子需要的 AppHandle
 static HOOK_APP: OnceLock<tauri::AppHandle> = OnceLock::new();
 /// 低级鼠标钩子句柄（保持安装直到进程退出，系统会回收）
 #[allow(dead_code)]
 static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
+/// 低级键盘钩子句柄：菜单打开时接管 Esc（见 lyric_bar_keyboard_hook）
+#[allow(dead_code)]
+static KEY_HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
+
+/// 右键菜单是否正在显示。歌词条被 SetParent 到任务栏后不是前台窗口，
+/// TrackPopupMenu 不会在点击菜单外部时自行关闭（微软文档记录的行为），
+/// 因此菜单打开期间由低级鼠标钩子接管「菜单外点击 → 关闭菜单」。
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+/// 当前弹出菜单的窗口句柄（窗口类 #32768；钩子线程首次需要时枚举发现并缓存）
+static MENU_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 菜单外按下已被吞掉：对应松开也要吞，避免半个点击落到底层窗口
+static MENU_SWALLOW_UP: AtomicBool = AtomicBool::new(false);
 
 /// 获取 Windows 任务栏矩形（物理像素）。
 /// 通过 SHAppBarMessage(ABM_GETTASKBARPOS) 查询，任务栏不在屏幕底部时返回 None。
@@ -588,6 +625,167 @@ fn current_monitor_scale(app: &tauri::AppHandle) -> f64 {
         .unwrap_or(1.0)
 }
 
+/* ============================================================
+ * 迷你播放器（左键点击状态栏歌词弹出）
+ *
+ * flyout 语义：左键歌词条切换显隐；窗口失焦自动隐藏（点击窗口外
+ * 任意位置即收起）。钩子吞掉歌词条上的左键 DOWN/UP，所以切换那次
+ * 点击不会引发焦点变化，与 Focused(false) 自动隐藏无竞态。
+ * 窗口懒创建一次后复用（hide/show），避免反复加载 WebView。
+ * ============================================================ */
+
+/// 创建迷你播放器窗口（懒加载，仅首次左键时调用）。
+fn create_mini_player_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    let win = WebviewWindowBuilder::new(
+        app,
+        "mini-player",
+        WebviewUrl::App("mini-player.html".into()),
+    )
+    .title("QQMusic Monitor - 迷你播放器")
+    .inner_size(MINI_PLAYER_W, MINI_PLAYER_H)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(false)
+    .maximizable(false)
+    .minimizable(false)
+    .shadow(false)
+    .visible(false)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    // 失焦自动隐藏（flyout 行为）：点击窗口外任意位置即收起。
+    // 250ms 防抖：部分系统上 show+set_focus 会先抖一次 Focused(false)。
+    let handle = app.clone();
+    win.on_window_event(move |event| {
+        if let tauri::WindowEvent::Focused(false) = event {
+            let shown = MINI_PLAYER_SHOWN_AT_MS.load(Ordering::SeqCst);
+            if current_timestamp_ms().saturating_sub(shown) < 250 {
+                return;
+            }
+            request_hide_mini_player(&handle);
+        }
+    });
+    Ok(win)
+}
+
+/// 把迷你播放器定位到歌词条上方（水平对其中线），钳制在显示器工作区内。
+/// 歌词条句柄不可用时回退锚定任务栏矩形；任务栏在屏幕顶部时改放歌词条下方。
+fn position_mini_player(app: &tauri::AppHandle, win: &tauri::WebviewWindow) {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    let scale = current_monitor_scale(app);
+
+    // 锚点矩形（逻辑 px）：优先歌词条屏幕矩形，回退任务栏矩形
+    let mut anchor: Option<(f64, f64, f64, f64)> = None;
+    let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
+    if raw != 0 {
+        let mut rc = RECT::default();
+        unsafe {
+            if GetWindowRect(HWND(raw as *mut core::ffi::c_void), &mut rc).is_ok() {
+                anchor = Some((
+                    rc.left as f64 / scale,
+                    rc.top as f64 / scale,
+                    rc.right as f64 / scale,
+                    rc.bottom as f64 / scale,
+                ));
+            }
+        }
+    }
+    if anchor.is_none() {
+        anchor = taskbar_rect().map(|(l, t, r, b)| {
+            (l as f64 / scale, t as f64 / scale, r as f64 / scale, b as f64 / scale)
+        });
+    }
+    let Some((al, at, ar, ab)) = anchor else { return; };
+
+    let (w, h) = (MINI_PLAYER_W, MINI_PLAYER_H);
+    let mut x = (al + ar) / 2.0 - w / 2.0;
+    let mut y = at - h - 8.0;
+
+    if let Ok(Some(mon)) = app.primary_monitor() {
+        let mpos = mon.position().to_logical::<f64>(scale);
+        let msize = mon.size().to_logical::<f64>(scale);
+        // 水平：与歌词条更靠近屏幕边界的一边对齐（用户 2026-10 要求）——
+        // 左侧布局（贴开始按钮）对齐歌词条左缘，右侧布局（贴通知区）对齐右缘，
+        // 不再取中线居中；歌词条比窗口宽/窄时都按边缘齐平。
+        let dist_left = al - mpos.x;
+        let dist_right = (mpos.x + msize.width) - ar;
+        x = if dist_left <= dist_right { al } else { ar - w };
+        // 任务栏在顶部（锚点上方放不下）→ 改放锚点下方
+        if y < mpos.y + 8.0 {
+            y = ab + 8.0;
+        }
+        x = x.clamp(mpos.x + 8.0, (mpos.x + msize.width - w - 8.0).max(mpos.x + 8.0));
+        y = y.clamp(mpos.y + 8.0, (mpos.y + msize.height - h - 8.0).max(mpos.y + 8.0));
+    }
+    // 记录放置方位（供显隐动画选方向）：y 越过锚点顶缘 = 放在歌词条下方
+    MINI_PLAYER_PLACED_BELOW_BAR.store(y > at, Ordering::SeqCst);
+    let _ = win.set_position(tauri::Position::Logical((x, y).into()));
+}
+
+/// 显示并聚焦迷你播放器（记录显示时刻供失焦防抖），并通知前端重播滑入动画。
+fn show_mini_player(win: &tauri::WebviewWindow) {
+    use tauri::Emitter;
+    MINI_PLAYER_SHOWN_AT_MS.store(current_timestamp_ms(), Ordering::SeqCst);
+    let _ = win.show();
+    let _ = win.set_focus();
+    // from_below：卡片在歌词条上方（常规底部任务栏）→ 从下方滑入；反之从上方
+    let from_below = !MINI_PLAYER_PLACED_BELOW_BAR.load(Ordering::SeqCst);
+    let _ = win.emit("mini-player-show", serde_json::json!({ "from_below": from_below }));
+}
+
+/// 请求隐藏迷你播放器：先发事件让前端播滑出动画（播完回执 hide_mini_player），
+/// 500ms 兜底强制收起——页面异常时窗口不应残留；期间被重新聚焦则放弃兜底。
+fn request_hide_mini_player(app: &tauri::AppHandle) {
+    use tauri::{Emitter, Manager};
+    let Some(win) = app.get_webview_window("mini-player") else { return; };
+    if !win.is_visible().unwrap_or(false) { return; }
+    let _ = win.emit("mini-player-hide-request", ());
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Some(w) = handle.get_webview_window("mini-player") {
+            if w.is_visible().unwrap_or(false) && !w.is_focused().unwrap_or(false) {
+                let _ = w.hide();
+            }
+        }
+    });
+}
+
+/// 左键点击歌词条：切换迷你播放器显隐（主线程执行）。
+fn toggle_mini_player(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    if let Some(win) = app.get_webview_window("mini-player") {
+        if win.is_visible().unwrap_or(false) {
+            request_hide_mini_player(app);
+            return;
+        }
+        position_mini_player(app, &win);
+        show_mini_player(&win);
+        return;
+    }
+    if let Ok(win) = create_mini_player_window(app) {
+        position_mini_player(app, &win);
+        show_mini_player(&win);
+    } else if debug_mode_enabled() {
+        eprintln!("[mini-player] 创建迷你播放器窗口失败");
+    }
+}
+
+/// 销毁迷你播放器（歌词条关闭/隐藏时连带收起——没有歌词条就没有入口）。
+fn destroy_mini_player(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window("mini-player") {
+        let _ = win.destroy();
+    }
+}
+
 /// 歌词条自愈守护：
 /// - explorer 重启会销毁其子窗口（歌词条窗口被一并销毁），检测到句柄
 ///   失效后重建窗口并重新嵌入
@@ -681,12 +879,20 @@ fn spawn_lyric_bar_watchdog(app: tauri::AppHandle) {
  * （避免任务栏弹出自己的右键菜单）并弹原生菜单：
  *   - 隐藏状态栏歌词（写回前端偏好，下次启动不再创建）
  *   - 退出 QQMusic Monitor
+ *
+ * 收起菜单：歌词条被 SetParent 到任务栏后不是前台窗口，TrackPopupMenu
+ * 不会在点击菜单外部时自行关闭（微软文档记录的已知行为）。因此菜单
+ * 打开期间由同一个低级鼠标钩子接管：菜单外的任何点击都先关闭菜单，
+ * 并吞掉这次点击（与系统菜单一致，关闭菜单的点击不落到下层窗口）。
  * ============================================================ */
 
-/// 安装状态栏歌词条右键菜单钩子（独立线程 + 消息循环）。
-fn spawn_lyric_bar_right_click_hook(app: tauri::AppHandle) {
+/// 安装状态栏歌词条右键菜单钩子（独立线程 + 消息循环）：
+/// 鼠标钩子负责「右键命中歌词条 → 弹菜单」与「菜单外点击 → 关闭菜单」，
+/// 键盘钩子负责菜单打开时的 Esc（歌词条不是前台窗口，键盘事件不会路由给它）。
+fn spawn_lyric_bar_menu_hooks(app: tauri::AppHandle) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage, MSG, WH_MOUSE_LL,
+        DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage, MSG, WH_KEYBOARD_LL,
+        WH_MOUSE_LL,
     };
 
     let _ = HOOK_APP.set(app);
@@ -694,52 +900,218 @@ fn spawn_lyric_bar_right_click_hook(app: tauri::AppHandle) {
         match SetWindowsHookExW(WH_MOUSE_LL, Some(lyric_bar_mouse_hook), None, 0) {
             Ok(hook) => {
                 HOOK_HANDLE.store(hook.0 as isize, Ordering::SeqCst);
-                let mut msg = MSG::default();
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    let _ = DispatchMessageW(&msg);
-                }
             }
-            Err(err) => eprintln!("[hook] 状态栏歌词右键菜单安装失败: {:?}", err),
+            Err(err) => eprintln!("[hook] 状态栏歌词右键菜单鼠标钩子安装失败: {:?}", err),
+        }
+        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(lyric_bar_keyboard_hook), None, 0) {
+            Ok(hook) => {
+                KEY_HOOK_HANDLE.store(hook.0 as isize, Ordering::SeqCst);
+            }
+            Err(err) => eprintln!("[hook] 状态栏歌词右键菜单键盘钩子安装失败: {:?}", err),
+        }
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            let _ = DispatchMessageW(&msg);
         }
     });
 }
 
-/// 低级鼠标钩子回调：右键命中歌词条矩形时吞掉事件并弹菜单。
+/// 枚举回调：找到本进程的弹出菜单窗口（窗口类 #32768）。
+unsafe extern "system" fn find_menu_window_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    _l_param: windows::Win32::Foundation::LPARAM,
+) -> windows::core::BOOL {
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId};
+
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
+    if pid == std::process::id() {
+        let mut buf = [0u16; 16];
+        let len = GetClassNameW(hwnd, &mut buf);
+        if len > 0 && String::from_utf16_lossy(&buf[..len as usize]) == "#32768" {
+            MENU_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+        }
+    }
+    true.into()
+}
+
+/// 当前正在弹出的菜单窗口（首次需要时枚举发现并缓存）。
+unsafe fn active_menu_hwnd() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+    let raw = MENU_HWND.load(Ordering::SeqCst);
+    if raw != 0 {
+        return Some(HWND(raw as *mut core::ffi::c_void));
+    }
+    let _ = EnumWindows(Some(find_menu_window_proc), LPARAM(0));
+    let raw = MENU_HWND.load(Ordering::SeqCst);
+    if raw != 0 {
+        Some(HWND(raw as *mut core::ffi::c_void))
+    } else {
+        None
+    }
+}
+
+/// 光标是否落在当前弹出的菜单内（还没定位到菜单窗口时按「在菜单内」处理，
+/// 即不拦截——宁可这次不关闭，也不要吞掉用户正常点击）。
+unsafe fn cursor_over_active_menu() -> bool {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect};
+
+    let Some(menu) = active_menu_hwnd() else {
+        return true;
+    };
+    let mut rc = RECT::default();
+    let mut pt = POINT::default();
+    GetWindowRect(menu, &mut rc).is_ok()
+        && GetCursorPos(&mut pt).is_ok()
+        && pt.x >= rc.left
+        && pt.x <= rc.right
+        && pt.y >= rc.top
+        && pt.y <= rc.bottom
+}
+
+/// 用 Esc 关掉当前菜单：菜单窗口是 TrackPopupMenu 的内部窗口（类 #32768），
+/// 直接投递键盘消息即可让它按「取消」退出（实测可靠）。
+unsafe fn close_active_menu() {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN, WM_KEYUP};
+
+    if let Some(menu) = active_menu_hwnd() {
+        let _ = PostMessageW(Some(menu), WM_KEYDOWN, WPARAM(0x1B), LPARAM(0));
+        let _ = PostMessageW(Some(menu), WM_KEYUP, WPARAM(0x1B), LPARAM(0));
+    }
+}
+
+/// 菜单打开时的键盘钩子：只接管 Esc。
+/// 歌词条不是前台窗口，键盘输入会送到前台应用而不是菜单；不拦截的话
+/// 用户按 Esc 既关不掉菜单，还会误触发前台应用的 Esc。
+unsafe extern "system" fn lyric_bar_keyboard_hook(
+    n_code: i32,
+    w_param: windows::Win32::Foundation::WPARAM,
+    l_param: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, HC_ACTION, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+
+    if n_code == HC_ACTION as i32 && MENU_OPEN.load(Ordering::SeqCst) {
+        let msg = w_param.0 as u32;
+        if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP {
+            let kb = l_param.0 as *const KBDLLHOOKSTRUCT;
+            if !kb.is_null() && (*kb).vkCode == 0x1B {
+                if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+                    close_active_menu();
+                }
+                return windows::Win32::Foundation::LRESULT(1);
+            }
+        }
+    }
+    CallNextHookEx(None, n_code, w_param, l_param)
+}
+
+/// 光标当前是否落在歌词条窗口矩形内（屏幕物理像素判定）。
+unsafe fn cursor_in_lyric_bar() -> bool {
+    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect};
+
+    let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
+    if raw == 0 {
+        return false;
+    }
+    let hwnd = HWND(raw as *mut core::ffi::c_void);
+    let mut rc = RECT::default();
+    let mut pt = POINT::default();
+    GetWindowRect(hwnd, &mut rc).is_ok()
+        && GetCursorPos(&mut pt).is_ok()
+        && pt.x >= rc.left
+        && pt.x <= rc.right
+        && pt.y >= rc.top
+        && pt.y <= rc.bottom
+}
+
+/// 低级鼠标钩子回调：
+/// 1. 菜单打开期间，菜单外的任何鼠标按键 → 关闭菜单并吞掉这次点击
+///    （等价于系统菜单「点击外部即关闭」的行为；歌词条不是前台窗口，
+///    TrackPopupMenu 自己不会关）；
+/// 2. 其余情况：左键命中歌词条 → 吞掉并切换迷你播放器（弹窗 flyout）；
+///    右键命中歌词条 → 吞掉并弹菜单。
 unsafe extern "system" fn lyric_bar_mouse_hook(
     n_code: i32,
     w_param: windows::Win32::Foundation::WPARAM,
     l_param: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::Foundation::{HWND, LRESULT, POINT, RECT};
+    use windows::Win32::Foundation::LRESULT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetCursorPos, GetWindowRect, HC_ACTION, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        CallNextHookEx, HC_ACTION, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     };
 
     if n_code == HC_ACTION as i32 {
         let msg = w_param.0 as u32;
-        if msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP {
-            let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
-            if raw != 0 {
-                let hwnd = HWND(raw as *mut core::ffi::c_void);
-                let mut rc = RECT::default();
-                let mut pt = POINT::default();
-                let hit = GetWindowRect(hwnd, &mut rc).is_ok()
-                    && GetCursorPos(&mut pt).is_ok()
-                    && pt.x >= rc.left
-                    && pt.x <= rc.right
-                    && pt.y >= rc.top
-                    && pt.y <= rc.bottom;
-                if hit {
-                    if msg == WM_RBUTTONUP {
-                        if let Some(app) = HOOK_APP.get() {
-                            let handle = app.clone();
-                            let _ = app.run_on_main_thread(move || show_lyric_bar_menu(&handle));
-                        }
+        let is_down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN;
+        let is_up = msg == WM_LBUTTONUP || msg == WM_RBUTTONUP;
+
+        // 菜单打开期间滚轮/侧键不属于菜单操作：一并吞掉，避免滚动或
+        // 前进/后退落到下层窗口（系统菜单同样不会把它们传给别的窗口）
+        if MENU_OPEN.load(Ordering::SeqCst)
+            && (msg == WM_MOUSEWHEEL
+                || msg == WM_MOUSEHWHEEL
+                || msg == WM_XBUTTONDOWN
+                || msg == WM_XBUTTONUP)
+        {
+            return LRESULT(1);
+        }
+
+        // —— 菜单打开期间：接管菜单外的点击 ——
+        if MENU_OPEN.load(Ordering::SeqCst) && (is_down || is_up) {
+            if cursor_over_active_menu() {
+                // 点在菜单内：交给菜单自己处理，同时保证不会误弹新菜单
+                return CallNextHookEx(None, n_code, w_param, l_param);
+            }
+            if is_down {
+                MENU_SWALLOW_UP.store(true, Ordering::SeqCst);
+                close_active_menu();
+            } else {
+                MENU_SWALLOW_UP.store(false, Ordering::SeqCst);
+            }
+            // 吞掉点击：与系统菜单一致，关闭菜单的那次点击不落到下层窗口
+            return LRESULT(1);
+        }
+        // 菜单已经关掉、但松开来迟一步：仍然吞掉，保证这次点击整体不生效
+        if is_up && MENU_SWALLOW_UP.swap(false, Ordering::SeqCst) {
+            return LRESULT(1);
+        }
+
+        // —— 左键命中歌词条 → 吞掉并切换迷你播放器 ——
+        // 歌词条是鼠标穿透窗口，原本左键会穿透到任务栏；弹出交互接管后
+        // DOWN/UP 一并吞掉，避免任务栏抢前台导致弹窗被 Focused(false)
+        // 立刻收起（toggling 的那次点击不会引发焦点变化）。
+        if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP {
+            if cursor_in_lyric_bar() {
+                if msg == WM_LBUTTONUP {
+                    if let Some(app) = HOOK_APP.get() {
+                        let handle = app.clone();
+                        let _ = app.run_on_main_thread(move || toggle_mini_player(&handle));
                     }
-                    // 吞掉右键（DOWN/UP），任务栏不会弹出自己的菜单
-                    return LRESULT(1);
                 }
+                return LRESULT(1);
+            }
+        }
+
+        // —— 右键命中歌词条 → 吞掉并弹菜单 ——
+        if msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP {
+            if cursor_in_lyric_bar() {
+                if msg == WM_RBUTTONUP {
+                    if let Some(app) = HOOK_APP.get() {
+                        let handle = app.clone();
+                        let _ = app.run_on_main_thread(move || show_lyric_bar_menu(&handle));
+                    }
+                }
+                // 吞掉右键（DOWN/UP），任务栏不会弹出自己的菜单
+                return LRESULT(1);
             }
         }
     }
@@ -747,6 +1119,9 @@ unsafe extern "system" fn lyric_bar_mouse_hook(
 }
 
 /// 在歌词条位置弹出原生右键菜单（主线程执行）。
+///
+/// 菜单打开期间置 MENU_OPEN，由低级鼠标钩子负责「点击菜单外部 → 关闭菜单」，
+/// 见 lyric_bar_mouse_hook。
 fn show_lyric_bar_menu(app: &tauri::AppHandle) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -767,7 +1142,13 @@ fn show_lyric_bar_menu(app: &tauri::AppHandle) {
             return;
         }
         let owner = HWND(raw as *mut core::ffi::c_void);
+        // 钩子线程据此接管菜单外点击；菜单窗口句柄由钩子按需枚举发现
+        MENU_HWND.store(0, Ordering::SeqCst);
+        MENU_SWALLOW_UP.store(false, Ordering::SeqCst);
+        MENU_OPEN.store(true, Ordering::SeqCst);
         let ret = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, None, owner, None);
+        MENU_OPEN.store(false, Ordering::SeqCst);
+        MENU_HWND.store(0, Ordering::SeqCst);
         let _ = DestroyMenu(menu);
         // TPM_RETURNCMD：返回值即菜单项 id（0 = 取消）
         let cmd = ret.0 as u32;
@@ -788,6 +1169,7 @@ fn hide_lyric_bar_from_menu(app: &tauri::AppHandle) {
         let _ = win.destroy();
     }
     LYRIC_BAR_HWND.store(0, Ordering::SeqCst);
+    destroy_mini_player(app);
 
     let path = frontend_prefs_path();
     if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -957,6 +1339,7 @@ async fn set_lyric_bar_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(
     } else if let Some(win) = app.get_webview_window("lyric-bar") {
         LYRIC_BAR_HWND.store(0, Ordering::SeqCst);
         let _ = win.destroy();
+        destroy_mini_player(&app);
     }
 
     Ok(())
@@ -2565,7 +2948,7 @@ async fn main() -> Result<()> {
 
     // 启动 Tauri 窗口
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_app_config, save_app_config, get_current_song_info, media_toggle_play_pause, media_next, media_previous, window_hidden, set_lyric_bar_enabled, set_lyric_bar_side, set_lyric_bar_gap, get_taskbar_light_theme, get_frontend_prefs, save_frontend_prefs])
+        .invoke_handler(tauri::generate_handler![get_app_config, save_app_config, get_current_song_info, media_toggle_play_pause, media_next, media_previous, window_hidden, set_lyric_bar_enabled, set_lyric_bar_side, set_lyric_bar_gap, get_taskbar_light_theme, get_frontend_prefs, save_frontend_prefs, hide_mini_player])
         .setup(move |app| {
             // —— 系统托盘（后台模式）——
             // 窗口最小化/隐藏到托盘后，托盘小图标保留在任务栏通知区域，
@@ -2597,7 +2980,7 @@ async fn main() -> Result<()> {
                 .build(app)?;
 
             // 状态栏歌词条右键菜单（鼠标穿透窗口无法直接接收右键，用低级鼠标钩子）
-            spawn_lyric_bar_right_click_hook(app.handle().clone());
+            spawn_lyric_bar_menu_hooks(app.handle().clone());
 
             // 主窗口关闭 = 退出整个应用（同时销毁歌词条，避免其阻止进程退出）
             if let Some(main_win) = app.get_webview_window("main") {

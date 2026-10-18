@@ -1,0 +1,286 @@
+/* ============================================================
+ * Mini Player（迷你播放器）
+ * 左键点击状态栏歌词弹出：专辑封面全幅背景 + 歌曲信息 + 进度条 + 播放控制。
+ * 透明无边框窗口，卡片悬浮于透明画布上。
+ *
+ * 阴影几何（2026-10 修复）：box-shadow 的"模糊半径 − 扩张 + 偏移"必须
+ * 小于卡片到窗口边缘的透明留白，否则阴影被窗口边界裁切、形成方形暗晕。
+ * 当前阴影最大外扩：下 10+24-6=28px / 侧 24-6=18px / 上 24-6-10=8px，
+ * 留白 inset 18/24/34 全部覆盖。
+ * ============================================================ */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html,
+body {
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    /* 系统字体栈：中文覆盖全，外网字体阻塞首屏（与主窗口一致） */
+    font-family: system-ui, 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: default;
+}
+
+/* —— 卡片容器：透明画布上的悬浮实体 —— */
+.mp-card {
+    position: absolute;
+    inset: 30px 24px 34px;
+    /* 滑动位移方向：默认从下方滑入（底部任务栏）；顶部任务栏由 JS 置负 */
+    --mp-from: 26px;
+    border-radius: 18px;
+    overflow: hidden;
+    background: #0a0e17;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    /* 深度栈：远处柔和投影 + 近处接触影；外扩量与 inset 留白匹配（见头注释） */
+    box-shadow:
+        0 10px 24px -6px rgba(0, 0, 0, 0.5),
+        0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+/* —— 显隐动画：窗口创建一次后 hide/show 复用，CSS 动画由后端事件驱动重触发 —— */
+/* 入场：从任务栏方向上滑 + 淡入 + 轻微缩放（指数缓出，先快后稳） */
+.mp-card.mp-enter {
+    animation: mp-slide-in 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes mp-slide-in {
+    from {
+        opacity: 0;
+        transform: translateY(var(--mp-from)) scale(0.97);
+        filter: blur(4px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+        filter: blur(0);
+    }
+}
+
+/* 退场：向任务栏方向下滑 + 淡出（加速缓入，forwards 保持终态直到窗口隐藏） */
+.mp-card.mp-exit {
+    animation: mp-slide-out 0.19s cubic-bezier(0.5, 0, 0.75, 0) forwards;
+}
+
+@keyframes mp-slide-out {
+    from {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+    to {
+        opacity: 0;
+        transform: translateY(var(--mp-from)) scale(0.98);
+    }
+}
+
+/* —— 专辑封面全幅背景（无封面时透明，露出卡片纯深色底） —— */
+.mp-art {
+    position: absolute;
+    inset: 0;
+    background-size: cover;
+    background-position: center;
+}
+
+/* —— 可读性 scrim：底部深色渐变承载文字与控件，向上渐隐露出封面 —— */
+.mp-scrim {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+        to top,
+        rgba(6, 9, 16, 0.92) 0%,
+        rgba(6, 9, 16, 0.72) 34%,
+        rgba(6, 9, 16, 0.25) 58%,
+        rgba(6, 9, 16, 0) 78%
+    );
+}
+
+/* 无封面时 scrim 退场，纯深色底 + 顶部一线棱光 */
+.mp-card:not(.has-art) .mp-scrim {
+    background: linear-gradient(165deg, rgba(20, 30, 55, 0.6), rgba(10, 14, 23, 0.2));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+/* —— 内容层：整体沉底 —— */
+.mp-content {
+    position: relative;
+    z-index: 1;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    gap: 13px;
+    padding: 16px 18px 18px;
+}
+
+/* —— 标题/歌手/专辑 —— */
+.mp-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+    text-align: left;
+}
+
+.mp-title {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: #ffffff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.mp-artist {
+    font-size: 12.5px;
+    /* 次级文字从主题色取色相（封面上不用纯灰，更润） */
+    color: color-mix(in oklab, var(--theme-primary) 26%, #e2e8f0);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.mp-album {
+    font-size: 11px;
+    color: rgba(226, 232, 240, 0.72);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.mp-album:empty {
+    display: none;
+}
+
+/* —— 进度条：轨道 + 渐变填充 + 端点圆珠 —— */
+.mp-progress {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+}
+
+.mp-time {
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: rgba(226, 232, 240, 0.8);
+    flex: 0 0 auto;
+}
+
+.mp-track {
+    position: relative;
+    flex: 1;
+    height: 5px;
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.18);
+}
+
+.mp-fill {
+    position: relative;
+    height: 100%;
+    width: 0%;
+    border-radius: 3px;
+    background: var(--theme-gradient);
+    box-shadow: 0 1px 8px var(--theme-primary-glow);
+}
+
+/* 填充端点圆珠：白芯 + 主题色光晕，进度位置的视觉锚点 */
+.mp-fill::after {
+    content: '';
+    position: absolute;
+    right: -5px;
+    top: 50%;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #ffffff;
+    transform: translateY(-50%);
+    box-shadow:
+        0 0 0 2.5px var(--theme-primary),
+        0 0 10px var(--theme-primary-glow);
+    opacity: 0;
+    transition: opacity 0.25s ease;
+}
+
+/* 有真实进度时才显示圆珠（0% 时不顶在左端） */
+.mp-card.has-progress .mp-fill::after {
+    opacity: 1;
+}
+
+/* —— 播放控制 —— */
+.mp-controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+}
+
+.mp-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: rgba(226, 232, 240, 0.85);
+    cursor: pointer;
+    transition: background 0.18s ease, color 0.18s ease, transform 0.12s ease;
+}
+
+.mp-btn:hover {
+    background: rgba(255, 255, 255, 0.14);
+    color: #ffffff;
+}
+
+.mp-btn:active {
+    transform: scale(0.92);
+}
+
+.mp-btn .svg-icon {
+    width: 20px;
+    height: 20px;
+    fill: currentColor;
+}
+
+/* 播放/暂停主按钮：主题渐变底 + 分层深度影 + 悬浮抬升 */
+.mp-btn-play {
+    width: 52px;
+    height: 52px;
+    background: var(--theme-gradient);
+    color: #ffffff;
+    box-shadow:
+        0 8px 22px -6px var(--theme-primary-glow),
+        0 3px 8px rgba(0, 0, 0, 0.4);
+    transition: transform 0.15s ease, filter 0.18s ease, box-shadow 0.18s ease;
+}
+
+.mp-btn-play:hover {
+    background: var(--theme-gradient);
+    color: #ffffff;
+    filter: brightness(1.1);
+    transform: translateY(-1px);
+    box-shadow:
+        0 12px 28px -6px var(--theme-primary-glow),
+        0 4px 10px rgba(0, 0, 0, 0.42);
+}
+
+.mp-btn-play:active {
+    transform: translateY(0) scale(0.94);
+}
+
+.mp-btn-play .svg-icon {
+    width: 26px;
+    height: 26px;
+}
+
+.svg-icon.hidden {
+    display: none;
+}
