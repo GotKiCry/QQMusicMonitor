@@ -170,3 +170,21 @@ export function createPlaybackClock(options = {}) {
 
     return clock;
 }
+
+/**
+ * 计算带传输补偿的原始时间（ms），主窗口/歌词条/迷你播放器共用：
+ * 后端时间戳与本机同源，补偿事件/IPC 传输耗时（上限 250ms，防时钟调整跳跃）。
+ */
+export function computeRawTimeMs(p) {
+    const totalMs = p.total_time_ms && p.total_time_ms > 0
+        ? p.total_time_ms
+        : (p.total_time || 0) * 1000;
+    let rawT = p.current_time_ms && p.current_time_ms > 0
+        ? p.current_time_ms
+        : (totalMs * ((p.progress_percent || 0) / 100));
+    if (p.is_playing && Number.isFinite(p.server_ts) && p.server_ts > 0) {
+        rawT += Math.min(250, Math.max(0, Date.now() - p.server_ts));
+        if (totalMs > 0) rawT = Math.min(rawT, totalMs);
+    }
+    return rawT;
+}
