@@ -40,8 +40,6 @@ const clock = createPlaybackClock();
 /** 当前歌曲指纹（title|artist）：仅在真正切歌时重置时钟基线 */
 let lastSongKey = '';
 let hasSong = false;
-/** 滚动动画暂停状态缓存（避免每个进度帧重复写 style） */
-let scrollPaused = null;
 
 /** 当前渲染状态 */
 let currentRowIdx = -1;
@@ -50,7 +48,8 @@ let currentRowStart = 0;    // 当前行起始时间（翻译行重新匹配用�
 let wordEls = [];           // 当前行的逐字 fg 元素 {el, start, dur, width}
 let lastShownTrans = '';
 let lastRenderKey = '';     // 静态内容指纹：跳过同内容的重复重建
-let scrollOverflow = 0;     // 上次测量的滚动溢出量（防无关 layout 抖动重开动画）
+let scrollOverflow = 0;     // 当前行相对窗口的溢出量（px），>0 才需要滚动
+let lastScrollX = '';       // 上次写入的 translateX（去抖：位置没变不重复写 style）
 
 /** 占位模式：'idle' | 'loading' | 'pure' | 'plain' | null */
 let fallbackMode = null;
@@ -137,7 +136,6 @@ function onSongInfo(data) {
             totalMs
         });
     }
-    syncScrollPause();
     hasSong = true;
 
     // 静态内容未变（如仅专辑图升级触发快照）：只交给时钟校准，不重建 DOM，
@@ -187,7 +185,6 @@ function onProgress(progress) {
         isPlaying: !!progress.is_playing,
         totalMs
     });
-    syncScrollPause();
 }
 
 /** 设置占位状态（等待播放 / 加载中 / 纯音乐 / 无时间戳纯文本）；DOM 由 tick 在指纹变化时渲染 */
@@ -199,16 +196,15 @@ function setFallback(kind, customText = '') {
 
 /** 渲染占位 DOM（仅在内容指纹变化时执行一次） */
 function applyFallbackDom() {
-    // 状态复位：清掉上一首歌残留的翻译行/滚动类/行状态
+    // 状态复位：清掉上一首歌残留的翻译行/滚动偏移/行状态
     wordEls = [];
     currentRowIdx = -1;
     currentRowState = '';
     currentRowStart = 0;
     lastShownTrans = '';
     els.trans.hidden = true;
-    els.inner.classList.remove('scrolling', 'pending', 'done');
-    els.inner.style.removeProperty('--scroll-dist');
-    els.inner.style.removeProperty('--scroll-dur');
+    els.inner.classList.remove('pending', 'done');
+    els.inner.style.transform = '';
     scrollOverflow = 0;
 
     els.inner.innerHTML = '';
@@ -216,17 +212,34 @@ function applyFallbackDom() {
     span.className = 'lyric-bar-text bar-content';
     span.textContent = fallbackText;
     els.inner.appendChild(span);
-    applyScrollIfNeeded(true);
+    measureScroll();
 }
 
 /** 重建当前行 DOM（逐字或纯文本），行状态通过 CSS class 施加 */
 function renderRow(row) {
+    // 换行过渡：旧行克隆到独立的绝对定位层做上滑退出（克隆体连同 inner 的
+    // 横向滚动偏移一起保留），新行从下方滑入——垂直滚动式换行。
+    if (els.inner.firstElementChild) {
+        const layer = document.createElement('div');
+        layer.className = 'row-leaving';
+        const ghost = els.inner.cloneNode(true);
+        ghost.removeAttribute('id');
+        // 克隆体只做退出动画：清掉进入/淡入动画，避免重复播放
+        ghost.querySelectorAll('.bar-content, .lyric-bar-trans').forEach((el) => {
+            el.style.animation = 'none';
+            el.classList.remove('row-entering');
+        });
+        layer.appendChild(ghost);
+        els.line.appendChild(layer);
+        setTimeout(() => layer.remove(), 360);
+    }
+
     wordEls = [];
     els.inner.innerHTML = '';
     els.inner.classList.remove('pending', 'done');
 
     const wrap = document.createElement('span');
-    wrap.className = 'bar-content';
+    wrap.className = 'bar-content row-entering';
 
     if (row.words && row.words.length > 0) {
         // 逐字模式：每个字两层 span，fg 渐变剪裁
@@ -254,8 +267,10 @@ function renderRow(row) {
     }
 
     els.inner.appendChild(wrap);
-    applyScrollIfNeeded(true);
-    syncScrollPause();
+    // 换行回到行首：先清掉上一行的滚动偏移再重新测量
+    lastScrollX = '';
+    els.inner.style.transform = '';
+    measureScroll();
 }
 
 /**
@@ -304,43 +319,39 @@ function updateWordHighlights(t) {
 }
 
 /**
- * 歌词宽度超出窗口时启用水平往返滚动。
- * forceRestart：换行时强制回到 phase 0（新行从头显示，不落在滚动中段）；
- * 其余情况仅在溢出量变化时重启，过滤 ResizeObserver 的无关 layout 抖动。
+ * 测量当前行相对窗口的溢出量（px）：决定是否需要水平滚动。
+ * 换行、窗口宽度变化（后端按任务栏可用空间重定位）后都要重测。
  */
-function applyScrollIfNeeded(forceRestart = false) {
-    const overflow = els.inner.scrollWidth - els.line.clientWidth;
-    if (overflow > 8) {
-        els.inner.style.setProperty('--scroll-dist', `${overflow}px`);
-        els.inner.style.setProperty(
-            '--scroll-dur',
-            `${Math.min(12, Math.max(4, overflow * 0.03))}s`
-        );
-        const distChanged = Math.abs(overflow - scrollOverflow) > 2;
-        const active = els.inner.classList.contains('scrolling');
-        if (forceRestart || distChanged || !active) {
-            scrollOverflow = overflow;
-            els.inner.classList.remove('scrolling');
-            void els.inner.offsetWidth; // Force reflow to restart the animation at phase 0
-            els.inner.classList.add('scrolling');
-        }
-    } else {
-        scrollOverflow = 0;
-        els.inner.classList.remove('scrolling');
+function measureScroll() {
+    // 用 .bar-content 测量：inner 受 max-width: 100% 限制，内容恒定从
+    // 窗口左缘向右溢出，row 元素自身的 scrollWidth 才是内容真实宽度
+    const rowEl = els.inner.firstElementChild;
+    const contentW = rowEl ? rowEl.scrollWidth : els.inner.scrollWidth;
+    const overflow = contentW - els.line.clientWidth;
+    scrollOverflow = overflow > 8 ? overflow : 0;
+    if (scrollOverflow === 0) {
+        lastScrollX = '';
+        els.inner.style.transform = '';
     }
 }
 
-/** 暂停时冻结往返滚动动画 */
-function setScrollPaused(paused) {
-    els.inner.style.animationPlayState = paused ? 'paused' : 'running';
-}
-
-/** 按单调时钟 running 状态同步滚动动画（缓存，避免重复写 style） */
-function syncScrollPause() {
-    const paused = !clock.running;
-    if (paused === scrollPaused) return;
-    scrollPaused = paused;
-    setScrollPaused(paused);
+/**
+ * 按当前行进度推进水平滚动：滚动位置直接跟随播放进度，行结束时正好
+ * 滚到行尾——固定时长的 CSS 动画在短行上会「追不上进度」。
+ *  - 行内前 10% 停留：先完整显示行首
+ *  - 10%→90%：匀速滚到行尾（贴通知区）
+ *  - 90%→行结束：停在行尾
+ * 暂停时 clock 位置冻结，滚动随之冻结；seek 时直接跟到新位置。
+ */
+function updateScroll(t, row) {
+    if (scrollOverflow <= 0 || !row) return;
+    const span = Math.max(1, (row.end || row.start + 4000) - row.start);
+    const p = Math.min(1, Math.max(0, (t - row.start) / span));
+    const q = Math.min(1, Math.max(0, (p - 0.1) / 0.8));
+    const x = (-scrollOverflow * q).toFixed(1);
+    if (x === lastScrollX) return;
+    lastScrollX = x;
+    els.inner.style.transform = 'translateX(' + x + 'px)';
 }
 
 function setTransText(text) {
@@ -349,6 +360,10 @@ function setTransText(text) {
     if (text) {
         els.trans.textContent = text;
         els.trans.hidden = false;
+        // 翻译行跟随歌词行做同向的「从下滑入」，换行时整体是一体的
+        els.trans.classList.remove('row-entering');
+        void els.trans.offsetWidth;
+        els.trans.classList.add('row-entering');
     } else {
         els.trans.hidden = true;
     }
@@ -398,6 +413,8 @@ function tick() {
             const st = rowStateAt(t, idx);
             if (st !== currentRowState) applyRowState(st);
             if (wordEls.length > 0 && st === 'active') updateWordHighlights(t);
+            // 超长行的水平滚动跟随行内进度（行结束前滚到行尾）
+            updateScroll(t, rows[idx]);
         }
     }
 }
@@ -532,7 +549,7 @@ export function initLyricBar() {
 
     // 任务栏可用宽度变化（左右位置切换/分辨率/DPI 变化）时自动重测滚动
     if (typeof ResizeObserver !== 'undefined') {
-        new ResizeObserver(() => applyScrollIfNeeded(false)).observe(els.line);
+        new ResizeObserver(() => measureScroll()).observe(els.line);
     }
 
     listenSongInfo(onSongInfo, onProgress, () => {});

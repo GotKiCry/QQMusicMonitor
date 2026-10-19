@@ -50,6 +50,7 @@ body {
 
 /* —— 歌词行（外层裁剪容器） —— */
 .lyric-bar-line {
+    position: relative; /* 换行退出的旧行用绝对定位覆盖在本行之上 */
     width: 100%;
     height: var(--bar-line-height);
     display: flex;
@@ -89,25 +90,52 @@ body {
     animation: bar-fade 0.2s ease;
 }
 
-.lyric-bar-inner.scrolling {
-    /* 默认（左侧）：行首可见（贴着开始按钮），向左滚动露出行尾 */
-    --scroll-start: 0px;
-    --scroll-end: calc(var(--scroll-dist, 0px) * -1);
-    animation: lyric-scroll var(--scroll-dur, 8s) linear infinite;
+/* —— 换行：垂直滚动过渡（旧行上滑出、新行从下滑入） —— */
+.row-leaving {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    overflow: hidden;
+    pointer-events: none;
+    animation: bar-row-out 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* 左侧布局：与 .lyric-bar-line 一致地贴左缘 */
+.lyric-bar-body.side-left .row-leaving {
+    justify-content: flex-start;
+}
+
+.bar-content.row-entering {
+    animation: bar-row-in 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.lyric-bar-trans.row-entering {
+    animation: bar-row-in-soft 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes bar-row-out {
+    from { transform: translateY(0); opacity: 1; }
+    to { transform: translateY(-100%); opacity: 0; }
+}
+
+@keyframes bar-row-in {
+    from { transform: translateY(100%); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes bar-row-in-soft {
+    from { transform: translateY(70%); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+}
+
+/* 超长行的水平滚动由 JS 按「当前行进度」逐帧驱动（lyric-bar.js 的
+   updateScroll / measureScroll），不再用 CSS 动画：固定时长的动画在
+   短行上会追不上歌词进度，且暂停/seek 需要额外的 play-state 管理。 */
+.lyric-bar-inner {
     will-change: transform;
-}
-
-/* 右侧偏好：内容右对齐，行首偏移 +dist 出现在窗口左缘，
-   滚回 0 时行尾贴着通知区（保证从头阅读、结尾贴边） */
-.lyric-bar-body.side-right .lyric-bar-inner.scrolling {
-    --scroll-start: var(--scroll-dist, 0px);
-    --scroll-end: 0px;
-}
-
-@keyframes lyric-scroll {
-    0%, 12% { transform: translateX(var(--scroll-start, 0px)); }
-    44%, 56% { transform: translateX(var(--scroll-end, 0px)); }
-    88%, 100% { transform: translateX(var(--scroll-start, 0px)); }
 }
 
 @keyframes bar-fade {
