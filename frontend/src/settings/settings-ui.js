@@ -9,10 +9,19 @@ import { fetchBackendConfig, saveBackendConfig } from '../config/backend-config.
 import { saveFrontendConfig } from '../config/frontend-config.js';
 import { paintCustomTheme, presetThemeColor, loadAutoPalette } from '../config/theme.js';
 
-/** Tauri 环境：向后端同步状态栏歌词窗口开关 */
-function syncLyricBarToBackend(enabled) {
+/**
+ * Tauri 环境：向后端同步状态栏歌词窗口开关。
+ * side / gap 必须随开关一起下发：后端在创建歌词条窗口的同一时刻就要用
+ * 这两个值做首次定位，单独追加的 set_lyric_bar_side 调用会晚于首次定位，
+ * 表现为「第一次打开时位置与设置不符」。
+ */
+function syncLyricBarToBackend(enabled, front) {
     if (window.__TAURI__) {
-        window.__TAURI__.core.invoke('set_lyric_bar_enabled', { enabled }).catch((e) => {
+        window.__TAURI__.core.invoke('set_lyric_bar_enabled', {
+            enabled,
+            side: front.lyricBarSide,
+            gap: front.lyricBarGap || 0
+        }).catch((e) => {
             console.error('Failed to toggle lyric bar:', e);
         });
     }
@@ -169,7 +178,7 @@ export function wireUpSettings({ els, configs, onFrontConfigChange }) {
     els.toggleLyricBar.addEventListener('change', () => {
         front.lyricBar = els.toggleLyricBar.checked;
         saveFrontendConfig(front);
-        syncLyricBarToBackend(front.lyricBar);
+        syncLyricBarToBackend(front.lyricBar, front);
     });
 
     // —— 歌词条位置（左/右） ——

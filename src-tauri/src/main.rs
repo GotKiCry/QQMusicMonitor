@@ -27,6 +27,7 @@ static LYRIC_BAR_SIDE: std::sync::atomic::AtomicU8 =
 static LYRIC_BAR_GAP: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
+
 /// 全局调试开关（main 启动时按配置设置，供非异步路径打印诊断）
 fn debug_mode_enabled() -> bool {
     DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
@@ -391,6 +392,62 @@ fn tasklist_rect_of(
     }
 }
 
+/// 任务栏「任务按钮」区域的并集矩形（屏幕物理像素）。
+///
+/// 不能用 MSTaskSwWClass / MSTaskListWClass 的窗口矩形：Win11 任务栏由
+/// XAML（DesktopWindowContentBridge）渲染，这两个兼容窗口的矩形明显偏小
+/// （实测右缘 1004，而按钮实际到 1269），直接采用会让歌词条盖住任务按钮。
+/// 这里用 UI Automation 枚举 AutomationId 形如 `Appid:` 的按钮取并集。
+fn taskbar_buttons_rect() -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, TreeScope_Descendants, UIA_ButtonControlTypeId,
+        UIA_ControlTypePropertyId,
+    };
+
+    unsafe {
+        // UIA 客户端需要 COM；线程可能已初始化（S_FALSE / 模式冲突均可忽略）
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL).ok()?;
+        let taskbar = find_taskbar()?;
+        let root = automation.ElementFromHandle(taskbar).ok()?;
+
+        let button_type = VARIANT::from(UIA_ButtonControlTypeId.0);
+        let condition = automation
+            .CreatePropertyCondition(UIA_ControlTypePropertyId, &button_type)
+            .ok()?;
+        let items = root.FindAll(TreeScope_Descendants, &condition).ok()?;
+        let count = items.Length().ok()?;
+
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for i in 0..count {
+            let Ok(item) = items.GetElement(i) else { continue };
+            let Ok(id) = item.CurrentAutomationId() else { continue };
+            // 只取任务按钮（固定/运行中的程序），开始按钮与托盘图标不参与
+            if !id.to_string().starts_with("Appid:") {
+                continue;
+            }
+            let Ok(rect) = item.CurrentBoundingRectangle() else { continue };
+            if rect.right <= rect.left {
+                continue;
+            }
+            bounds = Some(match bounds {
+                None => (rect.left, rect.top, rect.right, rect.bottom),
+                Some((l, t, r, b)) => (
+                    l.min(rect.left),
+                    t.min(rect.top),
+                    r.max(rect.right),
+                    b.max(rect.bottom),
+                ),
+            });
+        }
+        bounds
+    }
+}
+
 /// 计算歌词条在任务栏内的位置并应用（支持左右偏好与插件避让）。
 /// 返回是否成功。
 fn position_lyric_bar_in_taskbar(
@@ -413,7 +470,6 @@ fn position_lyric_bar_in_taskbar(
         let tb_w = tb_rect.right - tb_rect.left;
         let tb_h = tb_rect.bottom - tb_rect.top;
 
-        let max_w = (LYRIC_BAR_W * scale) as i32;
         let min_w = (LYRIC_BAR_MIN_W * scale) as i32;
         // 高度贴合任务栏：小任务栏（如 40px）时收缩到任务栏高度，
         // 避免子窗口上下溢出被父窗口裁剪。前端 CSS 按窗口高度自适应隐藏翻译行。
@@ -449,58 +505,65 @@ fn position_lyric_bar_in_taskbar(
             }
         }
 
-        // —— 任务列表（MSTaskSwWClass）矩形：用于判定左对齐/居中与避让 ——
+        // —— 任务按钮区：优先 UIA 真实边界，回退 MSTaskSwWClass 窗口矩形 ——
+        // （Win11 的兼容窗口矩形偏小，见 taskbar_buttons_rect 注释）
+        let buttons = taskbar_buttons_rect()
+            .map(|(l, _, r, _)| (l - tb_rect.left, r - tb_rect.left));
         let tasklist = tasklist_rect_of(taskbar).map(|rc| {
             (
                 rc.left - tb_rect.left,
                 rc.right - tb_rect.left,
             )
         });
+        let pin_left = buttons.map(|(l, _)| l).or(tasklist.map(|(tl, _)| tl));
+        let pin_right = buttons.map(|(_, r)| r).or(tasklist.map(|(_, tr)| tr));
 
         // Win10 左对齐任务栏：搜索框位于开始按钮与任务列表之间，把左锚
         // 移到任务列表左缘（搜索框右侧），避免盖住搜索框。居中任务栏的
         // 任务列表起点远离左缘（≥400 物理像素），不参与。
-        if let Some((tl, _)) = tasklist {
+        if let Some(tl) = pin_left {
             if tl < (400.0 * scale) as i32 {
                 left_anchor = left_anchor.max(tl);
             }
         }
 
-        // —— 宽度与位置 ——
+        // —— 可用区间（相对任务栏左上角，物理像素） ——
+        // 左侧：任务栏左缘 → 任务按钮区左缘（居中任务栏，避免盖住按钮）
+        //       或任务栏右缘（左对齐任务栏）；
+        // 右侧：max(左锚, 任务按钮区右缘 + gap) → 通知区左缘。
+        let (zone_left, zone_right) = if side_left {
+            let right = match pin_left {
+                Some(tl) if tl >= (400.0 * scale) as i32 => (tl - gap).max(min_w),
+                _ => tb_w - gap,
+            };
+            (0, right)
+        } else {
+            let left = match pin_right {
+                Some(tr) => left_anchor.max(tr + gap),
+                None => left_anchor,
+            };
+            (left, right_anchor)
+        };
+
         // 用户可调边距（逻辑 px → 物理 px）：左侧 = 距任务栏左缘
         // （0 = 贴左缘，可覆盖开始按钮——歌词条鼠标穿透不影响点击）；
         // 右侧 = 距通知区左缘（0 = 贴通知区）
         let user_gap = (LYRIC_BAR_GAP.load(Ordering::SeqCst) as f64 * scale) as i32;
-        let mut bar_w = max_w;
+
+        // —— 长度：任务栏可用空间的最大值（动态计算） ——
+        // 不再写死 520 逻辑像素，也不随当前歌词长度收缩——可用区间随
+        // 插件/任务按钮/DPI/左右切换变化，每次定位都按当时的剩余空间
+        // 取最大长度，宽度因此稳定不跳动（长歌词也不需要滚动）。
+        let available = (zone_right - zone_left - user_gap).max(min_w);
+        let mut bar_w = available;
         let mut x = if side_left {
             user_gap
         } else {
-            // 右侧：贴着通知区左缘。可用区左界 = max(左锚, 任务列表右缘 + gap)，
-            // 空间不足时收缩宽度，避免盖住居中的任务按钮
-            let mut zone_left = left_anchor;
-            if let Some((_, tr)) = tasklist {
-                zone_left = zone_left.max(tr + gap);
-            }
-            let available = (right_anchor - zone_left).max(0);
-            if available < max_w {
-                bar_w = available.max(min_w);
-            }
-            (right_anchor - bar_w - user_gap).max(zone_left)
+            zone_right - bar_w - user_gap
         };
 
-        // 左侧 + 居中任务栏：宽度收窄到任务列表左缘前，不盖任务按钮
-        if side_left {
-            if let Some((tl, _)) = tasklist {
-                if tl >= (400.0 * scale) as i32 {
-                    let limit = tl - gap - x;
-                    if limit > 0 && limit < bar_w {
-                        bar_w = limit.max(min_w);
-                    }
-                }
-            }
-        }
-
         // —— 避让其他任务栏插件（TrafficMonitor 等嵌入窗口） ——
+        // 推开后按剩余空间重算宽度：插件挤占会让可用长度变短，不能沿用原宽度
         for p in detect_taskbar_plugins(taskbar, bar_hwnd) {
             let p_w = p.right - p.left;
             if p_w < 20 {
@@ -510,8 +573,13 @@ fn position_lyric_bar_in_taskbar(
             if overlaps {
                 if side_left {
                     x = p.right + gap;
+                    let limit = (zone_right - x - user_gap).max(min_w);
+                    bar_w = bar_w.min(limit);
                 } else {
-                    x = (p.left - bar_w - gap).max(left_anchor);
+                    let limit_right = (p.left - gap).max(zone_left);
+                    let limit = (limit_right - zone_left - user_gap).max(min_w);
+                    bar_w = bar_w.min(limit);
+                    x = limit_right - bar_w - user_gap;
                 }
             }
         }
@@ -601,7 +669,6 @@ fn create_lyric_bar(app: &tauri::AppHandle) -> Result<(), String> {
     let _ = win.set_ignore_cursor_events(true);
     // tauri 返回的 HWND 来自 windows 0.61，转为项目使用的 0.62 指针类型
     let hwnd_raw = win.hwnd().map_err(|e| e.to_string())?;
-    LYRIC_BAR_HWND.store(hwnd_raw.0 as isize, Ordering::SeqCst);
     let hwnd = windows::Win32::Foundation::HWND(hwnd_raw.0);
 
     let embedded = embed_lyric_bar_into_taskbar(hwnd, scale);
@@ -610,6 +677,11 @@ fn create_lyric_bar(app: &tauri::AppHandle) -> Result<(), String> {
         let _ = win.set_position(tauri::Position::Logical((x, y).into()));
         let _ = win.set_size(tauri::Size::Logical((w, h).into()));
     }
+
+    // 句柄必须等定位完成后才登记：提前登记时并发的 set_lyric_bar_side /
+    // set_lyric_bar_gap 会在窗口尚未 SetParent 的瞬间按「顶层窗口」坐标系
+    // 重定位一次（数值是任务栏客户区坐标），窗口当场落到错误的屏幕位置。
+    LYRIC_BAR_HWND.store(hwnd_raw.0 as isize, Ordering::SeqCst);
 
     let _ = win.show();
     let _ = win.set_ignore_cursor_events(true);
@@ -797,6 +869,7 @@ fn spawn_lyric_bar_watchdog(app: tauri::AppHandle) {
         let mut last_tb_rect: Option<(i32, i32, i32, i32)> = None;
         let mut last_tray_rect: Option<(i32, i32, i32, i32)> = None;
         let mut last_tasklist_rect: Option<(i32, i32, i32, i32)> = None;
+        let mut last_buttons_rect: Option<(i32, i32, i32, i32)> = None;
         let mut last_plugins: Option<Vec<(i32, i32, i32, i32)>> = None;
         let mut last_scale: f64 = 0.0;
         loop {
@@ -837,6 +910,9 @@ fn spawn_lyric_bar_watchdog(app: tauri::AppHandle) {
                             .map(|r| (r.left, r.top, r.right, r.bottom));
                         let tasklist_now = tasklist_rect_of(taskbar)
                             .map(|r| (r.left, r.top, r.right, r.bottom));
+                        // 任务按钮区（UIA 真实边界）：按钮增减/移动后要重定位，
+                        // 否则歌词条会盖住新出现的按钮
+                        let buttons_now = taskbar_buttons_rect();
                         let mut plugins_now = detect_taskbar_plugins(taskbar, bar)
                             .iter()
                             .map(|r| (r.left, r.top, r.right, r.bottom))
@@ -847,6 +923,7 @@ fn spawn_lyric_bar_watchdog(app: tauri::AppHandle) {
                         let layout_changed = tb_now != last_tb_rect
                             || tray_now != last_tray_rect
                             || tasklist_now != last_tasklist_rect
+                            || buttons_now != last_buttons_rect
                             || Some(plugins_now.clone()) != last_plugins
                             || (scale - last_scale).abs() > f64::EPSILON;
                         if layout_changed {
@@ -854,6 +931,7 @@ fn spawn_lyric_bar_watchdog(app: tauri::AppHandle) {
                             last_tb_rect = tb_now;
                             last_tray_rect = tray_now;
                             last_tasklist_rect = tasklist_now;
+                            last_buttons_rect = buttons_now;
                             last_plugins = Some(plugins_now);
                             last_scale = scale;
                         }
@@ -1323,8 +1401,24 @@ async fn save_frontend_prefs(json: String) -> Result<(), String> {
 // 状态栏歌词开关：开启时创建歌词窗口并通过 SetParent 嵌入任务栏
 // （显示在通知区域左侧，任务栏自身交互不会盖住它），关闭时销毁。
 // 歌词条复用 song-info / playback-progress 事件。
-async fn set_lyric_bar_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+//
+// side / gap 为位置偏好，与开关一次事务式传入：窗口创建时的首次定位读的
+// 就是这两个静态值，若等创建完再单独调 set_lyric_bar_side / _gap，
+// 首次打开必然先按默认值（右侧、0 边距）出现在错误位置。
+async fn set_lyric_bar_enabled(
+    app: tauri::AppHandle,
+    enabled: bool,
+    side: Option<String>,
+    gap: Option<u32>,
+) -> Result<(), String> {
     use tauri::Manager;
+
+    if let Some(side) = side {
+        LYRIC_BAR_SIDE.store(if side == "left" { 1 } else { 0 }, Ordering::SeqCst);
+    }
+    if let Some(gap) = gap {
+        LYRIC_BAR_GAP.store(gap.min(500), Ordering::SeqCst);
+    }
 
     LYRIC_BAR_ENABLED.store(enabled, Ordering::SeqCst);
 

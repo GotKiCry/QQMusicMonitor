@@ -271,16 +271,19 @@ window.addEventListener('beforeunload', () => {
 
 /**
  * 恢复状态栏歌词窗口（按偏好：开关/位置/边距）。
- * 歌词条边距与位置在窗口创建后按序 invoke，位置函数读取的是
- * 静态偏好值，创建完成前先存值也能正确生效。
+ * 位置与边距随开关一次下发：三次并发 invoke 时后端创建窗口与
+ * set_lyric_bar_side / _gap 的先后顺序不确定，首次定位会读到旧值
+ * （默认右侧、0 边距），表现为启动恢复后歌词条位置与设置不符。
  */
 function restoreLyricBar(cfg) {
     if (!isTauri() || !cfg.lyricBar) return;
-    window.__TAURI__.core.invoke('set_lyric_bar_enabled', { enabled: true }).catch((e) => {
+    window.__TAURI__.core.invoke('set_lyric_bar_enabled', {
+        enabled: true,
+        side: cfg.lyricBarSide,
+        gap: cfg.lyricBarGap || 0
+    }).catch((e) => {
         console.error('Failed to restore lyric bar:', e);
     });
-    window.__TAURI__.core.invoke('set_lyric_bar_side', { side: cfg.lyricBarSide }).catch(() => {});
-    window.__TAURI__.core.invoke('set_lyric_bar_gap', { gap: cfg.lyricBarGap || 0 }).catch(() => {});
 }
 
 // 5. 水合后端持久化的前端偏好（跨 origin 权威值），随后恢复歌词条。
