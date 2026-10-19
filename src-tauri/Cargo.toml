@@ -1,6 +1,6 @@
 [package]
 name = "qqmusic-monitor"
-version = "1.0.0"
+version = "1.0.1"
 description = "A Tauri App for monitoring QQMusic info"
 authors = ["GotKiCry <liuzhihao66@gmail.com>"]
 license = "MIT"
