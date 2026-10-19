@@ -127,6 +127,15 @@ static LYRIC_BAR_HWND: AtomicIsize = AtomicIsize::new(0);
 const MINI_PLAYER_W: f64 = 368.0;
 const MINI_PLAYER_H: f64 = 396.0;
 
+/// 窗口内卡片本体的透明留白（与 mini-player.css 的 `inset: 30px 24px 34px`
+/// 对齐：上 30 / 左右 24 / 下 34）。留白只为容纳投影与滑入动画——
+/// 用户看到的是卡片本体，所以定位、边距、显示器钳制一律按卡片边缘算，
+/// 不能按窗口边缘（否则卡片会离歌词条边界差一整个阴影留白）。
+const MINI_PLAYER_INSET_TOP: f64 = 30.0;
+const MINI_PLAYER_INSET_RIGHT: f64 = 24.0;
+const MINI_PLAYER_INSET_BOTTOM: f64 = 34.0;
+const MINI_PLAYER_INSET_LEFT: f64 = 24.0;
+
 /// 迷你播放器最近一次显示时刻（Unix ms）：失焦自动隐藏的防抖基准。
 /// 某些系统上 show+set_focus 会抖一次 Focused(false)，刚显示的一小段
 /// 时间内的失焦事件直接忽略，防止窗口一闪而过。
@@ -775,25 +784,39 @@ fn position_mini_player(app: &tauri::AppHandle, win: &tauri::WebviewWindow) {
     }
     let Some((al, at, ar, ab)) = anchor else { return; };
 
-    let (w, h) = (MINI_PLAYER_W, MINI_PLAYER_H);
-    let mut x = (al + ar) / 2.0 - w / 2.0;
-    let mut y = at - h - 8.0;
+    // —— 按卡片本体（不含阴影留白）对齐歌词条边界 ——
+    // 窗口外的透明留白只为投影和滑入动画服务，用户看到的是卡片本身，
+    // 因此对齐、间距、显示器钳制都按卡片边缘计算。
+    let card_w = MINI_PLAYER_W - MINI_PLAYER_INSET_LEFT - MINI_PLAYER_INSET_RIGHT;
+    let card_h = MINI_PLAYER_H - MINI_PLAYER_INSET_TOP - MINI_PLAYER_INSET_BOTTOM;
+    // 卡片底缘距歌词条顶缘 8px（窗口坐标 = 卡片坐标 - 上留白）
+    let mut x = (al + ar) / 2.0 - card_w / 2.0;
+    let mut y = at - 8.0 - card_h - MINI_PLAYER_INSET_TOP;
 
     if let Ok(Some(mon)) = app.primary_monitor() {
         let mpos = mon.position().to_logical::<f64>(scale);
         let msize = mon.size().to_logical::<f64>(scale);
         // 水平：与歌词条更靠近屏幕边界的一边对齐（用户 2026-10 要求）——
-        // 左侧布局（贴开始按钮）对齐歌词条左缘，右侧布局（贴通知区）对齐右缘，
-        // 不再取中线居中；歌词条比窗口宽/窄时都按边缘齐平。
+        // 左侧布局让卡片左缘贴歌词条左缘，右侧布局让卡片右缘贴歌词条右缘，
+        // 不再取中线居中；歌词条比卡片宽/窄时都按边缘齐平。
         let dist_left = al - mpos.x;
         let dist_right = (mpos.x + msize.width) - ar;
-        x = if dist_left <= dist_right { al } else { ar - w };
-        // 任务栏在顶部（锚点上方放不下）→ 改放锚点下方
+        x = if dist_left <= dist_right {
+            al - MINI_PLAYER_INSET_LEFT
+        } else {
+            ar - MINI_PLAYER_INSET_LEFT - card_w
+        };
+        // 任务栏在顶部（锚点上方放不下）→ 改放锚点下方，卡片顶缘距锚点 8px
         if y < mpos.y + 8.0 {
-            y = ab + 8.0;
+            y = ab + 8.0 - MINI_PLAYER_INSET_TOP;
         }
-        x = x.clamp(mpos.x + 8.0, (mpos.x + msize.width - w - 8.0).max(mpos.x + 8.0));
-        y = y.clamp(mpos.y + 8.0, (mpos.y + msize.height - h - 8.0).max(mpos.y + 8.0));
+        // 钳制在显示器内：按卡片本体边缘留 8px 边距，窗口留白不计入
+        let min_x = mpos.x + 8.0 - MINI_PLAYER_INSET_LEFT;
+        let max_x = (mpos.x + msize.width - 8.0 - MINI_PLAYER_INSET_LEFT - card_w).max(min_x);
+        x = x.clamp(min_x, max_x);
+        let min_y = mpos.y + 8.0 - MINI_PLAYER_INSET_TOP;
+        let max_y = (mpos.y + msize.height - 8.0 - MINI_PLAYER_INSET_TOP - card_h).max(min_y);
+        y = y.clamp(min_y, max_y);
     }
     // 记录放置方位（供显隐动画选方向）：y 越过锚点顶缘 = 放在歌词条下方
     MINI_PLAYER_PLACED_BELOW_BAR.store(y > at, Ordering::SeqCst);
