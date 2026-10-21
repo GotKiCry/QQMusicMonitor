@@ -173,6 +173,15 @@
                     </div>
 
                     <div class="setting-item">
+                        <div class="setting-info">
+                            <label for="cfg-lyric-bar-width">歌词条宽度</label>
+                            <span class="badge" id="val-lyric-bar-width">520px</span>
+                        </div>
+                        <input type="range" id="cfg-lyric-bar-width" min="180" max="1600" step="10" value="520">
+                        <p class="helper-text">歌词条窗口最大宽度（逻辑像素）；任务栏可用空间不足时自动收缩</p>
+                    </div>
+
+                    <div class="setting-item">
                         <span class="setting-title">任务栏配色</span>
                         <div class="seg-control">
                             <button class="seg-btn" id="btn-taskbar-theme-auto" title="跟随系统任务栏明暗（自动检测，失败时保持上次配色）">自动</button>
@@ -230,13 +239,16 @@
                             <button class="theme-dot dot-purple" data-theme="aurora-purple" title="罗兰紫"></button>
                             <button class="theme-dot dot-emerald" data-theme="aurora-emerald" title="翡翠绿"></button>
                             <button class="theme-dot dot-sunset" data-theme="aurora-sunset" title="落日橙"></button>
-                            <button class="theme-dot theme-dot-auto" data-theme="auto" title="自动（专辑封面取色）"></button>
                             <div class="theme-dot-wrap">
                                 <button class="theme-dot theme-dot-custom" id="theme-dot-custom" title="自定义颜色（取色盘）"></button>
                                 <!-- 0 尺寸隐藏输入：不渲染任何表面（无方块），仅作取色器锚点，由按钮点击驱动 -->
                                 <input type="color" id="custom-color" class="hidden-color-input" value="#14b8a6">
                             </div>
                         </div>
+                        <button type="button" class="theme-auto-btn" id="btn-theme-auto" title="跟随专辑封面自动取色（色点与色值为当前取到的颜色）">
+                            <span class="theme-auto-label">AUTO</span>
+                            <span class="theme-auto-hex" id="val-theme-auto-hex">#14b8a6</span>
+                        </button>
                         <p class="helper-text">自动主题随专辑封面变色，切换歌曲时实时更新。</p>
                     </div>
                 </fieldset>

@@ -78,7 +78,10 @@ const els = bindElements({
     btnTaskbarThemeLight: 'btn-taskbar-theme-light',
     cfgLyricBarGap: 'cfg-lyric-bar-gap',
     valLyricBarGap: 'val-lyric-bar-gap',
+    cfgLyricBarWidth: 'cfg-lyric-bar-width',
+    valLyricBarWidth: 'val-lyric-bar-width',
     themeDotCustom: 'theme-dot-custom',
+    btnThemeAuto: 'btn-theme-auto',
     customColor: 'custom-color',
     // 调试
     debugPanel: 'debug-panel',
@@ -245,6 +248,10 @@ if (isTauri()) {
     });
     listenSongInfo(onMessage, onPlaybackProgress, startRendering);
     updateConnectionUI('connected', els.statusDot, els.statusText);
+    // 状态栏歌词右键菜单「打开设置」：后端恢复主窗口后通知前端打开设置抽屉
+    window.__TAURI__.event
+        .listen('open-settings', () => els.btnSettings.click())
+        .catch(() => {});
 } else {
     // 浏览器/独立调试环境：用 WebSocket 连接后端
     fetchBackendConfig().then((cfg) => {
@@ -270,17 +277,18 @@ window.addEventListener('beforeunload', () => {
 });
 
 /**
- * 恢复状态栏歌词窗口（按偏好：开关/位置/边距）。
- * 位置与边距随开关一次下发：三次并发 invoke 时后端创建窗口与
- * set_lyric_bar_side / _gap 的先后顺序不确定，首次定位会读到旧值
- * （默认右侧、0 边距），表现为启动恢复后歌词条位置与设置不符。
+ * 恢复状态栏歌词窗口（按偏好：开关/位置/边距/宽度）。
+ * 位置、边距、宽度随开关一次下发：并发 invoke 时后端创建窗口与
+ * set_lyric_bar_side / _gap / _width 的先后顺序不确定，首次定位会读到旧值
+ * （默认右侧、0 边距、520 宽），表现为启动恢复后歌词条位置与设置不符。
  */
 function restoreLyricBar(cfg) {
     if (!isTauri() || !cfg.lyricBar) return;
     window.__TAURI__.core.invoke('set_lyric_bar_enabled', {
         enabled: true,
         side: cfg.lyricBarSide,
-        gap: cfg.lyricBarGap || 0
+        gap: cfg.lyricBarGap || 0,
+        width: cfg.lyricBarWidth || 520
     }).catch((e) => {
         console.error('Failed to restore lyric bar:', e);
     });

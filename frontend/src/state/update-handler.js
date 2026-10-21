@@ -34,6 +34,9 @@ const songKeyOf = (data) => `${data.title}|${data.artist}`;
 /** 自动主题取色请求序号：只允许最新一次请求的结果落地 */
 let autoColorSeq = 0;
 
+/** 最近一次发布的调色板签名：同一封面重复帧（update 每 100ms 一帧）不重复写库/广播 */
+let lastAutoPaletteSig = '';
+
 /**
  * @param {Object} els - DOM 元素集合
  * @param {any} data - 后端推送的 SongInfo
@@ -154,21 +157,29 @@ export function handleSongInfoUpdate(els, data, cfg, backCfg, lastSyncMsRef) {
     // 序号保证切歌竞态下只有最新结果落地。
     // 黑白/低饱和封面、取色失败 → 中性银回退（不再继承上一首颜色，
     // 避免"主题色不是当前歌"的观感）；同一封面 URL 有缓存，重复帧不重复解码。
-    if (cfg.theme === 'auto') {
+    //
+    // 注意：即使当前主题不是 auto 也提取调色板——设置面板的 AUTO 按钮需要
+    // 始终显示「当前歌曲」的取色（切歌实时刷新）；只有 theme=auto 才应用为
+    // 当前主题。无封面帧保持当前主题（切歌瞬间 SMTC 常滞后几帧才补封面）。
+    {
         const seq = ++autoColorSeq;
         const artSrc = data.album_pic_hd_url || data.album_pic_url;
         if (artSrc) {
             extractAlbumPalette(artSrc).then((palette) => {
-                if (seq !== autoColorSeq || cfg.theme !== 'auto') return;
+                if (seq !== autoColorSeq) return;
+                // 同一封面：取色结果不变，不重复写库 / 广播（每 100ms 一帧）
+                const sig = `${palette.primary}|${palette.ink}`;
+                if (sig === lastAutoPaletteSig) return;
+                lastAutoPaletteSig = sig;
                 try {
                     localStorage.setItem(AUTO_COLOR_KEY, palette.primary);
                     localStorage.setItem(AUTO_PALETTE_KEY, JSON.stringify(palette));
                 } catch {}
-                paintCustomTheme(palette);
+                if (cfg.theme === 'auto') paintCustomTheme(palette);
+                // 通知设置面板刷新 AUTO 按钮的色点/hex（切歌实时跟随）
+                window.dispatchEvent(new Event('auto-color-updated'));
             });
         }
-        // 无封面帧：保持当前主题（切歌瞬间 SMTC 常滞后几帧才补封面；
-        // 直接清主题会广播删除事件、歌词条闪回默认青绿）
     }
 
     // —— 播放状态动画 ——

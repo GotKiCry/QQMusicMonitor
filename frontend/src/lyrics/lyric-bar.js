@@ -217,21 +217,22 @@ function applyFallbackDom() {
 
 /** 重建当前行 DOM（逐字或纯文本），行状态通过 CSS class 施加 */
 function renderRow(row) {
-    // 换行过渡：旧行克隆到独立的绝对定位层做上滑退出（克隆体连同 inner 的
-    // 横向滚动偏移一起保留），新行从下方滑入——垂直滚动式换行。
-    if (els.inner.firstElementChild) {
-        const layer = document.createElement('div');
-        layer.className = 'row-leaving';
-        const ghost = els.inner.cloneNode(true);
-        ghost.removeAttribute('id');
-        // 克隆体只做退出动画：清掉进入/淡入动画，避免重复播放
-        ghost.querySelectorAll('.bar-content, .lyric-bar-trans').forEach((el) => {
+    // 换行过渡：旧内容（歌词行 + 翻译）整体克隆到绝对定位层，从窗口顶部
+    // 整体滑出；新内容（歌词行 + 翻译）从窗口下方整体滑入——上下滚动式换行。
+    const root = els.trans.parentElement; // .lyric-bar-root
+    if (root && els.inner.firstElementChild) {
+        const layer = root.cloneNode(true);
+        layer.removeAttribute('id');
+        // 清理克隆体：去掉重复 id、内部可能残留的旧退场层、入场/淡入动画
+        layer.querySelectorAll('[id]').forEach((el) => el.removeAttribute('id'));
+        layer.querySelectorAll('.row-leaving').forEach((el) => el.remove());
+        layer.querySelectorAll('.bar-content, .lyric-bar-trans').forEach((el) => {
             el.style.animation = 'none';
             el.classList.remove('row-entering');
         });
-        layer.appendChild(ghost);
-        els.line.appendChild(layer);
-        setTimeout(() => layer.remove(), 360);
+        layer.classList.add('row-leaving');
+        root.appendChild(layer);
+        setTimeout(() => layer.remove(), 380);
     }
 
     wordEls = [];
@@ -378,8 +379,9 @@ function tick() {
     let target = '';
     const t = clock.position();
     if (fallbackMode) {
-        // 加载兜底：歌词长时间未到达（如网络失败）时改为纯音乐提示
-        if (fallbackMode === 'loading' && performance.now() - loadingStartedAt > 15000) {
+        // 加载兜底：本地歌词通常切歌后 <1s 到达（在线歌词已停用），
+        // 3s 仍为空即视为无歌词，显示纯音乐提醒（原 15s 是等在线请求的超时）
+        if (fallbackMode === 'loading' && performance.now() - loadingStartedAt > 3000) {
             setFallback('pure');
         }
         target = 'fb:' + fallbackMode + ':' + fallbackText;
@@ -513,6 +515,23 @@ async function refreshTaskbarLightMode() {
     applyTaskbarAppearance();
 }
 
+/* ============================================================
+ * 边界提示：主窗口调整歌词条宽度/位置/边距后，立即在窗口左右边缘
+ * 显示竖线（CSS 动画约 3s 后自主淡出），方便确认窗口边界。
+ * 事件由主窗口的 set_lyric_bar_* 命令经 Tauri 广播触发。
+ * ============================================================ */
+function flashBoundaryHint() {
+    const left = document.getElementById('bar-boundary-left');
+    const right = document.getElementById('bar-boundary-right');
+    if (!left || !right) return;
+    // 重启动画：移除类 + 强制重排 + 重新添加（连续调整时也能重新亮起）
+    for (const el of [left, right]) {
+        el.classList.remove('show');
+        void el.offsetWidth;
+        el.classList.add('show');
+    }
+}
+
 /** 页面入口 */
 export function initLyricBar() {
     applyPreferences();
@@ -533,6 +552,10 @@ export function initLyricBar() {
     if (window.__TAURI__) {
         window.__TAURI__.event
             .listen('theme-changed', () => applyPreferences())
+            .catch(() => {});
+        // 主窗口调整宽度/位置/边距后点亮左右边界竖线（3s 后自动淡出）
+        window.__TAURI__.event
+            .listen('lyric-bar-bounds', () => flashBoundaryHint())
             .catch(() => {});
     }
     window.addEventListener('storage', (e) => {

@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(dead_code)]
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use tokio::sync::RwLock;
 
@@ -26,6 +26,20 @@ static LYRIC_BAR_SIDE: std::sync::atomic::AtomicU8 =
 /// 歌词条边距偏好（逻辑像素）：距任务栏屏幕边缘的距离（左=距左缘，右=距通知区左缘）
 static LYRIC_BAR_GAP: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
+
+/// 歌词条宽度偏好（逻辑像素）：窗口最大宽度，任务栏可用空间不足时自动收缩。
+/// 默认 LYRIC_BAR_DEFAULT_W（520），设置项可调 LYRIC_BAR_MIN_W..LYRIC_BAR_MAX_W。
+static LYRIC_BAR_WIDTH: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(LYRIC_BAR_DEFAULT_W as u32);
+
+/// 歌词条左键抬起的时间/位置（双击打开主界面用；Windows 双击判定 = 时间 + 距离）
+static LAST_LYRIC_BAR_CLICK_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_LYRIC_BAR_CLICK_X: AtomicI32 = AtomicI32::new(0);
+static LAST_LYRIC_BAR_CLICK_Y: AtomicI32 = AtomicI32::new(0);
+
+/// 待定单击序号：单击动作延迟到双击判定窗口之后再执行，双击时递增使待定项作废
+/// （否则双击的第一击会先弹出迷你播放器，第二击再收起——视觉上闪一下）。
+static PENDING_SINGLE_CLICK_SEQ: AtomicU64 = AtomicU64::new(0);
 
 
 /// 全局调试开关（main 启动时按配置设置，供非异步路径打印诊断）
@@ -112,8 +126,7 @@ async fn hide_mini_player(app: tauri::AppHandle) {
     }
 }
 
-/// 状态栏歌词窗口兜底尺寸（拿不到任务栏位置时使用）
-const LYRIC_BAR_FALLBACK_WIDTH: f64 = 800.0;
+/// 状态栏歌词窗口兜底高度（拿不到任务栏位置时使用；宽度取用户偏好）
 const LYRIC_BAR_FALLBACK_HEIGHT: f64 = 48.0;
 const LYRIC_BAR_BOTTOM_OFFSET: f64 = 0.0;
 
@@ -192,18 +205,26 @@ fn lyric_bar_geometry(monitor: &tauri::Monitor) -> (f64, f64, f64, f64) {
         return (x, y, w, h);
     }
     let logical = monitor.size().to_logical::<f64>(scale);
+    let width = configured_lyric_bar_width();
     (
-        (logical.width - LYRIC_BAR_FALLBACK_WIDTH) / 2.0,
+        (logical.width - width) / 2.0,
         (logical.height - LYRIC_BAR_FALLBACK_HEIGHT - LYRIC_BAR_BOTTOM_OFFSET).max(0.0),
-        LYRIC_BAR_FALLBACK_WIDTH,
+        width,
         LYRIC_BAR_FALLBACK_HEIGHT,
     )
 }
 
-/// 歌词条逻辑尺寸（与前端 CSS 布局匹配）：最大宽度、高度、最小收缩宽度
-const LYRIC_BAR_W: f64 = 520.0;
+/// 歌词条逻辑尺寸（与前端 CSS 布局匹配）：默认宽度（设置项默认值）、高度、
+/// 可调宽度范围。宽度偏好存于 LYRIC_BAR_WIDTH，定位时按可用空间封顶。
+const LYRIC_BAR_DEFAULT_W: f64 = 520.0;
 const LYRIC_BAR_H: f64 = 48.0;
 const LYRIC_BAR_MIN_W: f64 = 180.0;
+const LYRIC_BAR_MAX_W: u32 = 1600;
+
+/// 当前歌词条宽度偏好（逻辑像素，clamp 到可调范围）
+fn configured_lyric_bar_width() -> f64 {
+    (LYRIC_BAR_WIDTH.load(Ordering::SeqCst) as f64).clamp(LYRIC_BAR_MIN_W, LYRIC_BAR_MAX_W as f64)
+}
 
 /// 找到主任务栏窗口（Shell_TrayWnd）
 fn find_taskbar() -> Option<windows::Win32::Foundation::HWND> {
@@ -457,16 +478,102 @@ fn taskbar_buttons_rect() -> Option<(i32, i32, i32, i32)> {
     }
 }
 
+/// 歌词条定位的布局快照：锚点、可用区间与第三方插件占用（UIA 枚举任务
+/// 按钮、EnumChildWindows 找插件）都是昂贵查询，完整定位算一次缓存下来；
+/// 拖动宽度滑块时只按快照重算 x/宽度并 SetWindowPos（完整定位约 55ms，
+/// 每帧调用会拖慢拖动；快照路径约 3ms）。
+#[derive(Clone)]
+struct LyricBarLayout {
+    tb_w: i32,
+    tb_h: i32,
+    bar_h: i32,
+    gap: i32,
+    min_w: i32,
+    user_gap: i32,
+    side_left: bool,
+    zone_left: i32,
+    zone_right: i32,
+    right_anchor: i32,
+    /// 第三方插件占用区间（相对任务栏左缘）：(left, right)
+    plugins: Vec<(i32, i32)>,
+}
+
+impl LyricBarLayout {
+    /// 按宽度偏好计算位置与宽度并应用（含插件避让与边界钳制）。
+    fn apply(&self, bar_hwnd: windows::Win32::Foundation::HWND, requested_w: i32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        };
+
+        let available = (self.zone_right - self.zone_left - self.user_gap).max(self.min_w);
+        let mut bar_w = requested_w.min(available).max(self.min_w);
+        let mut x = if self.side_left {
+            self.user_gap
+        } else {
+            self.zone_right - bar_w - self.user_gap
+        };
+
+        // —— 避让其他任务栏插件（TrafficMonitor 等嵌入窗口） ——
+        // 推开后按剩余空间重算宽度：插件挤占会让可用长度变短，不能沿用原宽度
+        for &(p_left, p_right) in &self.plugins {
+            let p_w = p_right - p_left;
+            if p_w < 20 {
+                continue;
+            }
+            if p_left < x + bar_w && p_right > x {
+                if self.side_left {
+                    x = p_right + self.gap;
+                    let limit = (self.zone_right - x - self.user_gap).max(self.min_w);
+                    bar_w = bar_w.min(limit);
+                } else {
+                    let limit_right = (p_left - self.gap).max(self.zone_left);
+                    let limit = (limit_right - self.zone_left - self.user_gap).max(self.min_w);
+                    bar_w = bar_w.min(limit);
+                    x = limit_right - bar_w - self.user_gap;
+                }
+            }
+        }
+
+        // 收进任务栏范围内，右侧不越过通知区
+        x = x.max(0);
+        if x + bar_w > self.tb_w - self.gap {
+            bar_w = (self.tb_w - self.gap - x).max(self.min_w);
+        }
+        if !self.side_left && x + bar_w > self.right_anchor {
+            bar_w = (self.right_anchor - x).max(self.min_w);
+            x = self.right_anchor - bar_w;
+        }
+
+        let y = ((self.tb_h - self.bar_h) / 2).max(0);
+        // HWND_TOP：保持在任务栏其他子窗口之上（后续新建的插件窗口可能抢占），
+        // 配合 watchdog 每 5s 的布局自愈保证歌词条始终可见。
+        unsafe {
+            let _ = SetWindowPos(
+                bar_hwnd,
+                Some(HWND_TOP),
+                x,
+                y,
+                bar_w,
+                self.bar_h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        true
+    }
+}
+
+/// 最近一次完整定位得到的布局快照（拖动宽度预览用）；窗口销毁时清空。
+static LYRIC_BAR_LAYOUT: std::sync::Mutex<Option<LyricBarLayout>> =
+    std::sync::Mutex::new(None);
+
 /// 计算歌词条在任务栏内的位置并应用（支持左右偏好与插件避让）。
-/// 返回是否成功。
+/// 完整定位会刷新布局快照（拖动预览用）；返回是否成功。
 fn position_lyric_bar_in_taskbar(
     bar_hwnd: windows::Win32::Foundation::HWND,
     scale: f64,
 ) -> bool {
     use windows::Win32::Foundation::RECT;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowExW, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_SHOWWINDOW, HWND_TOP,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowRect};
 
     unsafe {
         let Some(taskbar) = find_taskbar() else {
@@ -559,63 +666,37 @@ fn position_lyric_bar_in_taskbar(
         // 右侧 = 距通知区左缘（0 = 贴通知区）
         let user_gap = (LYRIC_BAR_GAP.load(Ordering::SeqCst) as f64 * scale) as i32;
 
-        // —— 长度：任务栏可用空间的最大值（动态计算） ——
-        // 不再写死 520 逻辑像素，也不随当前歌词长度收缩——可用区间随
-        // 插件/任务按钮/DPI/左右切换变化，每次定位都按当时的剩余空间
-        // 取最大长度，宽度因此稳定不跳动（长歌词也不需要滚动）。
-        let available = (zone_right - zone_left - user_gap).max(min_w);
-        let mut bar_w = available;
-        let mut x = if side_left {
-            user_gap
-        } else {
-            zone_right - bar_w - user_gap
-        };
+        // —— 第三方插件占用区间（随布局快照缓存，拖动预览不必重新枚举） ——
+        let plugins: Vec<(i32, i32)> = detect_taskbar_plugins(taskbar, bar_hwnd)
+            .into_iter()
+            .map(|p| (p.left, p.right))
+            .collect();
 
-        // —— 避让其他任务栏插件（TrafficMonitor 等嵌入窗口） ——
-        // 推开后按剩余空间重算宽度：插件挤占会让可用长度变短，不能沿用原宽度
-        for p in detect_taskbar_plugins(taskbar, bar_hwnd) {
-            let p_w = p.right - p.left;
-            if p_w < 20 {
-                continue;
-            }
-            let overlaps = p.left < x + bar_w && p.right > x;
-            if overlaps {
-                if side_left {
-                    x = p.right + gap;
-                    let limit = (zone_right - x - user_gap).max(min_w);
-                    bar_w = bar_w.min(limit);
-                } else {
-                    let limit_right = (p.left - gap).max(zone_left);
-                    let limit = (limit_right - zone_left - user_gap).max(min_w);
-                    bar_w = bar_w.min(limit);
-                    x = limit_right - bar_w - user_gap;
-                }
-            }
-        }
-
-        // 收进任务栏范围内，右侧不越过通知区
-        x = x.max(0);
-        if x + bar_w > tb_w - gap {
-            bar_w = (tb_w - gap - x).max(min_w);
-        }
-        if !side_left && x + bar_w > right_anchor {
-            bar_w = (right_anchor - x).max(min_w);
-            x = right_anchor - bar_w;
-        }
-
-        let y = ((tb_h - bar_h) / 2).max(0);
-        // HWND_TOP：保持在任务栏其他子窗口之上（后续新建的插件窗口可能抢占），
-        // 配合 watchdog 每 5s 的布局自愈保证歌词条始终可见。
-        let _ = SetWindowPos(
-            bar_hwnd,
-            Some(HWND_TOP),
-            x,
-            y,
-            bar_w,
+        // 宽度计算 / 插件避让 / SetWindowPos 统一交给布局快照应用：
+        // 宽度 = min(用户偏好, 可用空间)，避免空间不足时盖住任务按钮
+        let layout = LyricBarLayout {
+            tb_w,
+            tb_h,
             bar_h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
-        true
+            gap,
+            min_w,
+            user_gap,
+            side_left,
+            zone_left,
+            zone_right,
+            right_anchor,
+            plugins,
+        };
+        let requested_w = (configured_lyric_bar_width() * scale) as i32;
+        let ok = layout.apply(bar_hwnd, requested_w);
+        if ok {
+            // 缓存给拖动宽度预览用：完整定位（含 UIA 枚举）约 55ms，
+            // 预览路径只做 SetWindowPos，约 3ms
+            if let Ok(mut cache) = LYRIC_BAR_LAYOUT.lock() {
+                *cache = Some(layout);
+            }
+        }
+        ok
     }
 }
 
@@ -662,7 +743,7 @@ fn create_lyric_bar(app: &tauri::AppHandle) -> Result<(), String> {
         WebviewUrl::App("lyric-bar.html".into()),
     )
     .title("QQMusic Monitor - 状态栏歌词")
-    .inner_size(LYRIC_BAR_W, LYRIC_BAR_H)
+    .inner_size(configured_lyric_bar_width(), LYRIC_BAR_H)
     .decorations(false)
     .transparent(true)
     .always_on_top(true)
@@ -873,6 +954,12 @@ fn toggle_mini_player(app: &tauri::AppHandle) {
     }
 }
 
+/// 双击歌词条：收起可能刚被单击弹出的迷你播放器，恢复主界面。
+fn open_main_from_lyric_bar(app: &tauri::AppHandle) {
+    request_hide_mini_player(app);
+    show_main_window(app);
+}
+
 /// 销毁迷你播放器（歌词条关闭/隐藏时连带收起——没有歌词条就没有入口）。
 fn destroy_mini_player(app: &tauri::AppHandle) {
     use tauri::Manager;
@@ -960,9 +1047,13 @@ fn spawn_lyric_bar_watchdog(app: tauri::AppHandle) {
                         }
                     }
                 } else {
-                    // 窗口已被外部销毁：重建
+                    // 窗口已被外部销毁：重建（布局快照同时失效）
                     if let Some(win) = app.get_webview_window("lyric-bar") {
                         let _ = win.destroy();
+                    }
+                    LYRIC_BAR_HWND.store(0, Ordering::SeqCst);
+                    if let Ok(mut cache) = LYRIC_BAR_LAYOUT.lock() {
+                        *cache = None;
                     }
                     let _ = create_lyric_bar(&app);
                     last_tb_rect = None;
@@ -1133,6 +1224,63 @@ unsafe fn cursor_in_lyric_bar() -> bool {
         && pt.y <= rc.bottom
 }
 
+/// 系统双击时间（毫秒，下限 200ms）：双击容差判定用。
+fn lyric_bar_double_click_ms() -> u64 {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+    unsafe { GetDoubleClickTime().max(200) as u64 }
+}
+
+/// 单击动作延迟：只需覆盖「第一击抬起 → 第二击按下」的间隔，不必等满
+/// 系统双击时间（默认 500ms，单击反馈太拖沓）。用户实测 250ms 仍偏慢，
+/// 压到 150ms；慢速双击（>150ms）由第二击按下作废待定动作兜底。
+fn lyric_bar_single_click_delay_ms() -> u64 {
+    lyric_bar_double_click_ms().min(150)
+}
+
+/// 本次左键按下是否可能构成双击的第二击（距上次抬起在系统双击时间内且
+/// 位置接近）。第二击一按下就作废待定单击——等不到抬起，迷你播放器已经
+/// 延迟执行了。
+fn lyric_bar_press_starts_double_click() -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let last_ms = LAST_LYRIC_BAR_CLICK_MS.load(Ordering::SeqCst);
+    if last_ms == 0 {
+        return false;
+    }
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    current_timestamp_ms().saturating_sub(last_ms) <= lyric_bar_double_click_ms()
+        && (pt.x - LAST_LYRIC_BAR_CLICK_X.load(Ordering::SeqCst)).abs() <= 4
+        && (pt.y - LAST_LYRIC_BAR_CLICK_Y.load(Ordering::SeqCst)).abs() <= 4
+}
+
+/// 判断本次左键抬起是否构成歌词条上的双击（系统双击时间 + 光标位置容差），
+/// 并把本次抬起记录为下一次判定的基准。
+fn is_lyric_bar_double_click() -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let now = current_timestamp_ms();
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    let double_click_ms = lyric_bar_double_click_ms();
+    let last_ms = LAST_LYRIC_BAR_CLICK_MS.load(Ordering::SeqCst);
+    let is_double = last_ms != 0
+        && now.saturating_sub(last_ms) <= double_click_ms
+        && (pt.x - LAST_LYRIC_BAR_CLICK_X.load(Ordering::SeqCst)).abs() <= 4
+        && (pt.y - LAST_LYRIC_BAR_CLICK_Y.load(Ordering::SeqCst)).abs() <= 4;
+
+    LAST_LYRIC_BAR_CLICK_MS.store(now, Ordering::SeqCst);
+    LAST_LYRIC_BAR_CLICK_X.store(pt.x, Ordering::SeqCst);
+    LAST_LYRIC_BAR_CLICK_Y.store(pt.y, Ordering::SeqCst);
+    is_double
+}
+
 /// 低级鼠标钩子回调：
 /// 1. 菜单打开期间，菜单外的任何鼠标按键 → 关闭菜单并吞掉这次点击
 ///    （等价于系统菜单「点击外部即关闭」的行为；歌词条不是前台窗口，
@@ -1186,7 +1334,7 @@ unsafe extern "system" fn lyric_bar_mouse_hook(
             return LRESULT(1);
         }
 
-        // —— 左键命中歌词条 → 吞掉并切换迷你播放器 ——
+        // —— 左键命中歌词条 → 吞掉：单击切换迷你播放器，双击打开主界面 ——
         // 歌词条是鼠标穿透窗口，原本左键会穿透到任务栏；弹出交互接管后
         // DOWN/UP 一并吞掉，避免任务栏抢前台导致弹窗被 Focused(false)
         // 立刻收起（toggling 的那次点击不会引发焦点变化）。
@@ -1194,9 +1342,33 @@ unsafe extern "system" fn lyric_bar_mouse_hook(
             if cursor_in_lyric_bar() {
                 if msg == WM_LBUTTONUP {
                     if let Some(app) = HOOK_APP.get() {
-                        let handle = app.clone();
-                        let _ = app.run_on_main_thread(move || toggle_mini_player(&handle));
+                        if is_lyric_bar_double_click() {
+                            // 双击：作废待定单击，直接恢复主界面（不弹迷你播放器）
+                            PENDING_SINGLE_CLICK_SEQ.fetch_add(1, Ordering::SeqCst);
+                            let handle = app.clone();
+                            let _ = app.run_on_main_thread(move || open_main_from_lyric_bar(&handle));
+                        } else {
+                            // 单击：延迟一小段（≤250ms）再切换迷你播放器，给双击第二击
+                            // 留出判定时间；第二击按下时会立即作废这个待定动作
+                            let seq = PENDING_SINGLE_CLICK_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+                            let app_handle = app.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    lyric_bar_single_click_delay_ms(),
+                                ));
+                                if PENDING_SINGLE_CLICK_SEQ.load(Ordering::SeqCst) == seq {
+                                    let task_handle = app_handle.clone();
+                                    let _ = app_handle.run_on_main_thread(move || {
+                                        toggle_mini_player(&task_handle)
+                                    });
+                                }
+                            });
+                        }
                     }
+                } else if lyric_bar_press_starts_double_click() {
+                    // 双击的第二击一按下就作废待定单击（不必等抬起），
+                    // 单击延迟窗口内不会误弹迷你播放器
+                    PENDING_SINGLE_CLICK_SEQ.fetch_add(1, Ordering::SeqCst);
                 }
                 return LRESULT(1);
             }
@@ -1232,9 +1404,12 @@ fn show_lyric_bar_menu(app: &tauri::AppHandle) {
 
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return; };
-        let _ = AppendMenuW(menu, MF_STRING, 1, windows::core::w!("隐藏状态栏歌词"));
+        let _ = AppendMenuW(menu, MF_STRING, 1, windows::core::w!("打开主页"));
+        let _ = AppendMenuW(menu, MF_STRING, 2, windows::core::w!("打开设置"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, 2, windows::core::w!("退出 QQMusic Monitor"));
+        let _ = AppendMenuW(menu, MF_STRING, 3, windows::core::w!("隐藏状态栏歌词"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, 4, windows::core::w!("退出 QQMusic Monitor"));
         let mut pt = windows::Win32::Foundation::POINT::default();
         let _ = GetCursorPos(&mut pt);
         let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
@@ -1254,10 +1429,22 @@ fn show_lyric_bar_menu(app: &tauri::AppHandle) {
         // TPM_RETURNCMD：返回值即菜单项 id（0 = 取消）
         let cmd = ret.0 as u32;
         match cmd {
-            1 => hide_lyric_bar_from_menu(app),
-            2 => app.exit(0),
+            1 => show_main_window(app),
+            2 => open_settings_window(app),
+            3 => hide_lyric_bar_from_menu(app),
+            4 => app.exit(0),
             _ => {}
         }
+    }
+}
+
+/// 右键菜单「打开设置」：恢复主界面，并通知前端打开设置抽屉。
+fn open_settings_window(app: &tauri::AppHandle) {
+    use tauri::{Emitter, Manager};
+
+    show_main_window(app);
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.emit("open-settings", ());
     }
 }
 
@@ -1270,6 +1457,10 @@ fn hide_lyric_bar_from_menu(app: &tauri::AppHandle) {
         let _ = win.destroy();
     }
     LYRIC_BAR_HWND.store(0, Ordering::SeqCst);
+    // 窗口销毁后布局快照立即失效（下次预览回退完整定位重建快照）
+    if let Ok(mut cache) = LYRIC_BAR_LAYOUT.lock() {
+        *cache = None;
+    }
     destroy_mini_player(app);
 
     let path = frontend_prefs_path();
@@ -1340,26 +1531,44 @@ fn get_taskbar_light_theme() -> bool {
     false
 }
 
+/// 歌词条已存在时按当前偏好立即重新定位（DPI 取主显示器）。
+/// 三个位置偏好命令（side / gap / width）共用；窗口尚未创建时为空操作。
+/// 通知歌词条点亮左右边界竖线（前端约 3s 后自动淡出）。
+fn flash_lyric_bar_bounds(app: &tauri::AppHandle) {
+    use tauri::{Emitter, Manager};
+    if let Some(win) = app.get_webview_window("lyric-bar") {
+        let _ = win.emit("lyric-bar-bounds", ());
+    }
+}
+
+fn relocate_lyric_bar(app: &tauri::AppHandle) {
+    use windows::Win32::Foundation::HWND;
+
+    let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
+    if raw == 0 {
+        return;
+    }
+    let bar = HWND(raw as *mut core::ffi::c_void);
+    let scale = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.scale_factor())
+        .unwrap_or(1.0);
+    if position_lyric_bar_in_taskbar(bar, scale) {
+        // 调整后让歌词条立即点亮左右边界竖线（前端约 3s 后淡出），
+        // 用户拖宽度/切位置/改边距时能直接看到窗口的实际边界。
+        flash_lyric_bar_bounds(app);
+    }
+}
+
 #[tauri::command]
 // 状态栏歌词位置偏好：'left' 任务栏左侧（开始按钮右侧），'right' 通知区左侧。
 // 歌词条存在时立即重新定位（含插件避让检测）。
 async fn set_lyric_bar_side(app: tauri::AppHandle, side: String) -> Result<(), String> {
-    use windows::Win32::Foundation::HWND;
-
     let v = if side == "left" { 1u8 } else { 0u8 };
     LYRIC_BAR_SIDE.store(v, Ordering::SeqCst);
-
-    let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
-    if raw != 0 {
-        let bar = HWND(raw as *mut core::ffi::c_void);
-        let scale = app
-            .primary_monitor()
-            .ok()
-            .flatten()
-            .map(|m| m.scale_factor())
-            .unwrap_or(1.0);
-        position_lyric_bar_in_taskbar(bar, scale);
-    }
+    relocate_lyric_bar(&app);
     Ok(())
 }
 
@@ -1367,20 +1576,57 @@ async fn set_lyric_bar_side(app: tauri::AppHandle, side: String) -> Result<(), S
 // 状态栏歌词边距偏好（逻辑像素）：距任务栏边缘的距离
 // （左侧 = 距任务栏左缘，右侧 = 距通知区左缘）。歌词条存在时立即重定位。
 async fn set_lyric_bar_gap(app: tauri::AppHandle, gap: u32) -> Result<(), String> {
+    LYRIC_BAR_GAP.store(gap.min(500), Ordering::SeqCst);
+    relocate_lyric_bar(&app);
+    Ok(())
+}
+
+#[tauri::command]
+// 状态栏歌词宽度偏好（逻辑像素）：窗口最大宽度（默认 520），任务栏可用空间
+// 不足时自动收缩。歌词条存在时立即重定位。
+async fn set_lyric_bar_width(app: tauri::AppHandle, width: u32) -> Result<(), String> {
+    LYRIC_BAR_WIDTH.store(
+        width.clamp(LYRIC_BAR_MIN_W as u32, LYRIC_BAR_MAX_W),
+        Ordering::SeqCst,
+    );
+    relocate_lyric_bar(&app);
+    Ok(())
+}
+
+#[tauri::command]
+// 拖动宽度滑块时的实时预览：更新偏好后按布局快照快速重定位。
+// 完整定位每次都要 UIA 枚举任务按钮/插件（约 55ms），拖动时每帧调用会
+// 明显卡顿；命中快照只做 SetWindowPos（约 3ms）。快照不存在时回退完整定位。
+async fn set_lyric_bar_width_preview(app: tauri::AppHandle, width: u32) -> Result<(), String> {
     use windows::Win32::Foundation::HWND;
 
-    LYRIC_BAR_GAP.store(gap.min(500), Ordering::SeqCst);
+    LYRIC_BAR_WIDTH.store(
+        width.clamp(LYRIC_BAR_MIN_W as u32, LYRIC_BAR_MAX_W),
+        Ordering::SeqCst,
+    );
 
     let raw = LYRIC_BAR_HWND.load(Ordering::SeqCst);
-    if raw != 0 {
-        let bar = HWND(raw as *mut core::ffi::c_void);
-        let scale = app
-            .primary_monitor()
-            .ok()
-            .flatten()
-            .map(|m| m.scale_factor())
-            .unwrap_or(1.0);
-        position_lyric_bar_in_taskbar(bar, scale);
+    if raw == 0 {
+        return Ok(());
+    }
+    let bar = HWND(raw as *mut core::ffi::c_void);
+
+    let cached = LYRIC_BAR_LAYOUT
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    match cached {
+        Some(layout) => {
+            let scale = app
+                .primary_monitor()
+                .ok()
+                .flatten()
+                .map(|m| m.scale_factor())
+                .unwrap_or(1.0);
+            layout.apply(bar, (configured_lyric_bar_width() * scale) as i32);
+            flash_lyric_bar_bounds(&app);
+        }
+        None => relocate_lyric_bar(&app),
     }
     Ok(())
 }
@@ -1425,14 +1671,15 @@ async fn save_frontend_prefs(json: String) -> Result<(), String> {
 // （显示在通知区域左侧，任务栏自身交互不会盖住它），关闭时销毁。
 // 歌词条复用 song-info / playback-progress 事件。
 //
-// side / gap 为位置偏好，与开关一次事务式传入：窗口创建时的首次定位读的
-// 就是这两个静态值，若等创建完再单独调 set_lyric_bar_side / _gap，
-// 首次打开必然先按默认值（右侧、0 边距）出现在错误位置。
+// side / gap / width 为位置与尺寸偏好，与开关一次事务式传入：窗口创建时的
+// 首次定位读的就是这三个静态值，若等创建完再单独调 set_lyric_bar_side /
+// _gap / _width，首次打开必然先按默认值（右侧、0 边距、520 宽）出现在错误位置。
 async fn set_lyric_bar_enabled(
     app: tauri::AppHandle,
     enabled: bool,
     side: Option<String>,
     gap: Option<u32>,
+    width: Option<u32>,
 ) -> Result<(), String> {
     use tauri::Manager;
 
@@ -1441,6 +1688,12 @@ async fn set_lyric_bar_enabled(
     }
     if let Some(gap) = gap {
         LYRIC_BAR_GAP.store(gap.min(500), Ordering::SeqCst);
+    }
+    if let Some(width) = width {
+        LYRIC_BAR_WIDTH.store(
+            width.clamp(LYRIC_BAR_MIN_W as u32, LYRIC_BAR_MAX_W),
+            Ordering::SeqCst,
+        );
     }
 
     LYRIC_BAR_ENABLED.store(enabled, Ordering::SeqCst);
@@ -1455,6 +1708,10 @@ async fn set_lyric_bar_enabled(
         }
     } else if let Some(win) = app.get_webview_window("lyric-bar") {
         LYRIC_BAR_HWND.store(0, Ordering::SeqCst);
+        // 窗口销毁后布局快照立即失效（下次预览回退完整定位重建快照）
+        if let Ok(mut cache) = LYRIC_BAR_LAYOUT.lock() {
+            *cache = None;
+        }
         let _ = win.destroy();
         destroy_mini_player(&app);
     }
@@ -1675,7 +1932,18 @@ mod synchronization_tests {
 /// 缓存淘汰上限：超出后淘汰最久未访问的条目。
 /// 每条含歌词文本 + QRC 逐字数据，按平均 8KB/条估算，128 条约 1MB 内存。
 const LYRICS_CACHE_MAX_ENTRIES: usize = 128;
-const LYRICS_RETRY_DELAY_MS: u64 = 30_000;
+/// 在线歌词获取失败后的重试间隔。
+/// 原 30s 太长：QQ 音乐客户端通常在播放开始 1~2s 后就把歌词写进本地缓存，
+/// 失败重试时优先命中本地即可恢复（配合下方的本地重查轮询）。
+const LYRICS_RETRY_DELAY_MS: u64 = 5_000;
+
+/// 本地歌词重查间隔：QQ 音乐客户端是「播放后才滞后写入 qrc」的，
+/// 切歌瞬间本地常查不到（本地查找只在切歌时做一次），随后 1~2s 才落盘。
+/// 在线获取期间按此间隔重查本地，命中即用本地逐字歌词覆盖。
+const LYRIC_LOCAL_RESCAN_INTERVAL_MS: u64 = 1_500;
+
+/// 本地歌词重查最大次数（1.5s × 8 = 12s，覆盖客户端写入延迟）
+const LYRIC_LOCAL_RESCAN_MAX_TRIES: u32 = 8;
 
 #[derive(Clone, Copy)]
 enum LyricsFetchState {
@@ -2295,6 +2563,75 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                 }
                             }
 
+                            // 1.5. 本地歌词重查轮询：QQ 音乐客户端是播放后才滞后写入
+                            // qrc 的，切歌瞬间本地常查不到；在线请求期间每 1.5s 重查本地，
+                            // 命中即用本地逐字歌词覆盖缓存（仅切歌瞬间本地无 QRC 时启动）。
+                            if !has_local_qrc {
+                                let cache_rescan = cache.clone();
+                                let t_rescan = t.clone();
+                                let a_rescan = a.clone();
+                                tokio::spawn(async move {
+                                    for _ in 0..LYRIC_LOCAL_RESCAN_MAX_TRIES {
+                                        tokio::time::sleep(Duration::from_millis(
+                                            LYRIC_LOCAL_RESCAN_INTERVAL_MS,
+                                        ))
+                                        .await;
+
+                                        // 已切到别的歌：停止轮询（旧歌不必再补缓存）
+                                        let still_current = match LATEST_SONG_INFO.get() {
+                                            Some(lock) => {
+                                                let s = lock.read().await;
+                                                s.title == t_rescan && s.artist == a_rescan
+                                            }
+                                            None => false,
+                                        };
+                                        if !still_current {
+                                            break;
+                                        }
+
+                                        // 已经是本地 QRC：无需再扫
+                                        {
+                                            let guard = cache_rescan.read().await;
+                                            if let Some(e) = guard
+                                                .entries
+                                                .get(&format!("{}|{}", t_rescan, a_rescan))
+                                            {
+                                                if e.source == LyricsSource::Local
+                                                    && !e.qrc_data.is_empty()
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        let t2 = t_rescan.clone();
+                                        let a2 = a_rescan.clone();
+                                        let mut local = tokio::task::spawn_blocking(move || {
+                                            lookup_local_lyrics(&t2, &a2)
+                                        })
+                                        .await
+                                        .unwrap_or_else(|_| LyricsCacheEntry::loading());
+                                        if local.qrc_data.is_empty() && local.lyrics.is_empty() {
+                                            continue;
+                                        }
+                                        local.fetch_state = LyricsFetchState::Ready;
+                                        local.source = LyricsSource::Local;
+                                        cache_rescan.write().await.insert_entry(
+                                            &t_rescan,
+                                            &a_rescan,
+                                            local,
+                                        );
+                                        if debug {
+                                            eprintln!(
+                                                "[lyrics] Local rescan hit for '{} - {}'",
+                                                t_rescan, a_rescan
+                                            );
+                                        }
+                                        break;
+                                    }
+                                });
+                            }
+
                             // 封面策略（用户 2026-10：远程搜索有法律风险，只能最后手段）：
                             // SMTC 缩略图是 QQ 音乐客户端主动推给系统的当前封面（零远程
                             // 请求、与客户端显示一致），本地缓存图同理；两者都存在时
@@ -2309,8 +2646,9 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                 None => false,
                             };
 
-                            // 2. 在线歌词获取（仅当本地无 QRC 时才请求，作为备用手段）
-                            if !has_local_qrc {
+                            // 2. 在线歌词获取（已停用：用户 2026-10 要求只用本地歌词，
+                            //    本地搜不到就不显示歌词；保留实现便于将来恢复）
+                            if false && !has_local_qrc {
                             let mut attempt = 0u32;
                             let online_result = loop {
                                 attempt += 1;
@@ -2433,8 +2771,23 @@ async fn run_monitor(app_handle: Option<tauri::AppHandle>, args: Cli, config: Co
                                     cached.mark_retry(&t, &a);
                                 }
                             }
-                            } // if !has_local_qrc
-                            else {
+                            } else if !has_local_qrc {
+                                // 在线歌词已停用：本地无歌词时把条目标记 Ready（空歌词），
+                                // 前端显示「无歌词/纯音乐」占位；本地重查轮询随后命中会覆盖。
+                                let mut cached = cache.write().await;
+                                if let Some(entry) = cached
+                                    .entries
+                                    .get_mut(&format!("{}|{}", t, a))
+                                {
+                                    entry.fetch_state = LyricsFetchState::Ready;
+                                }
+                                if debug {
+                                    eprintln!(
+                                        "[lyrics] 在线歌词已停用，本地无歌词: '{} - {}'",
+                                        t, a
+                                    );
+                                }
+                            } else {
                                 // 本地有 QRC 但缺少封面：解析封面 mid → 优先查本地 QQMusicPicture → 在线 CDN 兜底
                                 //
                                 // 1) 取封面 mid：
@@ -3065,7 +3418,7 @@ async fn main() -> Result<()> {
 
     // 启动 Tauri 窗口
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_app_config, save_app_config, get_current_song_info, media_toggle_play_pause, media_next, media_previous, window_hidden, set_lyric_bar_enabled, set_lyric_bar_side, set_lyric_bar_gap, get_taskbar_light_theme, get_frontend_prefs, save_frontend_prefs, hide_mini_player])
+        .invoke_handler(tauri::generate_handler![get_app_config, save_app_config, get_current_song_info, media_toggle_play_pause, media_next, media_previous, window_hidden, set_lyric_bar_enabled, set_lyric_bar_side, set_lyric_bar_gap, set_lyric_bar_width, set_lyric_bar_width_preview, get_taskbar_light_theme, get_frontend_prefs, save_frontend_prefs, hide_mini_player])
         .setup(move |app| {
             // —— 系统托盘（后台模式）——
             // 窗口最小化/隐藏到托盘后，托盘小图标保留在任务栏通知区域，

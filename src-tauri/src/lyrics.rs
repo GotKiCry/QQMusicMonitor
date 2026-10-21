@@ -55,6 +55,12 @@ impl LyricFetcher {
             client: Client::builder()
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
                 .referer(true)
+                // 之前没有设置任何超时：网络抖动时单个请求会一直挂着，直到
+                // 系统 TCP 超时（Windows 约 21s），整首歌歌词迟迟不更新。
+                // 实测 QQ 音乐接口正常 150~500ms、冷启动首次约 2s，
+                // 连接 4s / 总请求 10s 足够且能兜住挂起。
+                .connect_timeout(std::time::Duration::from_secs(4))
+                .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
             debug,

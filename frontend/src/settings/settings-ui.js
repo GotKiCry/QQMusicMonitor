@@ -11,16 +11,17 @@ import { paintCustomTheme, presetThemeColor, loadAutoPalette } from '../config/t
 
 /**
  * Tauri 环境：向后端同步状态栏歌词窗口开关。
- * side / gap 必须随开关一起下发：后端在创建歌词条窗口的同一时刻就要用
- * 这两个值做首次定位，单独追加的 set_lyric_bar_side 调用会晚于首次定位，
- * 表现为「第一次打开时位置与设置不符」。
+ * side / gap / width 必须随开关一起下发：后端在创建歌词条窗口的同一时刻
+ * 就要用这些值做首次定位，单独追加的 set_lyric_bar_side 调用会晚于首次
+ * 定位，表现为「第一次打开时位置与设置不符」。
  */
 function syncLyricBarToBackend(enabled, front) {
     if (window.__TAURI__) {
         window.__TAURI__.core.invoke('set_lyric_bar_enabled', {
             enabled,
             side: front.lyricBarSide,
-            gap: front.lyricBarGap || 0
+            gap: front.lyricBarGap || 0,
+            width: front.lyricBarWidth || 520
         }).catch((e) => {
             console.error('Failed to toggle lyric bar:', e);
         });
@@ -190,6 +191,51 @@ export function wireUpSettings({ els, configs, onFrontConfigChange }) {
     els.btnTaskbarThemeDark.addEventListener('click', () => setTaskbarTheme(els, front, 'dark', onFrontConfigChange));
     els.btnTaskbarThemeLight.addEventListener('click', () => setTaskbarTheme(els, front, 'light', onFrontConfigChange));
 
+    // —— 歌词条宽度（窗口最大宽度，可用空间不足时后端自动收缩） ——
+    // 拖动时实时预览：input 节流调用 preview 命令（后端命中布局快照，
+    // 只做 SetWindowPos ≈3ms；完整定位含 UIA/插件枚举 ≈55ms，每帧调用
+    // 会明显拖慢拖动手感）。松手（change）再落偏好并走完整定位。
+    let widthPreviewTimer = 0;
+    let widthPreviewValue = 0;
+    let widthPreviewSentAt = 0;
+
+    function sendWidthPreview(width) {
+        widthPreviewSentAt = performance.now();
+        window.__TAURI__.core
+            .invoke('set_lyric_bar_width_preview', { width })
+            .catch((e) => console.error('Failed to preview lyric bar width:', e));
+    }
+
+    els.cfgLyricBarWidth.addEventListener('input', () => {
+        widthPreviewValue = parseInt(els.cfgLyricBarWidth.value, 10);
+        els.valLyricBarWidth.textContent = `${widthPreviewValue}px`;
+        if (!window.__TAURI__ || !front.lyricBar) return;
+        // 首帧立即应用（拖动一启动就跟手），随后 33ms 合并只发最新值
+        if (performance.now() - widthPreviewSentAt >= 33) {
+            sendWidthPreview(widthPreviewValue);
+            return;
+        }
+        if (widthPreviewTimer) return;
+        widthPreviewTimer = setTimeout(() => {
+            widthPreviewTimer = 0;
+            sendWidthPreview(widthPreviewValue);
+        }, 33);
+    });
+    els.cfgLyricBarWidth.addEventListener('change', () => {
+        if (widthPreviewTimer) {
+            clearTimeout(widthPreviewTimer);
+            widthPreviewTimer = 0;
+        }
+        widthPreviewSentAt = 0;
+        front.lyricBarWidth = parseInt(els.cfgLyricBarWidth.value, 10);
+        saveFrontendConfig(front);
+        if (window.__TAURI__ && front.lyricBar) {
+            window.__TAURI__.core.invoke('set_lyric_bar_width', { width: front.lyricBarWidth }).catch((e) => {
+                console.error('Failed to set lyric bar width:', e);
+            });
+        }
+    });
+
     // —— 歌词条边距（距任务栏边缘；左侧=距左缘，右侧=距通知区左缘） ——
     els.cfgLyricBarGap.addEventListener('input', () => {
         els.valLyricBarGap.textContent = `${parseInt(els.cfgLyricBarGap.value, 10)}px`;
@@ -211,6 +257,12 @@ export function wireUpSettings({ els, configs, onFrontConfigChange }) {
             applyTheme(els, front, theme);
         });
     });
+
+    // —— AUTO 按钮：一键切到专辑封面自动取色 ——
+    els.btnThemeAuto.addEventListener('click', () => applyTheme(els, front, 'auto'));
+
+    // 切歌/封面取色更新后刷新 AUTO 按钮的色点与 hex（设置抽屉打开时实时跟随）
+    window.addEventListener('auto-color-updated', () => markActiveTheme(front.theme));
 
     // —— 自定义取色盘 ——
     // 取色按钮驱动 0 尺寸隐藏输入打开原生取色器
@@ -251,13 +303,31 @@ function applyTheme(els, front, theme) {
     notifyThemeChanged();
 }
 
-/** 高亮当前激活的主题圆点 */
+/**
+ * 高亮当前激活的主题圆点 / AUTO 按钮。
+ * AUTO 是唯一的自动取色入口：选中 auto 时主题圆点全部不高亮。
+ * AUTO 按钮的色点与 hex 固定显示「自动取色」结果（loadAutoPalette 的 primary），
+ * 不消费当前 --theme-primary——点其它预设主题时该色值不会跟着变。
+ */
 function markActiveTheme(theme) {
     document.querySelectorAll('.theme-dot').forEach((d) => {
         d.classList.toggle('active', theme === 'custom'
             ? d.id === 'theme-dot-custom'
             : d.getAttribute('data-theme') === theme);
     });
+    const autoBtn = document.getElementById('btn-theme-auto');
+    const palette = loadAutoPalette();
+    const autoPrimary = palette ? palette.primary : null;
+    if (autoBtn) {
+        autoBtn.classList.toggle('active', theme === 'auto');
+        // 色点颜色走独立变量 --auto-color，不随预设主题切换
+        autoBtn.style.setProperty('--auto-color', autoPrimary || '#94a3b8');
+    }
+    const hexEl = document.getElementById('val-theme-auto-hex');
+    if (hexEl) {
+        // 尚未取得封面颜色时显示 —，避免误以为是某个预设色
+        hexEl.textContent = autoPrimary || '—';
+    }
 }
 
 /**
@@ -297,6 +367,8 @@ export function syncConfigToUI(els, front, back) {
     els.toggleDebug.checked = front.debug;
     els.cfgLyricBarGap.value = String(front.lyricBarGap || 0);
     els.valLyricBarGap.textContent = `${front.lyricBarGap || 0}px`;
+    els.cfgLyricBarWidth.value = String(front.lyricBarWidth || 520);
+    els.valLyricBarWidth.textContent = `${front.lyricBarWidth || 520}px`;
     els.debugPanel.hidden = !front.debug;
     markLyricSide(els, front);
     markTaskbarTheme(els, front);

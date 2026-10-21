@@ -329,19 +329,69 @@ input[type="range"]::-webkit-slider-thumb:hover {
 .dot-emerald { background-color: #10b981; }
 .dot-sunset { background-color: #f97316; }
 
-/* —— 自动主题（专辑封面取色）：白描边 + 当前主题色实心圆 —— */
-/* 20px 小尺寸下 URL 内嵌 SVG + cover 缩放的渲染不可控（曾出现环粗/点小/被 box 裁切），
-   改为纯 CSS：2px 白描边 + 背景直接消费 --theme-primary——实时跟随
-   主题切换/封面取色，无需 paintAutoDot 重写；与其余纯色圆点风格统一 */
-.theme-dot-auto {
-    border-radius: 50%;
-    overflow: hidden;
-    padding: 0;
-    -webkit-appearance: none;
-    appearance: none;
-    border: 2px solid var(--dot-ring);
-    background: var(--theme-primary, #14b8a6);
+/* —— AUTO 按钮：自动取色（专辑封面） —— */
+/* 圆点列表里的 auto 圆点不显眼，单独给一个文字按钮：
+   左侧色点实时消费 --theme-primary，一眼能看出当前自动取到的颜色；
+   激活（当前为自动主题）时按钮以主题 ink 填充。 */
+.theme-auto-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    height: 30px;
+    padding: 0 12px;
+    border-radius: 15px;
+    border: 1px solid var(--border-glass);
+    background: var(--surface-seg);
+    color: var(--text-sub);
+    font-family: var(--font-body);
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+    transition: var(--transition-base);
 }
+
+.theme-auto-btn::before {
+    content: '';
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    /* 固定显示「自动取色」结果（--auto-color 由 JS 按封面调色板写入），
+       不消费 --theme-primary：点其他预设主题时这个色点不会跟着变 */
+    background: var(--auto-color, #94a3b8);
+    box-shadow: 0 0 6px rgba(255, 255, 255, 0.18);
+}
+
+/* AUTO 按钮上的当前取色 hex（自动取色结果，不随手动主题变化） */
+.theme-auto-label {
+    letter-spacing: 0.08em;
+}
+
+.theme-auto-hex {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    opacity: 0.75;
+}
+
+.theme-auto-btn:hover {
+    color: var(--text-main);
+    border-color: var(--border-focus, var(--border-glass));
+}
+
+.theme-auto-btn.active {
+    background: var(--theme-ink, var(--theme-primary));
+    border-color: transparent;
+    color: var(--theme-on-primary, #ffffff);
+}
+
+.theme-auto-btn.active::before {
+    background: var(--theme-on-primary, #ffffff);
+    box-shadow: none;
+}
+
 /* —— 分段选择（歌词条左右位置） —— */
 .seg-control {
     display: inline-flex;

@@ -33,6 +33,7 @@ body {
 }
 
 .lyric-bar-root {
+    position: relative; /* 换行退场的旧翻译层按它定位 */
     width: 100%;
     height: 100%;
     display: flex;
@@ -90,45 +91,51 @@ body {
     animation: bar-fade 0.2s ease;
 }
 
-/* —— 换行：垂直滚动过渡（旧行上滑出、新行从下滑入） —— */
-.row-leaving {
+/* —— 换行：整体垂直滚动过渡 ——
+ * 旧内容（歌词行 + 翻译）克隆整个 .lyric-bar-root 作为退场层，从窗口顶部
+ * 整体滑出；新内容（歌词行 + 翻译）从窗口下方整体滑入。全程不做透明度
+ * 过渡：位移量取窗口高度（100 / 100vh），滑入滑出都在窗口外完成，
+ * 视觉上就是上下滑动。 */
+.lyric-bar-root.row-leaving {
     position: absolute;
     inset: 0;
     z-index: 1;
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    overflow: hidden;
     pointer-events: none;
-    animation: bar-row-out 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+    /* 与下方进入动画同一条缓动曲线：同一时刻两段位移互补，
+       新旧内容间距恒为一屏（48px），视觉上是同一块内容在连续滚动 */
+    animation: bar-row-out 0.32s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
-/* 左侧布局：与 .lyric-bar-line 一致地贴左缘 */
-.lyric-bar-body.side-left .row-leaving {
-    justify-content: flex-start;
+/* 退场层内的旧内容不应再播放入场/淡入动画（JS 也会清理，这里兜底） */
+.lyric-bar-root.row-leaving .bar-content,
+.lyric-bar-root.row-leaving .lyric-bar-trans {
+    animation: none !important;
 }
 
+/* 进入与退场共用同一条曲线（0.32s / cubic-bezier(0.16,1,0.3,1)）：
+   同一时刻旧内容上移 48·f、新内容下移 48·(1-f)，两者间距恒为一屏，
+   上下两句歌词以完全相同的速度同步滑动。 */
 .bar-content.row-entering {
     animation: bar-row-in 0.32s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .lyric-bar-trans.row-entering {
-    animation: bar-row-in-soft 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    animation: bar-row-in-soft 0.32s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 @keyframes bar-row-out {
-    from { transform: translateY(0); opacity: 1; }
-    to { transform: translateY(-100%); opacity: 0; }
+    from { transform: translateY(0); }
+    to   { transform: translateY(-100%); } /* 层高 = 窗口高，整体滑出窗口 */
 }
 
 @keyframes bar-row-in {
-    from { transform: translateY(100%); opacity: 0; }
-    to { transform: translateY(0); opacity: 1; }
+    from { transform: translateY(100vh); } /* 从窗口下缘之外滑入 */
+    to   { transform: translateY(0); }
 }
 
 @keyframes bar-row-in-soft {
-    from { transform: translateY(70%); opacity: 0; }
-    to { transform: translateY(0); opacity: 1; }
+    from { transform: translateY(100vh); }
+    to   { transform: translateY(0); }
 }
 
 /* 超长行的水平滚动由 JS 按「当前行进度」逐帧驱动（lyric-bar.js 的
@@ -221,4 +228,35 @@ body {
     .lyric-bar-root { gap: 0; }
     .lyric-bar-trans { display: none; }
     .lyric-bar-line { height: 100%; }
+}
+
+/* ============================================================
+ * 边界提示：主窗口调整歌词条宽度/位置/边距后，左右边缘立即显示
+ * 竖线，约 3s 后渐隐（确认窗口边界用）。颜色随主题高亮色（浅色
+ * 任务栏下已是深色适配）；动画一次性播完，JS 只负责重启类名。
+ * ============================================================ */
+.bar-boundary {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--bar-fg-color, var(--theme-primary, #14b8a6));
+    opacity: 0;
+    pointer-events: none;
+    z-index: 10;
+}
+
+.bar-boundary.left { left: 0; }
+.bar-boundary.right { right: 0; }
+
+.bar-boundary.show {
+    animation: bar-boundary-hint 3.5s ease forwards;
+}
+
+/* 0→0.95 瞬时淡入（约 70ms），88%（≈3.08s）后渐隐到 0 结束 */
+@keyframes bar-boundary-hint {
+    0%   { opacity: 0; }
+    2%   { opacity: 0.95; }
+    88%  { opacity: 0.95; }
+    100% { opacity: 0; }
 }

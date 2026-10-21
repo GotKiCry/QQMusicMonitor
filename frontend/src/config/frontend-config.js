@@ -22,6 +22,7 @@ export const STORAGE_KEY = 'qqmusic-monitor-front-prefs';
  * @property {boolean} lyricBar
  * @property {'left'|'right'} lyricBarSide
  * @property {number} lyricBarGap
+ * @property {number} lyricBarWidth - 歌词条窗口最大宽度（逻辑像素，默认 520）
  * @property {'auto'|'dark'|'light'} taskbarTheme - 状态栏歌词任务栏配色策略
  * @property {boolean} debug
  */
@@ -37,6 +38,7 @@ export function getDefaultFrontendConfig() {
         lyricBar: false,
         lyricBarSide: 'right',
         lyricBarGap: 0,
+        lyricBarWidth: 520,
         taskbarTheme: 'auto',
         debug: false
     };
@@ -57,6 +59,9 @@ function normalizePrefs(p) {
         lyricBarGap: Number.isInteger(p.lyricBarGap)
             ? Math.min(500, Math.max(0, p.lyricBarGap))
             : base.lyricBarGap,
+        lyricBarWidth: Number.isInteger(p.lyricBarWidth)
+            ? Math.min(1600, Math.max(180, p.lyricBarWidth))
+            : base.lyricBarWidth,
         taskbarTheme: ['auto', 'dark', 'light'].includes(p.taskbarTheme)
             ? p.taskbarTheme
             : base.taskbarTheme,
